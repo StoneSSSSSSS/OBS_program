@@ -43,7 +43,7 @@ def remove_oldest_recordings():
         if len(recordings) > 48:
             number_above = len(recordings) - 48
             for i in range(number_above):
-                if path_to_clip not in queue:
+                if recordings[i] not in queue:
                     try:
                         remove(path_to_recording + "\\" + recordings[i])
                     except PermissionError as e:
@@ -74,7 +74,7 @@ def move_recording(recordings,active_window):
     all_invalid_chars = ["/", "\\", ":", "*", "?", "\"", "<", ">", "|", "."]
     for char in all_invalid_chars:
         active_window = active_window.replace(char, "")
-    active_window.replace(" ", "_")
+    active_window = active_window.replace(" ", "_")
     # create folder with name of active window if it doesn't exist
     if active_window not in listdir(path_to_clip):
         try:
