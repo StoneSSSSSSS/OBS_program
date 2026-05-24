@@ -1,7 +1,8 @@
 import subprocess
+import config
 def start_obs():
-    OBS_PATH = r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"
-    OBS_DIR  = r"C:\Program Files\obs-studio\bin\64bit"
+    OBS_PATH = config.OBS_PATH
+    OBS_DIR  = config.OBS_DIR
 
     subprocess.Popen(
         [OBS_PATH, "--startrecording", "--startreplaybuffer", "--minimize-to-tray"],

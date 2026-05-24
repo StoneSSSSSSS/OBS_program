@@ -3,6 +3,7 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from _thread import start_new_thread
 import time
+import config
 
 overlay_active = False  # Global state to track overlay visibility
 
@@ -16,7 +17,7 @@ def overlay_thread_function():
     root.attributes("-topmost", True)  # Keep the window on top
 
     # Load the image
-    image = Image.open("path_to_your_overlay_image.png")
+    image = Image.open(config.overlay_image_name)
     img_width, img_height = image.size
     photo = ImageTk.PhotoImage(image)
 
@@ -76,8 +77,6 @@ def clippled_overlay():
 
 # Example usage:
 if __name__ == "__main__":
-    import time
-
     start_new_thread(overlay_thread_function, ())
 
     while True:

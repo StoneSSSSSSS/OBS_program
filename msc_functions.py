@@ -7,10 +7,11 @@ import time
 from bug_log import add_to_bug_log
 from overlay import clippled_overlay
 from overlay import overlay_thread_function
+import config
 
 
-path_to_recording = "I:\OBS\Recordings"
-path_to_clip = "I:\OBS\Clips"
+path_to_recording = config.path_to_recording
+path_to_clip = config.path_to_clip
 
 def get_active_window_title():
     name = gw.getActiveWindow().title
@@ -103,7 +104,7 @@ def move_recording(recordings,active_window):
 def clip_hotkey_listener():
     print("Listening for hotkey")
     # Register the hotkey and specify the callback function
-    keyboard.add_hotkey('ctrl+shift+`', hotkey_action)
+    keyboard.add_hotkey(config.overlay_hotkey, hotkey_action)
     # Keep the listener active
     keyboard.wait()
 
