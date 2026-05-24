@@ -1,5 +1,4 @@
 with open("configs.txt", "r") as f:
-    print(f.read)
     configs = f.read().split("\n")
 
 for i,config in enumerate(configs):
@@ -14,3 +13,4 @@ OBS_PATH = configs[2]
 OBS_DIR = '\\'.join(configs[2].split('\\')[:-1])
 path_to_recording = configs[3]
 path_to_clip = configs[4]
+keep_before_delete = int(configs[5])

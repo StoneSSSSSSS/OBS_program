@@ -41,8 +41,8 @@ def remove_oldest_recordings():
     while True:
         recordings = listdir(path_to_recording)
         recordings = [x for x in recordings if "Replay" not in x]
-        if len(recordings) > 48:
-            number_above = len(recordings) - 48
+        if len(recordings) > config.keep_before_delete:
+            number_above = len(recordings) - config.keep_before_delete
             for i in range(number_above):
                 if recordings[i] not in queue:
                     try:
