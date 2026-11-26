@@ -316,7 +316,7 @@ fn game_for_folder(db: &Db, folder: &str) -> anyhow::Result<i64> {
 }
 
 fn probe_pending(sh: &Shared, db: &Db) {
-    let pending = db.unprobed_clips(8).unwrap_or_default();
+    let pending = db.unprobed_clips(16).unwrap_or_default();
     if pending.is_empty() {
         return;
     }

@@ -183,6 +183,9 @@ impl App {
         if page == self.page {
             return;
         }
+        if self.page == Page::Settings {
+            self.settings.leave(&mut self.c);
+        }
         // Leaving a page with a player: pause playback.
         if matches!(self.page, Page::Recordings | Page::Clips) {
             if let Some(m) = &self.c.player.mpv {

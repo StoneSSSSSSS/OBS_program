@@ -59,6 +59,8 @@ pub struct LaneState {
     /// Selected range: (track, start, end) in axis units.
     pub sel: Option<(usize, f64, f64)>,
     drag: Option<(usize, f64)>,
+    /// Resizing an existing edit: (track, start, end, gain, dragging the left edge?).
+    resize: Option<(usize, f64, f64, f32, bool)>,
     pub all_tracks: bool,
     pub custom_pct: f32,
 }
@@ -133,7 +135,7 @@ pub fn lanes(
         }
         ui.add_space(10.0);
         ui.label(theme::small(if n > 1 {
-            "Drag across a track to select part of it, then mute it or make it louder. The recording itself is never changed."
+            "Drag across a track to select part of it, then mute it or make it louder. Drag an edit's edge to resize it. The recording itself is never changed."
         } else {
             "This file has a single audio track. Recordings made since the upgrade have separate tracks."
         }));
@@ -292,20 +294,47 @@ pub fn lanes(
 
         // ---- interaction: drag = select, click = seek (or pick an edit)
         let resp = ui.interact(wave_area, ui.scope_id().with(("lane", i)), Sense::click_and_drag());
+        // An edit edge under the pointer (for resizing).
+        let edge_at = |x: f32| -> Option<(f64, f64, f32, bool)> {
+            edits.iter().filter(|e| e.track == i).find_map(|e| {
+                if (x - x_of(e.start)).abs() <= 5.0 {
+                    Some((e.start, e.end, e.gain, true))
+                } else if (x - x_of(e.end)).abs() <= 5.0 {
+                    Some((e.start, e.end, e.gain, false))
+                } else {
+                    None
+                }
+            })
+        };
+        let hover_edge = resp.hover_pos().and_then(|p| edge_at(p.x)).is_some();
         if resp.drag_started() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                st.drag = Some((i, t_of(pos.x)));
+                match edge_at(pos.x) {
+                    Some((a, b, g, left)) => st.resize = Some((i, a, b, g, left)),
+                    None => st.drag = Some((i, t_of(pos.x))),
+                }
             }
         }
         if resp.dragged() {
-            if let (Some((tr, start)), Some(pos)) = (st.drag, resp.interact_pointer_pos()) {
+            if let Some(pos) = resp.interact_pointer_pos() {
                 let t = t_of(pos.x.clamp(wave_area.left(), wave_area.right()));
-                st.sel = Some((tr, start.min(t), start.max(t)));
+                if let Some((tr, a, b, _, left)) = st.resize {
+                    let (na, nb) = if left { (t.min(b - 0.05), b) } else { (a, t.max(a + 0.05)) };
+                    st.sel = Some((tr, na, nb));
+                } else if let Some((tr, start)) = st.drag {
+                    st.sel = Some((tr, start.min(t), start.max(t)));
+                }
             }
         }
         if resp.drag_stopped() {
             st.drag = None;
-            if let Some((_, a, b)) = st.sel {
+            if let Some((tr, a, b, g, _)) = st.resize.take() {
+                if let Some((_, na, nb)) = st.sel {
+                    // Clear the old range, then apply the edit over the new one.
+                    actions.push(LaneAction::Edit { tracks: vec![tr], a, b, gain: 1.0 });
+                    actions.push(LaneAction::Edit { tracks: vec![tr], a: na, b: nb, gain: g });
+                }
+            } else if let Some((_, a, b)) = st.sel {
                 if ((b - a) / span) * (axis.width() as f64) < 3.0 {
                     st.sel = None;
                 }
@@ -326,7 +355,11 @@ pub fn lanes(
                 }
             }
         }
-        resp.on_hover_cursor(egui::CursorIcon::Text);
+        if hover_edge || st.resize.is_some() {
+            resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        } else {
+            resp.on_hover_cursor(egui::CursorIcon::Text);
+        }
     }
     actions
 }

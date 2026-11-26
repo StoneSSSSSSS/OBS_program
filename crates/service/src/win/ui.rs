@@ -41,6 +41,10 @@ pub const WM_APP_TRAY: u32 = WM_APP + 2;
 
 const TIMER_OVERLAY: usize = 1;
 const TIMER_TOAST: usize = 2;
+/// Global hotkeys suspended for hotkey capture come back after this long,
+/// even if the GUI never says so (closed mid-capture, crashed...).
+const TIMER_HOTKEY_RESUME: usize = 3;
+const HOTKEY_SUSPEND_MS: u32 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -308,6 +312,15 @@ impl UiState {
                         let _ = KillTimer(self.main, TIMER_OVERLAY);
                         let _ = ShowWindow(self.overlay.hwnd, SW_HIDE);
                     },
+                    TIMER_HOTKEY_RESUME => {
+                        unsafe {
+                            let _ = KillTimer(self.main, TIMER_HOTKEY_RESUME);
+                        }
+                        if self.hotkeys.is_empty() && self.mouse_hotkeys.is_empty() {
+                            tracing::info!("hotkey capture timed out; restoring global hotkeys");
+                            self.apply_config();
+                        }
+                    }
                     TIMER_TOAST => unsafe {
                         let _ = KillTimer(self.main, TIMER_TOAST);
                         let _ = ShowWindow(self.toast.hwnd, SW_HIDE);
@@ -383,9 +396,13 @@ impl UiState {
                         for (id, _, _) in self.hotkeys.drain(..) {
                             let _ = UnregisterHotKey(self.main, id);
                         }
+                        let _ = SetTimer(self.main, TIMER_HOTKEY_RESUME, HOTKEY_SUSPEND_MS, None);
                     }
                     self.mouse_hotkeys.clear();
                 } else {
+                    unsafe {
+                        let _ = KillTimer(self.main, TIMER_HOTKEY_RESUME);
+                    }
                     self.apply_config();
                 }
             }

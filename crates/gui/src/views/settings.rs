@@ -72,6 +72,13 @@ impl Default for SettingsView {
 }
 
 impl SettingsView {
+    /// Called when navigating away: never leave global hotkeys suspended.
+    pub fn leave(&mut self, c: &mut Ctx) {
+        if self.capturing.take().is_some() {
+            c.service.fire(Request::SuspendHotkeys { suspend: false });
+        }
+    }
+
     /// Jump to a section by name (used by the self-test).
     pub fn select_tab(&mut self, name: &str) {
         self.tab = match name {
@@ -436,7 +443,20 @@ impl SettingsView {
             toggle_row(ui, c, "Game track follows your game", "Points the Game track at whichever game you're playing.", &mut d.audio.game_audio_capture);
             toggle_row(ui, c, "Keep apps on other devices in the full mix", "e.g. Discord playing on a headset's \"chat\" channel instead of the default device.", &mut d.audio.auto_mix_other_devices);
             row(ui, "Voice chat apps", "Recorded on the Voice chat track.", |ui| list_editor(ui, &mut d.audio.voice_apps, &mut self.new_item[0], "Discord.exe"));
-            row(ui, "Music apps", "Recorded on the Music track.", |ui| list_editor(ui, &mut d.audio.music_apps, &mut self.new_item[1], "Spotify.exe"));
+            row(ui, "Music apps", "Recorded on the Music track. Sound is split per program, not per browser tab.", |ui| {
+                ui.vertical(|ui| {
+                    list_editor(ui, &mut d.audio.music_apps, &mut self.new_item[1], "Spotify.exe");
+                    if ui.button("Add browsers & media players").on_hover_text("YouTube, Twitch and other browser audio get their own slider (all browser tabs share it)").clicked() {
+                        for app in MEDIA_APPS {
+                            if !d.audio.music_apps.iter().any(|x| x.eq_ignore_ascii_case(app)) {
+                                d.audio.music_apps.push(app.to_string());
+                            }
+                        }
+                    }
+                });
+            });
+            ui.label(theme::small("Apps that aren't on the Voice chat or Music lists (and aren't a game) are only in the Full mix and Desktop tracks."));
+            ui.add_space(8.0);
             row(ui, "Desktop audio device", "\"default\" follows Windows. Or pin a specific output.", |ui| {
                 let outputs: Vec<Endpoint> = self.devices.as_ref().map(|x| x.outputs.clone()).unwrap_or_default();
                 egui::ComboBox::from_id_salt("desktop_dev").selected_text(d.audio.desktop_device.clone()).width(280.0).show_ui(ui, |ui| {
@@ -943,6 +963,9 @@ fn list_editor(ui: &mut Ui, list: &mut Vec<String>, new_item: &mut String, hint:
         });
     });
 }
+
+/// Browsers and media players offered by the "Add browsers & media players" button.
+const MEDIA_APPS: [&str; 7] = ["chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "opera_gx.exe", "vlc.exe"];
 
 fn label_for(pairs: &[(&str, &str)], key: &str) -> String {
     pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string()).unwrap_or_else(|| key.to_string())
