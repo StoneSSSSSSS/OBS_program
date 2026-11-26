@@ -28,6 +28,7 @@ pub enum UiEvent {
 }
 
 pub struct Service {
+    toast_tx: Sender<UiEvent>,
     pub shared: Arc<Mutex<Shared>>,
     client: Arc<Mutex<Option<Arc<IpcClient>>>>,
     pub events: Receiver<UiEvent>,
@@ -38,6 +39,7 @@ impl Service {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let client: Arc<Mutex<Option<Arc<IpcClient>>>> = Arc::new(Mutex::new(None));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let tx_keep = tx.clone();
         {
             let shared = shared.clone();
             let client = client.clone();
@@ -46,7 +48,7 @@ impl Service {
                 .spawn(move || connection_loop(ctx, shared, client, tx))
                 .expect("spawn");
         }
-        Service { shared, client, events: rx }
+        Service { shared, client, events: rx, toast_tx: tx_keep }
     }
 
     pub fn status(&self) -> Option<Status> {
@@ -58,6 +60,22 @@ impl Service {
     }
 
     /// Blocking call (use for quick requests).
+    /// Send without waiting (slow operations like restarting OBS). Errors
+    /// come back as toasts.
+    pub fn fire(&self, req: Request) {
+        let c = self.client.lock().clone();
+        let tx = self.toast_tx.clone();
+        std::thread::spawn(move || {
+            let r = match c {
+                Some(c) => c.call(req, Duration::from_secs(180)).map_err(|e| format!("{e:#}")),
+                None => Err("ClipVault service isn't running yet".into()),
+            };
+            if let Err(e) = r {
+                let _ = tx.send(UiEvent::Toast { level: "error".into(), message: e });
+            }
+        });
+    }
+
     pub fn call(&self, req: Request) -> Result<serde_json::Value, String> {
         let c = self.client.lock().clone();
         match c {

@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 /// Don't read the last few seconds of a growing file (partial fragment).
 const LIVE_SAFETY_S: f64 = 4.0;
 const LIVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Backfill reads whole files; cap it at this many x realtime (~190 MB/s for
+/// a 30 Mbit/s recording) so it never saturates the drive.
+const BACKFILL_READRATE: f64 = 50.0;
+
+/// True while a game is (or was recently) in focus: skip heavy backfill then.
+fn gaming(sh: &Shared) -> bool {
+    sh.status.lock().game.current.is_some()
+}
 
 pub fn run(sh: Arc<Shared>) {
     let _ = std::fs::create_dir_all(cv_core::paths::data_dir().join("waves"));
@@ -57,7 +65,7 @@ pub fn run(sh: Arc<Shared>) {
                 }
                 let tracks = if r.audio_tracks > 0 { r.audio_tracks as usize } else { live_tracks.max(1) };
                 let recorded = (cv_core::util::now_ms() - r.start_ms) as f64 / 1000.0 - LIVE_SAFETY_S;
-                extend(&tools.ffmpeg, &src, &wp, existing, tracks, recorded, &never, &mut failed, &r.path);
+                extend(&tools.ffmpeg, &src, &wp, existing, tracks, recorded, None, &never, &mut failed, &r.path);
                 live_done = Some((r.path.clone(), Instant::now()));
                 did_work = true;
                 continue;
@@ -65,17 +73,20 @@ pub fn run(sh: Arc<Shared>) {
             if r.audio_tracks <= 0 || r.duration <= 0.0 {
                 continue; // not probed yet
             }
+            if gaming(&sh) {
+                continue; // don't compete with a game for disk/CPU
+            }
             let complete = existing.as_ref().map(|w| w.tracks == r.audio_tracks as usize && w.duration_s() >= r.duration - 2.0).unwrap_or(false);
             if complete {
                 continue;
             }
-            extend(&tools.ffmpeg, &src, &wp, existing, r.audio_tracks as usize, r.duration, &never, &mut failed, &r.path);
+            extend(&tools.ffmpeg, &src, &wp, existing, r.audio_tracks as usize, r.duration, Some(BACKFILL_READRATE), &never, &mut failed, &r.path);
             did_work = true;
             // One full file per pass, then breathe (and re-check the live file).
             break;
         }
 
-        if !did_work {
+        if !did_work && !gaming(&sh) {
             // Clips (small files) once the recordings are done.
             let clips = db.list_clips(&ClipFilter::default()).unwrap_or_default();
             for c in clips.iter().filter(|c| c.audio_tracks > 0 && c.duration > 0.0).take(500) {
@@ -87,7 +98,7 @@ pub fn run(sh: Arc<Shared>) {
                 if wp.exists() || failed.contains(&c.path) || !src.is_file() {
                     continue;
                 }
-                extend(&tools.ffmpeg, &src, &wp, None, c.audio_tracks as usize, c.duration, &never, &mut failed, &c.path);
+                extend(&tools.ffmpeg, &src, &wp, None, c.audio_tracks as usize, c.duration, Some(BACKFILL_READRATE), &never, &mut failed, &c.path);
                 did_work = true;
                 break;
             }
@@ -109,6 +120,7 @@ fn extend(
     existing: Option<Waveform>,
     tracks: usize,
     upto_s: f64,
+    readrate: Option<f64>,
     cancel: &AtomicBool,
     failed: &mut HashSet<String>,
     key: &str,
@@ -118,7 +130,7 @@ fn extend(
     if upto_s - from < 1.0 {
         return;
     }
-    match generate(ffmpeg, src, tracks, from, cancel) {
+    match generate(ffmpeg, src, tracks, from, readrate, cancel) {
         Ok(w) => {
             base.append(&w);
             if let Err(e) = base.save(wp) {

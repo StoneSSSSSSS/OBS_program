@@ -62,7 +62,8 @@ impl HomeView {
                 if s.obs.closed_by_user || (!s.obs.running && !s.warnings.is_empty()) {
                     ui.horizontal(|ui| {
                         if theme::primary_button(ui, Some(icon::REFRESH), "Start OBS").clicked() {
-                            c.request(Request::RestartObs);
+                            c.service.fire(Request::RestartObs);
+                c.toast("info", "Restarting OBS…");
                         }
                     });
                     ui.add_space(8.0);
@@ -248,7 +249,7 @@ fn recording_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, footage_s: f64) 
     ui.add_space(6.0);
     let paused = s.recording.paused_by_user;
     if theme::ghost_button(ui, Some(if paused { icon::PLAY } else { icon::PAUSE }), if paused { "Resume" } else { "Pause" }).clicked() {
-        c.request(Request::SetRecording { enabled: paused });
+        c.service.fire(Request::SetRecording { enabled: paused });
     }
 }
 
@@ -272,7 +273,7 @@ fn replay_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, _: f64) {
     }
     ui.add_space(6.0);
     if theme::accent_button(ui, Some(icon::RECORD), "Save clip", c.accent).clicked() {
-        c.request(Request::SaveClip { short: false });
+        c.service.fire(Request::SaveClip { short: false });
     }
 }
 

@@ -64,6 +64,8 @@ pub struct RecordingsView {
     edits: Vec<AudioEdit>,
     edits_dirty: Option<Instant>,
     lane_state: LaneState,
+    /// Playhead when the player was last showing our file.
+    resume_ms: Option<i64>,
 }
 
 fn edits_file() -> PathBuf {
@@ -233,6 +235,17 @@ impl RecordingsView {
         }
         self.refresh(c);
         self.save_edits_if_due();
+        // The player is shared with the clip view: take it back if needed.
+        if let Some(p) = self.cur_path.clone() {
+            if c.player.path.as_deref() == Some(p.as_str()) {
+                self.resume_ms = self.playhead(c);
+            } else if let Some(t) = self.resume_ms.take() {
+                self.play_at(c, t, false);
+            } else {
+                self.cur = None;
+                self.cur_path = None;
+            }
+        }
         if GO_LIVE.swap(false, Ordering::SeqCst) {
             self.go_live(c);
         }
@@ -852,7 +865,7 @@ impl RecordingsView {
                             ui.painter().circle_stroke(resp.rect.center(), 11.0, Stroke::new(1.0, c.accent));
                         }
                         if resp.clicked() {
-                            c.request(Request::KeepRecording { recording_id: r.id, keep: !r.kept });
+                            c.service.fire(Request::KeepRecording { recording_id: r.id, keep: !r.kept });
                             self.dirty = true;
                         }
                         ui.label(theme::small(human_bytes(r.size.max(0) as u64)));

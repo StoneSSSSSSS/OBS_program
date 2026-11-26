@@ -122,8 +122,13 @@ pub fn level_u8(amp: f32) -> u8 {
 
 /// ffmpeg arguments producing interleaved s16 envelopes for `tracks` audio
 /// tracks on stdout, starting `from_s` seconds into the file.
-pub fn ffmpeg_args(input: &Path, tracks: usize, from_s: f64) -> Vec<String> {
+/// `readrate` (x realtime) throttles disk reads for background backfill.
+pub fn ffmpeg_args(input: &Path, tracks: usize, from_s: f64, readrate: Option<f64>) -> Vec<String> {
     let mut a: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into(), "-loglevel".into(), "error".into()];
+    if let Some(r) = readrate {
+        a.push("-readrate".into());
+        a.push(format!("{r:.0}"));
+    }
     if from_s > 0.0 {
         a.push("-ss".into());
         a.push(format!("{from_s:.3}"));
@@ -172,10 +177,10 @@ pub fn peaks_from_envelope(samples: &[i16], tracks: usize) -> Waveform {
 
 /// Run ffmpeg and build the waveform. Runs at below-normal priority so it
 /// never competes with a game.
-pub fn generate(ffmpeg: &Path, input: &Path, tracks: usize, from_s: f64, cancel: &AtomicBool) -> Result<Waveform> {
+pub fn generate(ffmpeg: &Path, input: &Path, tracks: usize, from_s: f64, readrate: Option<f64>, cancel: &AtomicBool) -> Result<Waveform> {
     let tracks = tracks.max(1);
     let mut cmd = Command::new(ffmpeg);
-    cmd.args(ffmpeg_args(input, tracks, from_s)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(ffmpeg_args(input, tracks, from_s, readrate)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -283,13 +288,13 @@ mod tests {
             .arg(&src);
         crate::util::hide_console(&mut cmd);
         assert!(cmd.status().unwrap().success());
-        let w = generate(&tools.ffmpeg, &src, 2, 0.0, &AtomicBool::new(false)).unwrap();
+        let w = generate(&tools.ffmpeg, &src, 2, 0.0, Some(200.0), &AtomicBool::new(false)).unwrap();
         assert!((w.duration_s() - 4.0).abs() < 0.3, "{}", w.duration_s());
         assert_eq!(w.max_in(0, 0.0, 4.0, 1000), 0, "silent track stays flat");
         assert!(w.max_in(1, 0.2, 1.8, 1000) > 150, "tone is loud");
         assert!(w.max_in(1, 2.6, 3.8, 1000) < 40, "silence after the tone");
         // Incremental from 2 s.
-        let tail = generate(&tools.ffmpeg, &src, 2, 2.0, &AtomicBool::new(false)).unwrap();
+        let tail = generate(&tools.ffmpeg, &src, 2, 2.0, None, &AtomicBool::new(false)).unwrap();
         assert!((tail.duration_s() - 2.0).abs() < 0.3);
     }
 }

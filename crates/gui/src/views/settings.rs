@@ -771,7 +771,8 @@ fn obs(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
         });
         row(ui, "", "", |ui| {
             if theme::ghost_button(ui, Some(icon::REFRESH), "Restart OBS now").clicked() {
-                c.request(Request::RestartObs);
+                c.service.fire(Request::RestartObs);
+                c.toast("info", "Restarting OBS…");
             }
         });
     });
@@ -847,7 +848,7 @@ fn about(ui: &mut Ui, c: &mut Ctx) {
                 let _ = std::process::Command::new("explorer.exe").arg(cv_core::paths::data_dir()).spawn();
             }
             if theme::ghost_button(ui, Some(icon::REFRESH), "Restart service").on_hover_text("OBS keeps recording while the service restarts").clicked() {
-                let _ = c.service.call(Request::Shutdown);
+                c.service.fire(Request::Shutdown);
                 c.toast("info", "Restarting the service…");
             }
         });

@@ -52,6 +52,8 @@ struct Detail {
     edits: Vec<AudioEdit>,
     edits_dirty: Option<Instant>,
     lanes: LaneState,
+    /// Where this clip was when the player was last showing it.
+    resume_pos: f64,
 }
 
 #[derive(Default)]
@@ -137,11 +139,28 @@ impl ClipsView {
             self.open_clip(c, req);
         }
         self.refresh(c);
+        self.reclaim_player(c);
         if self.open.is_some() {
             self.detail_ui(ui, c);
         } else {
             self.library_ui(ui, c);
         }
+    }
+
+    /// The player is shared with the 24/7 view: if it's showing something
+    /// else now, reload this clip (paused where it was).
+    fn reclaim_player(&mut self, c: &mut Ctx) {
+        let Some(clip) = self.detail.clip.clone() else { return };
+        if self.open.is_none() {
+            return;
+        }
+        if c.player.path.as_deref() == Some(clip.path.as_str()) {
+            self.detail.resume_pos = c.player.state().time_pos;
+            return;
+        }
+        c.player.edits = self.detail.edits.clone();
+        let mix = if c.cfg.player.remember_clip_mix { clip.mixer.clone() } else { None };
+        c.player.open(&clip.path, self.detail.resume_pos, clip.audio_tracks.max(0) as usize, &clip.track_names, mix.as_deref(), false, false, &c.cfg.player);
     }
 
     fn open_clip(&mut self, c: &mut Ctx, id: i64) {

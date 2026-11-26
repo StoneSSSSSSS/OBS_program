@@ -254,10 +254,7 @@ impl App {
                         .on_hover_text(format!("Saves the last {} ({})", cv_core::util::format_duration(self.c.cfg.clips.clip_length_secs as f64), self.c.cfg.hotkeys.save_clip))
                         .clicked()
                     {
-                        let r = self.c.service.call(Request::SaveClip { short: false });
-                        if let Err(e) = r {
-                            self.c.toast("error", e);
-                        }
+                        self.c.service.fire(Request::SaveClip { short: false });
                     }
                 });
             });
