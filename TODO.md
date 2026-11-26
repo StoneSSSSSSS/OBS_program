@@ -1,66 +1,77 @@
-# ClipVault: remaining work
+# ClipVault: status & remaining work
 
-Status as of 2026-11-25. The Rust rewrite (core library, background service, GUI) builds
-and runs on this PC. The service is managing OBS and recording 6 audio tracks. The items
-below are what's left, in priority order.
+Last updated 2026-11-25 (end of the first build session). Branch: `rust-rewrite`.
 
-## 1. Install on this PC (done 2026-11-25)
-- [x] `scripts/install.ps1` (run after `cargo build --release`): installs to `%LOCALAPPDATA%\Programs\ClipVault\`
-      with libmpv, bundled ffmpeg 6.0 and assets; removes the old `main.py` Startup shortcut; creates
-      `ClipVault Service.lnk` (Startup), plus Start Menu and Desktop shortcuts; restarts the service, which
-      adopts the running OBS.
-- To update after code changes: `cargo build --release`, then re-run `scripts\install.ps1`.
-- `third_party\libmpv-2.dll` is gitignored (122 MB). On a fresh machine, get `mpv-dev-x86_64-*.7z` from
-  https://github.com/shinchiro/mpv-winbuild-cmake/releases and extract `libmpv-2.dll` into `third_party\`.
-- The old Python files are still in the repo folder, untracked (listed in `.git/info/exclude`) and no longer
-  started at login. They can be deleted.
+## How to pick this up (for the next agent)
+1. Read `README.md` (features, layout, paths) and this file.
+2. Build and test: `cargo test --workspace` (101 tests; some use the real ffmpeg at
+   `C:\Program Files\ffmpeg-6.0-essentials_build\bin`).
+3. Install over the running copy: `cargo build --release`, then
+   `powershell -ExecutionPolicy Bypass -File scripts\install.ps1`. The installer stops and restarts the service and
+   GUI (it reopens the window if it was open). OBS keeps recording.
+4. `third_party\libmpv-2.dll` is gitignored (122 MB). On another machine, get `mpv-dev-x86_64-*.7z` from
+   https://github.com/shinchiro/mpv-winbuild-cmake/releases and extract `libmpv-2.dll` into `third_party\`.
+5. Logs: `%LOCALAPPDATA%\ClipVault\logs\service.log.*` and `gui.log.*`.
+   `clipvault-service.exe --diagnose` prints audio devices, OBS/websocket state, and pending settings.
+6. Debug hooks: env `CLIPVAULT_MPV_LOG=<file>` writes mpv's verbose log. Env `CLIPVAULT_SELFTEST=<dir>` makes the
+   GUI screenshot each page to `<dir>` and exit. The user asked for **no more screenshot testing** in this
+   session, and declined computer-use screen control.
+7. The user's standing instruction: keep improving continuously and push to GitHub regularly. Keep this file current.
 
-## 2. 24/7 timeline & player (user feedback): implemented, needs the user's eyes
-- [x] Audio-tracks button toggles **audio lanes** under the timeline (per track: name, mute, volume, waveform).
-- [x] Drag on the timeline to **scrub** (keyframe seeks while dragging, exact on release, resumes playback).
-      Drag the time ruler or right-drag to pan; wheel zooms; Shift+wheel pans; auto-pans at the edges.
-      Bigger playhead handle.
-- [x] Controls live in a bottom panel, so fullscreen and small windows never cut them off (24/7 and clip views).
-- [x] Marker labels truncate; the rename box has a fixed width and char limit (no more layout blow-up).
-- [x] Activity lane labelled ("what was on screen"), app names drawn in wide blocks, alt-tab blips merged.
-- [ ] Verify with the user (they asked for no more automated screenshot testing).
+## User context worth knowing
+- "M drive" = `I:` (volume label "Fast M2"). Recordings go to `I:\OBS\Recordings`, clips to `I:\OBS\Clips`.
+- Mic: Astro A50. Windows re-registers it as "2- …", "3- …" on reconnect, which is why the mic guard matches by name.
+  Windows' default output is the A50 *Voice* channel (Discord plays there).
+- The user loves their `assets/overlay_img.png`. **Never change it.**
+- Retention was switched from "keep N recordings" to "keep N hours of footage" (48 h), so nothing older was
+  deleted at the switch. An optional age limit is off by default.
+- The old Python program's files are still in the repo folder, untracked (see `.git/info/exclude`), and are no
+  longer started at login. They can be deleted once the user is happy.
 
-## 3. Non-destructive audio region edits: implemented
-- [x] Core `AudioEdit`, `apply_edit`/`rebase_edits`, DB schema v2 `clips.audio_edits` (auto-migrates v1).
-- [x] Per-track gain expressions (`volume=eval=frame:volume='g*if(between(t,a,b),x,1)…'`) in mpv `af` and ffmpeg export.
-- [x] Lanes: drag to select, then Mute / −6 dB / +6 dB / exact % / Reset, with an "All tracks" option.
-      Click an edit to select it. Editing a stem while in full-mix mode switches to separate tracks.
-- [x] 24/7 edits persist in `%LOCALAPPDATA%\ClipVault	imeline_edits.json` (pruned with old footage).
-- [x] Create clip carries the track volumes plus the edits inside the range into the clip's metadata;
-      the file keeps all original tracks. Trim and export honour the edits.
-- [ ] Ideas: drag edges of an existing edit to resize; fades at edit boundaries (avoid clicks on hard mutes).
+## Open decisions (ask the user)
+- **YouTube/browser audio**: apps not on the Voice/Music lists are only in the Full mix and Desktop tracks, so in
+  "Separate tracks" mode YouTube is silent unless Desktop is raised. Settings → Audio now has a one-click
+  "Add browsers & media players" (puts Chrome/Edge/Firefox/… on the Music track). Should that be the default,
+  and should the track be renamed "Music & media"?
+- Merge `rust-rewrite` into `main` (or open a PR) once the user has used it for a bit.
 
-## 4. Waveforms: implemented
-- [x] Service `waves.rs`: newest recordings first, then clips; the live file is extended every ~60 s;
-      below-normal priority; cleanup of orphaned files hourly. Files in `%LOCALAPPDATA%\ClipVault\waves`.
-- [x] GUI `lanes::Waves` cache reloads changed files; strided max for zoomed-out views.
-- [ ] Watch the CPU/disk impact while gaming. Each 1 h file is read once (~13 GB); consider throttling with
-      `-readrate`, or pausing while a game is focused.
+## Verify with the user (built, not yet confirmed by them)
+- Video playback in the clip and 24/7 views. The multi-track mixing bug was found and fixed (canonical-order
+  `join`). Not yet seen working by the user after the fix.
+- Timeline scrubbing feel, audio lanes, region edits (mute/louder/resize), game sessions list, "Show in 24/7".
+- Hotkey capture in Settings (the service suspends global hotkeys during capture).
 
-## 5. Smaller items
-- [ ] "Music" track: maybe rename to "Music & media" and include browsers/VLC by default, so YouTube has
-      its own slider. In separate-tracks mode, audio from apps that aren't in any list is currently only in
-      Desktop/Full mix (the user asked about YouTube; awaiting their decision).
-- [ ] Home page cards: content now stacks vertically (fixed); re-check at small window sizes.
-- [x] Clip detail: lanes replace the mixer card; edits are saved per clip.
-- [ ] Remove the self-test/mpv-log env hooks before release, or keep them documented.
-- [ ] README: document install, settings and troubleshooting.
+## Next improvements (ideas, in rough priority order)
+1. Fades at audio-edit boundaries. `volume` with `eval=frame` switches per audio frame (~21 ms), so hard mutes can
+   click. For exports, consider `afade`/per-sample `aeval`; for playback, a short ramp across a few frames.
+2. Waveform backfill: each 1 h file (~13 GB) is read once at ≤50x realtime and paused while a game is focused.
+   Watch CPU/disk impact. Waveforms for 24/7 files appear newest first.
+3. Clip view: zoom/pan on the clip's own timeline for long clips (7-minute replays), like the 24/7 view.
+4. Export straight from a 24/7 range (skip creating a clip first). Share presets (Discord 10 MB / 50 MB / 500 MB).
+5. "Undo" for the last audio edit (keep a small history in the views).
+6. Home page: small timeline preview of the last hour; quick "clip last 30 s from 24/7".
+7. Optional: hide the Desktop track from the mixer when it isn't useful; per-clip track renaming.
+8. Code hygiene: some GUI files are large (`views/recordings.rs`, `views/clips.rs`, `views/settings.rs`); split
+   them into smaller modules. Add GUI-free unit tests for the timeline math (`x_of`/`t_of`, zoom anchoring).
 
-## Done (for reference)
-- Core library (config with ~100 settings, SQLite library, OBS websocket client, OBS config writer,
-  ffmpeg cut/export/probe/thumbnail, game detection, footage-hours retention, mic matching, hotkeys):
-  87 unit tests, including real-ffmpeg and fake-OBS integration tests.
-- Service: launches/supervises OBS, crash restarts, stalled-recording watchdog, 6-track audio routing,
-  game-audio follows the focused game, apps on other devices added to the full mix, mic guard (fixes the
-  A50 "new device ID on reconnect" problem), clip hotkey + overlay (your image) + toasts, tray icon,
-  clip filing by game, stray-replay import, one-time tidy of the old clip folders (`migration.log`),
-  retention, jobs (clip from range, trim, export to size), local IPC for the GUI.
-- GUI: Home, 24/7 timeline with live playback, Clips library (games/categories/favourites/search,
-  bulk actions), clip view (trim, export, categories, notes), Settings (12 sections).
-- Multi-track playback mixing in libmpv (canonical-order `join` + per-track `af` gains, verified on real
-  6-track OBS files).
+## Done
+- **Core** (`crates/core`): config with ~100 settings, SQLite library (schema v2 with audio edits, auto-migrating),
+  OBS websocket v5 client, OBS config writer (dry-run aware, backups), ffmpeg probe/thumbnail/cut/export, gain
+  expressions for mixing and region edits, waveform generator, game detection (Steam/Epic/Riot folders, known
+  games, full-screen), footage-hours retention, mic matching by name, hotkey parsing, timeline math, IPC protocol.
+- **Service** (`crates/service`):
+  - OBS: launches and supervises OBS (crash restarts, restart limit, stall watchdog) and applies settings.
+  - Audio: 6-track routing with game audio following the focused game, and apps playing on other devices
+    added to the full mix. The mic guard uses Core Audio notifications.
+  - Clips: activity tracking, clip hotkey with overlay, filing by game, stray-replay import, and a one-time tidy of
+    the old clip folders (`%LOCALAPPDATA%\ClipVault\migration.log`).
+  - Background work: retention, jobs (clip from range / trim / export with edits), waveform worker (throttled,
+    pauses while gaming), tray and toasts, local IPC, hotkey suspend with a 30 s safety resume.
+- **GUI** (`crates/gui`):
+  - Pages: Home; 24/7 timeline (scrub, pan/zoom, activity lane, markers, clips, game sessions, Go live,
+    create clip); Clips library (search, games, categories, favourites, bulk actions); clip view (trim,
+    share/export, details, notes, Show in 24/7); Settings (12 sections).
+  - Audio lanes with waveforms, per-track mute/volume, and non-destructive region edits. Controls sit in
+    bottom panels, so fullscreen works.
+- **Install**: `scripts/install.ps1`; installed at `%LOCALAPPDATA%\Programs\ClipVault`, with
+  "ClipVault Service" in Startup, plus Start Menu and Desktop shortcuts.
