@@ -1,13 +1,17 @@
-# PyCharm / IntelliJ
-.idea/
+# Rust build output
+/target/
 
-# Python cache
+# Large third-party binaries (libmpv, ffmpeg) are fetched/copied by scripts/install.ps1
+/third_party/
+
+# IDEs
+.idea/
+.vscode/
+
+# Python leftovers from the old version
 __pycache__/
 *.pyc
-
-# Virtual environments
 venv/
-.env/
 
 # OS files
 .DS_Store
