@@ -4,15 +4,16 @@ Status as of 2026-11-25. The Rust rewrite (core library, background service, GUI
 and runs on this PC. The service is managing OBS and recording 6 audio tracks. The items
 below are what's left, in priority order.
 
-## 1. Install on this PC (replace the old Python startup)
-- [ ] Build release binaries (`cargo build --release`).
-- [ ] Install to `%LOCALAPPDATA%\Programs\ClipVault\`: `clipvault.exe`, `clipvault-service.exe`,
-      `libmpv-2.dll`, `ffmpeg.exe`/`ffprobe.exe` (copied from `C:\Program Files\ffmpeg-6.0-essentials_build\bin`),
-      `assets\overlay_img.png`.
-- [ ] Remove `main.py - Shortcut.lnk` from the Startup folder; create `ClipVault Service.lnk`
-      (`clipvault-service.exe --install-shortcuts --desktop` does the Startup, Start Menu and Desktop links).
-- [ ] Stop the dev-build service, start the installed one, and confirm it adopts the running OBS.
-- [ ] Write `scripts/install.ps1` so this is repeatable.
+## 1. Install on this PC (done 2026-11-25)
+- [x] `scripts/install.ps1` (run after `cargo build --release`): installs to `%LOCALAPPDATA%\Programs\ClipVault\`
+      with libmpv, bundled ffmpeg 6.0 and assets; removes the old `main.py` Startup shortcut; creates
+      `ClipVault Service.lnk` (Startup), plus Start Menu and Desktop shortcuts; restarts the service, which
+      adopts the running OBS.
+- To update after code changes: `cargo build --release`, then re-run `scripts\install.ps1`.
+- `third_party\libmpv-2.dll` is gitignored (122 MB). On a fresh machine, get `mpv-dev-x86_64-*.7z` from
+  https://github.com/shinchiro/mpv-winbuild-cmake/releases and extract `libmpv-2.dll` into `third_party\`.
+- The old Python files are still in the repo folder, untracked (listed in `.git/info/exclude`) and no longer
+  started at login. They can be deleted.
 
 ## 2. 24/7 timeline & player (user feedback)
 - [ ] The audio-tracks button (next to the speed menu) should show/hide **audio lanes under the timeline**
