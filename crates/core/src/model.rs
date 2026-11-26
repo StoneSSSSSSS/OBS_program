@@ -33,6 +33,63 @@ pub struct Category {
     pub clip_count: i64,
 }
 
+/// A non-destructive volume change on one audio track over a time range.
+/// `gain` 0 = muted, 1 = unchanged, 2 = twice as loud. Times are seconds on
+/// the media's own timeline (clip time), except in `Request::CutRange` where
+/// they are wall-clock seconds (Unix time) on the 24/7 timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AudioEdit {
+    pub track: usize,
+    pub start: f64,
+    pub end: f64,
+    pub gain: f32,
+}
+
+impl AudioEdit {
+    pub fn overlaps(&self, a: f64, b: f64) -> bool {
+        self.start < b && self.end > a
+    }
+}
+
+/// Apply a gain to `[a, b)` on `track`, replacing whatever edits covered that
+/// range on that track. `gain == 1.0` simply clears the range.
+pub fn apply_edit(edits: &mut Vec<AudioEdit>, track: usize, a: f64, b: f64, gain: f32) {
+    let (a, b) = (a.min(b), a.max(b));
+    if b - a < 0.01 {
+        return;
+    }
+    let mut out = Vec::with_capacity(edits.len() + 2);
+    for e in edits.drain(..) {
+        if e.track != track || !e.overlaps(a, b) {
+            out.push(e);
+            continue;
+        }
+        // Keep the parts of the old edit outside [a, b).
+        if e.start < a {
+            out.push(AudioEdit { end: a, ..e });
+        }
+        if e.end > b {
+            out.push(AudioEdit { start: b, ..e });
+        }
+    }
+    if (gain - 1.0).abs() > 0.001 {
+        out.push(AudioEdit { track, start: a, end: b, gain });
+    }
+    out.sort_by(|x, y| x.track.cmp(&y.track).then(x.start.total_cmp(&y.start)));
+    *edits = out;
+}
+
+/// Edits re-based onto a sub-range `[from, to)` of the timeline (e.g. when a
+/// clip is cut from the 24/7 recording or trimmed): clipped to the range and
+/// shifted so `from` becomes 0.
+pub fn rebase_edits(edits: &[AudioEdit], from: f64, to: f64) -> Vec<AudioEdit> {
+    edits
+        .iter()
+        .filter(|e| e.overlaps(from, to))
+        .map(|e| AudioEdit { track: e.track, start: e.start.max(from) - from, end: e.end.min(to) - from, gain: e.gain })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: i64,
@@ -56,6 +113,9 @@ pub struct Clip {
     pub source: String,
     /// JSON array of per-track gains the user last used.
     pub mixer: Option<Vec<f32>>,
+    /// Non-destructive per-track volume edits (clip time).
+    #[serde(default)]
+    pub audio_edits: Vec<AudioEdit>,
     pub thumb: String,
     pub probed: bool,
     pub missing: bool,
@@ -164,4 +224,37 @@ pub struct EventEntry {
     pub at_ms: i64,
     pub level: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(track: usize, start: f64, end: f64, gain: f32) -> AudioEdit {
+        AudioEdit { track, start, end, gain }
+    }
+
+    #[test]
+    fn applying_edits_replaces_overlaps() {
+        let mut v = vec![e(1, 0.0, 10.0, 0.0)];
+        apply_edit(&mut v, 1, 4.0, 6.0, 2.0);
+        assert_eq!(v, vec![e(1, 0.0, 4.0, 0.0), e(1, 4.0, 6.0, 2.0), e(1, 6.0, 10.0, 0.0)]);
+        // Other tracks untouched; gain 1 clears.
+        apply_edit(&mut v, 2, 0.0, 5.0, 0.5);
+        apply_edit(&mut v, 1, 3.0, 7.0, 1.0);
+        assert_eq!(v, vec![e(1, 0.0, 3.0, 0.0), e(1, 7.0, 10.0, 0.0), e(2, 0.0, 5.0, 0.5)]);
+        // Reversed ranges are normalised; tiny ranges ignored.
+        apply_edit(&mut v, 3, 9.0, 8.0, 0.0);
+        assert!(v.contains(&e(3, 8.0, 9.0, 0.0)));
+        let before = v.clone();
+        apply_edit(&mut v, 3, 1.0, 1.001, 0.0);
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn rebasing() {
+        let v = vec![e(0, 100.0, 110.0, 0.0), e(1, 95.0, 102.0, 2.0), e(2, 200.0, 210.0, 0.0)];
+        let r = rebase_edits(&v, 98.0, 108.0);
+        assert_eq!(r, vec![e(0, 2.0, 10.0, 0.0), e(1, 0.0, 4.0, 2.0)]);
+    }
 }

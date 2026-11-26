@@ -54,23 +54,55 @@ pub fn mpv_lavfi_complex(n: usize) -> Option<String> {
     Some(g)
 }
 
-/// The `af` chain that splits the merged stream back into tracks, applies a
-/// gain per track (`volume@gN`), and mixes them, with a limiter so boosting
-/// tracks can't clip.
-pub fn mpv_af(gains: &[f32]) -> String {
-    let n = gains.len().min(MAX_MIX_TRACKS);
+/// Per-track gain expression: the base gain times a factor for every edit on
+/// that track (`if(between(t,a,b),g,1)`), evaluated per audio frame. `offset`
+/// shifts edit times (e.g. an export that starts `offset` seconds into the
+/// clip, where ffmpeg's `t` restarts at 0).
+pub fn track_expr(base: f32, edits: &[crate::model::AudioEdit], track: usize, offset: f64) -> String {
+    let mut s = fmt_gain(base);
+    let mut n = 0;
+    for e in edits.iter().filter(|e| e.track == track) {
+        if n >= 400 {
+            break; // keep expressions bounded
+        }
+        let (a, b) = (e.start - offset, e.end - offset);
+        if b <= 0.0 {
+            continue;
+        }
+        s.push_str(&format!("*if(between(t,{:.3},{:.3}),{},1)", a.max(0.0), b, fmt_gain(e.gain)));
+        n += 1;
+    }
+    s
+}
+
+/// Expressions for every track from plain gains (no edits).
+pub fn gains_to_exprs(gains: &[f32]) -> Vec<String> {
+    gains.iter().map(|g| fmt_gain(*g)).collect()
+}
+
+/// Expressions for every track from gains + edits.
+pub fn exprs_for(gains: &[f32], edits: &[crate::model::AudioEdit], offset: f64) -> Vec<String> {
+    gains.iter().enumerate().map(|(i, g)| track_expr(*g, edits, i, offset)).collect()
+}
+
+fn volume_filter(i: usize, expr: &str) -> String {
+    format!("volume@g{i}=eval=frame:volume='{expr}'")
+}
+
+/// The `af` chain that splits the joined stream back into tracks, applies a
+/// gain expression per track (`volume@gN`), and mixes them, with a limiter so
+/// boosting tracks can't clip.
+pub fn mpv_af(exprs: &[String]) -> String {
+    let n = exprs.len().min(MAX_MIX_TRACKS);
     if n < 2 {
-        let g = gains.first().copied().unwrap_or(1.0);
-        return format!("@{MIX_FILTER_LABEL}:lavfi=[volume@g0={}]", fmt_gain(g));
+        let e = exprs.first().cloned().unwrap_or_else(|| "1.000".into());
+        return format!("@{MIX_FILTER_LABEL}:lavfi=[{}]", volume_filter(0, &e));
     }
     let splits: String = (0..n).map(|i| format!("[s{i}]")).collect();
     let mut graph = format!("asplit={n}{splits}");
-    for i in 0..n {
+    for (i, e) in exprs.iter().enumerate().take(n) {
         let (a, b) = CHANNEL_PAIRS[i];
-        graph.push_str(&format!(
-            ";[s{i}]pan=stereo|c0={a}|c1={b},volume@g{i}={}[m{i}]",
-            fmt_gain(gains[i])
-        ));
+        graph.push_str(&format!(";[s{i}]pan=stereo|c0={a}|c1={b},{}[m{i}]", volume_filter(i, e)));
     }
     let ms: String = (0..n).map(|i| format!("[m{i}]")).collect();
     graph.push_str(&format!(";{ms}amix=inputs={n}:normalize=0,alimiter=limit=0.98:level=disabled"));
@@ -78,12 +110,12 @@ pub fn mpv_af(gains: &[f32]) -> String {
 }
 
 /// Arguments for mpv's `af-command` to change one track's gain live.
-pub fn mpv_gain_command(track_index: usize, gain: f32) -> [String; 5] {
+pub fn mpv_gain_command(track_index: usize, expr: &str) -> [String; 5] {
     [
         "af-command".into(),
         MIX_FILTER_LABEL.into(),
         "volume".into(),
-        fmt_gain(gain),
+        expr.to_string(),
         format!("volume@g{track_index}"),
     ]
 }
@@ -93,19 +125,23 @@ fn fmt_gain(g: f32) -> String {
     format!("{g:.3}")
 }
 
-/// ffmpeg `-filter_complex` that mixes the given (track index, gain) pairs of
-/// input 0 into `[aout]`. Tracks with gain 0 are skipped. Returns `None` when
-/// every track is muted.
-pub fn ffmpeg_mix_filter(tracks: &[(usize, f32)]) -> Option<String> {
-    let active: Vec<(usize, f32)> = tracks.iter().copied().filter(|(_, g)| *g > 0.0005).collect();
+/// An expression whose base gain is zero is silent whatever the edits say.
+pub fn is_silent(expr: &str) -> bool {
+    expr.split('*').next().and_then(|b| b.parse::<f32>().ok()).map(|b| b <= 0.0005).unwrap_or(false)
+}
+
+/// ffmpeg `-filter_complex` that mixes the given (track index, gain
+/// expression) pairs of input 0 into `[aout]`. Silent tracks are skipped.
+/// Returns `None` when every track is silent.
+pub fn ffmpeg_mix_filter(tracks: &[(usize, String)]) -> Option<String> {
+    let active: Vec<&(usize, String)> = tracks.iter().filter(|(_, e)| !is_silent(e)).collect();
     if active.is_empty() {
         return None;
     }
     let mut parts = Vec::new();
-    for (k, (idx, g)) in active.iter().enumerate() {
+    for (k, (idx, e)) in active.iter().enumerate() {
         parts.push(format!(
-            "[0:a:{idx}]aformat=sample_rates=48000:channel_layouts=stereo,volume={}[x{k}]",
-            fmt_gain(*g)
+            "[0:a:{idx}]aformat=sample_rates=48000:channel_layouts=stereo,volume=eval=frame:volume='{e}'[x{k}]"
         ));
     }
     let n = active.len();
@@ -144,11 +180,17 @@ pub fn default_gains(n: usize, mode: &str, multitrack_layout: bool) -> Vec<f32> 
 mod tests {
     use super::*;
 
+    use crate::model::AudioEdit;
+
+    fn ex(gains: &[f32]) -> Vec<String> {
+        gains_to_exprs(gains)
+    }
+
     #[test]
     fn single_track_needs_no_complex_graph() {
         assert_eq!(mpv_lavfi_complex(0), None);
         assert_eq!(mpv_lavfi_complex(1), None);
-        assert_eq!(mpv_af(&[0.5]), "@cvmix:lavfi=[volume@g0=0.500]");
+        assert_eq!(mpv_af(&ex(&[0.5])), "@cvmix:lavfi=[volume@g0=eval=frame:volume='0.500']");
     }
 
     #[test]
@@ -156,10 +198,10 @@ mod tests {
         let lc = mpv_lavfi_complex(3).unwrap();
         assert!(lc.starts_with("[aid1]aformat=sample_rates=48000:channel_layouts=stereo[cvt0];"));
         assert!(lc.ends_with("[cvt0][cvt1][cvt2]join=inputs=3:channel_layout=FL+FR+FC+BL+BR+BC:map=0.0-FL|0.1-FR|1.0-FC|1.1-BC|2.0-BL|2.1-BR[ao]"));
-        let af = mpv_af(&[1.0, 0.0, 0.25]);
+        let af = mpv_af(&ex(&[1.0, 0.0, 0.25]));
         assert!(af.starts_with("@cvmix:lavfi=[asplit=3[s0][s1][s2]"));
-        assert!(af.contains("[s1]pan=stereo|c0=FC|c1=BC,volume@g1=0.000[m1]"));
-        assert!(af.contains("volume@g2=0.250"));
+        assert!(af.contains("[s1]pan=stereo|c0=FC|c1=BC,volume@g1=eval=frame:volume='0.000'[m1]"));
+        assert!(af.contains("volume@g2=eval=frame:volume='0.250'"));
         assert!(af.ends_with("amix=inputs=3:normalize=0,alimiter=limit=0.98:level=disabled]"));
     }
 
@@ -179,23 +221,43 @@ mod tests {
         let lc = mpv_lavfi_complex(9).unwrap();
         assert!(lc.contains("join=inputs=6"));
         assert!(!lc.contains("aid7"));
-        let cmd = mpv_gain_command(2, 9.0);
+        let cmd = mpv_gain_command(2, &track_expr(9.0, &[], 2, 0.0));
         assert_eq!(cmd[3], "4.000");
         assert_eq!(cmd[4], "volume@g2");
-        assert_eq!(mpv_gain_command(0, f32::NAN)[3], "1.000");
+        assert_eq!(track_expr(f32::NAN, &[], 0, 0.0), "1.000");
+    }
+
+    #[test]
+    fn edit_expressions() {
+        let edits = [
+            AudioEdit { track: 1, start: 3.0, end: 5.0, gain: 0.0 },
+            AudioEdit { track: 1, start: 8.0, end: 9.5, gain: 2.0 },
+            AudioEdit { track: 2, start: 1.0, end: 2.0, gain: 0.5 },
+        ];
+        assert_eq!(track_expr(0.8, &edits, 1, 0.0), "0.800*if(between(t,3.000,5.000),0.000,1)*if(between(t,8.000,9.500),2.000,1)");
+        assert_eq!(track_expr(1.0, &edits, 0, 0.0), "1.000");
+        // Offset (export starting 4 s in): first edit partly before 0, last entirely in range.
+        assert_eq!(track_expr(1.0, &edits, 1, 4.0), "1.000*if(between(t,0.000,1.000),0.000,1)*if(between(t,4.000,5.500),2.000,1)");
+        // Edits entirely before the offset disappear.
+        assert_eq!(track_expr(1.0, &edits, 2, 3.0), "1.000");
+        let all = exprs_for(&[1.0, 0.8, 1.0], &edits, 0.0);
+        assert_eq!(all.len(), 3);
+        assert!(all[2].contains("0.500"));
+        assert!(is_silent("0.000*if(between(t,1,2),2,1)"));
+        assert!(!is_silent("0.500"));
     }
 
     #[test]
     fn ffmpeg_filters() {
-        assert_eq!(ffmpeg_mix_filter(&[(0, 0.0), (1, 0.0)]), None);
-        let one = ffmpeg_mix_filter(&[(0, 0.0), (2, 1.5)]).unwrap();
+        assert_eq!(ffmpeg_mix_filter(&[(0, "0.000".into()), (1, "0.000".into())]), None);
+        let one = ffmpeg_mix_filter(&[(0, "0.000".into()), (2, "1.500".into())]).unwrap();
         assert_eq!(
             one,
-            "[0:a:2]aformat=sample_rates=48000:channel_layouts=stereo,volume=1.500[x0];[x0]alimiter=limit=0.98:level=disabled[aout]"
+            "[0:a:2]aformat=sample_rates=48000:channel_layouts=stereo,volume=eval=frame:volume='1.500'[x0];[x0]alimiter=limit=0.98:level=disabled[aout]"
         );
-        let two = ffmpeg_mix_filter(&[(1, 1.0), (3, 0.3)]).unwrap();
+        let two = ffmpeg_mix_filter(&[(1, "1.000".into()), (3, "0.300*if(between(t,1.000,2.000),0.000,1)".into())]).unwrap();
         assert!(two.contains("[0:a:1]"));
-        assert!(two.contains("[0:a:3]"));
+        assert!(two.contains("volume='0.300*if(between(t,1.000,2.000),0.000,1)'"));
         assert!(two.contains("amix=inputs=2:normalize=0:duration=longest"));
     }
 

@@ -49,7 +49,20 @@ pub enum Request {
     /// Config file changed; reload it (restarting OBS if `restart_obs`).
     ReloadConfig { restart_obs: bool },
     /// Make a clip from wall-clock range of the continuous recording.
-    CutRange { from_ms: i64, to_ms: i64, title: String, game_id: Option<i64>, category_ids: Vec<i64>, precise: Option<bool> },
+    /// `gains` = per-track volumes to remember with the clip; `audio_edits`
+    /// use wall-clock seconds and are re-based onto the clip.
+    CutRange {
+        from_ms: i64,
+        to_ms: i64,
+        title: String,
+        game_id: Option<i64>,
+        category_ids: Vec<i64>,
+        precise: Option<bool>,
+        #[serde(default)]
+        gains: Vec<f32>,
+        #[serde(default)]
+        audio_edits: Vec<crate::model::AudioEdit>,
+    },
     /// Trim an existing clip into a new clip (or replace it).
     TrimClip { clip_id: i64, start_s: f64, end_s: f64, replace: bool, precise: Option<bool> },
     /// Export a shareable copy with a mixed-down audio track.

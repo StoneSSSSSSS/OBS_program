@@ -22,6 +22,7 @@ pub mod paths;
 pub mod retention;
 pub mod timeline;
 pub mod util;
+pub mod waveform;
 
 pub const APP_NAME: &str = "ClipVault";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

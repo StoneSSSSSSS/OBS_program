@@ -483,8 +483,8 @@ pub fn cut_args(parts: &[CutPart], out: &Path, list_file: &Path, precise: bool, 
 /// Settings for exporting a shareable file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ExportSpec {
-    /// (audio track index, gain). Empty = keep all tracks untouched.
-    pub gains: Vec<(usize, f32)>,
+    /// (audio track index, gain expression). Empty = keep all tracks untouched.
+    pub gains: Vec<(usize, String)>,
     /// Optional (start, end) seconds within the input.
     pub range: Option<(f64, f64)>,
     /// Re-encode to fit this many MB (None = keep video as is).
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn export_arg_shapes() {
         let info = ProbeInfo { width: 2560, height: 1440, duration: 30.0, ..Default::default() };
-        let spec = ExportSpec { gains: vec![(1, 1.0), (2, 0.5)], range: Some((5.0, 15.0)), target_size_mb: Some(10), max_height: 1080, reencode_video: false };
+        let spec = ExportSpec { gains: vec![(1, "1.000".into()), (2, "0.500".into())], range: Some((5.0, 15.0)), target_size_mb: Some(10), max_height: 1080, reencode_video: false };
         let a = export_args(Path::new("in.mp4"), Path::new("out.mp4"), &spec, &EncodeOptions::default(), &info, Some(2000));
         let fc = a.iter().position(|s| s == "-filter_complex").unwrap();
         assert!(a[fc + 1].starts_with("[0:v:0]scale=-2:720"));
@@ -749,7 +749,7 @@ mod tests {
 
         // Export with a custom mix to a size target.
         let out = dir.path().join("share.mp4");
-        let spec = ExportSpec { gains: vec![(0, 1.0), (1, 0.3)], range: None, target_size_mb: Some(1), max_height: 0, reencode_video: false };
+        let spec = ExportSpec { gains: vec![(0, "1.000".into()), (1, "0.300*if(between(t,2.000,4.000),0.000,1)".into())], range: None, target_size_mb: Some(1), max_height: 0, reencode_video: false };
         let enc = EncodeOptions { video_encoder: "libx264".into(), quality: 30, audio_bitrate_kbps: 96 };
         let k = bitrate_for_size(1, info.duration, 96).unwrap();
         let args = export_args(&src, &out, &spec, &enc, &info, Some(k));

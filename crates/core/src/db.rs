@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -132,6 +132,15 @@ impl Db {
 
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA_V1)?;
+        // v2: non-destructive audio edits per clip.
+        let has_edits: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('clips') WHERE name='audio_edits'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_edits == 0 {
+            self.conn.execute("ALTER TABLE clips ADD COLUMN audio_edits TEXT NOT NULL DEFAULT ''", [])?;
+        }
         let v: Option<String> = self
             .conn
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
@@ -359,6 +368,7 @@ impl Db {
     fn row_clip(r: &Row) -> rusqlite::Result<Clip> {
         let names: String = r.get("track_names")?;
         let mixer: String = r.get("mixer")?;
+        let edits: String = r.get("audio_edits")?;
         Ok(Clip {
             id: r.get("id")?,
             path: r.get("path")?,
@@ -378,6 +388,7 @@ impl Db {
             notes: r.get("notes")?,
             source: r.get("source")?,
             mixer: serde_json::from_str(&mixer).ok(),
+            audio_edits: serde_json::from_str(&edits).unwrap_or_default(),
             thumb: r.get("thumb")?,
             probed: r.get::<_, i64>("probed")? != 0,
             missing: r.get::<_, i64>("missing")? != 0,
@@ -542,6 +553,12 @@ impl Db {
             None => String::new(),
         };
         self.conn.execute("UPDATE clips SET mixer=?2 WHERE id=?1", params![id, s])?;
+        Ok(())
+    }
+
+    pub fn set_clip_audio_edits(&self, id: i64, edits: &[AudioEdit]) -> Result<()> {
+        let s = if edits.is_empty() { String::new() } else { serde_json::to_string(edits)? };
+        self.conn.execute("UPDATE clips SET audio_edits=?2 WHERE id=?1", params![id, s])?;
         Ok(())
     }
 
@@ -810,7 +827,7 @@ mod tests {
         }
         let db = Db::open(&p).unwrap();
         assert_eq!(db.meta_get("x").unwrap().as_deref(), Some("1"));
-        assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("1"));
+        assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("2"));
     }
 
     #[test]
@@ -888,6 +905,10 @@ mod tests {
         assert!(clip.probed);
         assert_eq!(clip.track_names, vec!["Full mix", "Game"]);
         assert_eq!(clip.mixer, Some(vec![1.0, 0.5]));
+        db.set_clip_audio_edits(c, &[AudioEdit { track: 2, start: 1.0, end: 2.5, gain: 0.0 }]).unwrap();
+        assert_eq!(db.clip(c).unwrap().unwrap().audio_edits, vec![AudioEdit { track: 2, start: 1.0, end: 2.5, gain: 0.0 }]);
+        db.set_clip_audio_edits(c, &[]).unwrap();
+        assert!(db.clip(c).unwrap().unwrap().audio_edits.is_empty());
         db.set_clip_mixer(c, None).unwrap();
         assert_eq!(db.clip(c).unwrap().unwrap().mixer, None);
         db.merge_games(g1, g2).unwrap();
@@ -942,5 +963,27 @@ mod tests {
         let b = Db::open(&p).unwrap();
         let id = a.create_category("Shared", "").unwrap();
         assert_eq!(b.list_categories().unwrap()[0].id, id);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// A v1 database (no audio_edits column) upgrades in place.
+    #[test]
+    fn upgrades_v1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("old.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '1')", []).unwrap();
+            c.execute("INSERT INTO clips(path, title, created_at) VALUES ('a.mp4', 'a', 1)", []).unwrap();
+        }
+        let db = Db::open(&p).unwrap();
+        let clip = db.clip_by_path("a.mp4").unwrap().unwrap();
+        assert!(clip.audio_edits.is_empty());
+        assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("2"));
     }
 }
