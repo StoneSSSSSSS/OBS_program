@@ -2,10 +2,11 @@
 //! (player, trim, mixer, export, organise).
 
 use crate::app::Ctx;
+use crate::lanes::{self, LaneAction, LaneState, WaveSource, GUTTER};
 use crate::player::seek_bar;
 use crate::theme::{self, icon};
 use cv_core::ipc::Request;
-use cv_core::model::{Category, Clip, ClipFilter, ClipSort, Game};
+use cv_core::model::{apply_edit, AudioEdit, Category, Clip, ClipFilter, ClipSort, Game};
 use cv_core::util::{format_duration, format_duration_precise, human_bytes, now_ms};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::collections::HashSet;
@@ -47,6 +48,10 @@ struct Detail {
     new_cat: String,
     mix_dirty: Option<Instant>,
     share_mb: u32,
+    /// Non-destructive audio edits (clip time).
+    edits: Vec<AudioEdit>,
+    edits_dirty: Option<Instant>,
+    lanes: LaneState,
 }
 
 #[derive(Default)]
@@ -147,6 +152,7 @@ impl ClipsView {
         }
         let start = if clip.last_position > 1.0 && clip.last_position < clip.duration - 2.0 { clip.last_position } else { 0.0 };
         let mix = if c.cfg.player.remember_clip_mix { clip.mixer.clone() } else { None };
+        c.player.edits = clip.audio_edits.clone();
         c.player.open(&clip.path, start, clip.audio_tracks.max(0) as usize, &clip.track_names, mix.as_deref(), false, c.cfg.player.autoplay, &c.cfg.player);
         if c.player.track_count > 1 {
             c.player.show_mixer = true;
@@ -159,6 +165,7 @@ impl ClipsView {
             title_edit: clip.title.clone(),
             notes_edit: clip.notes.clone(),
             share_mb: c.cfg.export.target_size_mb,
+            edits: clip.audio_edits.clone(),
             clip: Some(clip),
             ..Default::default()
         };
@@ -642,45 +649,111 @@ impl ClipsView {
                 egui::ScrollArea::vertical().id_salt("clip_side_scroll").auto_shrink(false).show(ui, |ui| self.side_ui(ui, c, &clip));
             });
 
-        let avail = ui.available_size();
-        let vw = avail.x;
-        let vh = (vw * 9.0 / 16.0).min(avail.y - 130.0).max(200.0);
-        c.player.video(ui, Vec2::new(vw, vh));
-        ui.add_space(4.0);
-        seek_bar(ui, &mut c.player, &mut self.detail.in_pt, &mut self.detail.out_pt, c.accent);
-        let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
-        c.player.transport(ui, &label, &c.cfg.player);
-    }
-
-    fn fullscreen_player(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        let st = c.player.state();
-        let avail = ui.available_size();
-        c.player.video(ui, Vec2::new(avail.x, avail.y - 80.0));
-        egui::Frame::NONE.inner_margin(Margin::symmetric(16, 4)).show(ui, |ui| {
-            seek_bar(ui, &mut c.player, &mut self.detail.in_pt, &mut self.detail.out_pt, c.accent);
+        // Controls in a bottom panel so they always fit; video takes the rest.
+        egui::Panel::bottom("clip_controls").resizable(false).frame(egui::Frame::NONE).show(ui, |ui| {
+            ui.add_space(4.0);
+            let lanes_on = c.player.show_mixer;
+            ui.horizontal(|ui| {
+                if lanes_on {
+                    ui.add_space(GUTTER);
+                }
+                seek_bar(ui, &mut c.player, &mut self.detail.in_pt, &mut self.detail.out_pt, c.accent);
+            });
+            if lanes_on {
+                self.clip_lanes(ui, c, &clip);
+            }
             let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
             c.player.transport(ui, &label, &c.cfg.player);
         });
+        let avail = ui.available_size();
+        let vh = (avail.x * 9.0 / 16.0).min(avail.y).max(120.0);
+        c.player.video(ui, Vec2::new(avail.x, vh));
+        self.persist_audio(c, &clip);
     }
 
-    fn side_ui(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
-        // Audio mixer.
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            if c.player.mixer(ui, c.accent) {
-                self.detail.mix_dirty = Some(Instant::now());
+    fn clip_lanes(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
+        let dur = c.player.state().duration.max(clip.duration).max(0.1);
+        let wave = c.waves.get(&clip.path).cloned();
+        let sources: Vec<WaveSource> = wave.iter().map(|w| WaveSource { start: 0.0, end: dur, wave: w }).collect();
+        let ph = Some(c.player.state().time_pos);
+        let acts = lanes::lanes(ui, &mut c.player, 0.0, dur, false, &sources, &self.detail.edits, ph, &mut self.detail.lanes, c.accent);
+        for a in acts {
+            match a {
+                LaneAction::Seek(t) => c.player.seek(t, true),
+                LaneAction::Edit { tracks, a, b, gain } => {
+                    for tr in &tracks {
+                        apply_edit(&mut self.detail.edits, *tr, a, b, gain);
+                    }
+                    if tracks.iter().any(|t| *t > 0) && c.player.mode == crate::player::MixMode::Full && gain != 1.0 {
+                        c.player.set_mode(crate::player::MixMode::Separate);
+                        self.detail.mix_dirty = Some(Instant::now());
+                        c.toast("info", "Switched to separate tracks so the edit is audible");
+                    }
+                    c.player.set_edits(self.detail.edits.clone());
+                    self.detail.edits_dirty = Some(Instant::now());
+                }
+                LaneAction::MixChanged => self.detail.mix_dirty = Some(Instant::now()),
             }
-        });
+        }
+    }
+
+    /// Save the clip's mix and audio edits shortly after they change.
+    fn persist_audio(&mut self, c: &mut Ctx, clip: &Clip) {
         if let Some(t) = self.detail.mix_dirty {
-            if t.elapsed() > Duration::from_millis(800) && c.cfg.player.remember_clip_mix {
-                let gains = c.player.effective_gains();
-                if let Some(db) = c.db() {
-                    let _ = db.set_clip_mixer(clip.id, Some(&gains));
+            if t.elapsed() > Duration::from_millis(800) {
+                if c.cfg.player.remember_clip_mix {
+                    let gains = c.player.effective_gains();
+                    if let Some(db) = c.db() {
+                        let _ = db.set_clip_mixer(clip.id, Some(&gains));
+                    }
                 }
                 self.detail.mix_dirty = None;
             }
         }
-        ui.add_space(12.0);
+        if let Some(t) = self.detail.edits_dirty {
+            if t.elapsed() > Duration::from_millis(500) {
+                let edits = self.detail.edits.clone();
+                if let Some(db) = c.db() {
+                    let _ = db.set_clip_audio_edits(clip.id, &edits);
+                }
+                self.detail.edits_dirty = None;
+            }
+        }
+        if self.detail.mix_dirty.is_some() || self.detail.edits_dirty.is_some() {
+            ui_repaint_soon();
+        }
+    }
+
+    fn fullscreen_player(&mut self, ui: &mut Ui, c: &mut Ctx) {
+        let st = c.player.state();
+        egui::Panel::bottom("clip_fs_controls").resizable(false).frame(egui::Frame::NONE.fill(theme::BG).inner_margin(Margin::symmetric(16, 8))).show(ui, |ui| {
+            seek_bar(ui, &mut c.player, &mut self.detail.in_pt, &mut self.detail.out_pt, c.accent);
+            let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
+            c.player.transport(ui, &label, &c.cfg.player);
+        });
+        let avail = ui.available_size();
+        c.player.video(ui, avail);
+    }
+
+    fn side_ui(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
+        ui.set_max_width(ui.available_width());
+        if !self.detail.edits.is_empty() {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::title("Audio edits"));
+                let n = self.detail.edits.len();
+                ui.label(theme::small(format!(
+                    "{n} part{} of the audio muted or changed. The original audio is untouched; exports and shares use these edits.",
+                    if n == 1 { "" } else { "s" }
+                )));
+                if ui.button("Remove all edits").clicked() {
+                    self.detail.edits.clear();
+                    c.player.set_edits(Vec::new());
+                    self.detail.edits_dirty = Some(Instant::now());
+                }
+            });
+            ui.add_space(12.0);
+        }
 
         // Trim / cut.
         theme::card().show(ui, |ui| {
@@ -976,4 +1049,17 @@ pub fn relative_time(ms: i64) -> String {
 
 pub fn show_in_folder(path: &str) {
     let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{path}")).spawn();
+}
+
+fn ui_repaint_soon() {
+    // Debounced saves need a frame after the delay even when idle.
+    if let Some(ctx) = REPAINT_CTX.get() {
+        ctx.request_repaint_after(Duration::from_millis(300));
+    }
+}
+
+static REPAINT_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+pub fn set_repaint_ctx(ctx: &egui::Context) {
+    let _ = REPAINT_CTX.set(ctx.clone());
 }

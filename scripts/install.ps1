@@ -34,6 +34,7 @@ foreach ($svc in $services) {
     if (Test-Path $svc) { try { & $svc --stop 2>$null | Out-Null } catch {} }
 }
 Start-Sleep -Seconds 2
+$guiWasOpen = [bool](Get-Process clipvault -ErrorAction SilentlyContinue)
 Get-Process clipvault, clipvault-service -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 1
 
@@ -77,4 +78,9 @@ if (-not $NoDesktopShortcut) { $shortcutArgs += '--desktop' }
 if (-not $NoStart) {
     Start-Process (Join-Path $Dest 'clipvault-service.exe') -WorkingDirectory $Dest
     Write-Output 'ClipVault service started (it adopts the running OBS).'
+    if ($guiWasOpen) {
+        Start-Sleep -Seconds 2
+        Start-Process (Join-Path $Dest 'clipvault.exe') -WorkingDirectory $Dest
+        Write-Output 'Reopened the ClipVault window.'
+    }
 }

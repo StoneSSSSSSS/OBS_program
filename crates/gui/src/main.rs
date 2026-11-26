@@ -3,6 +3,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod lanes;
 mod mpv;
 mod player;
 mod service;

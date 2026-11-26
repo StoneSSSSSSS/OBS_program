@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use cv_core::db::Db;
 use cv_core::ffmpeg::{bitrate_for_size, concat_list, cut_args, export_args, EncodeOptions, ExportSpec};
 use cv_core::ipc::{Event, JobInfo};
-use cv_core::model::NewClip;
+use cv_core::model::{rebase_edits, AudioEdit, NewClip};
 use cv_core::naming::{render_template, sanitize_component, unique_path};
 use cv_core::timeline::{plan_cut, plan_duration_s, CutPart, Segment};
 use cv_core::util::now_ms;
@@ -19,7 +19,16 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum JobKind {
-    CutRange { from_ms: i64, to_ms: i64, title: String, game_id: Option<i64>, category_ids: Vec<i64>, precise: Option<bool> },
+    CutRange {
+        from_ms: i64,
+        to_ms: i64,
+        title: String,
+        game_id: Option<i64>,
+        category_ids: Vec<i64>,
+        precise: Option<bool>,
+        gains: Vec<f32>,
+        audio_edits: Vec<AudioEdit>,
+    },
     Trim { clip_id: i64, start_s: f64, end_s: f64, replace: bool, precise: Option<bool> },
     Export { clip_id: i64, range: Option<(f64, f64)>, gains: Vec<f32>, target_size_mb: Option<u32> },
 }
@@ -90,8 +99,9 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<JobRequest>) {
             }
         };
         let result = match &req.kind {
-            JobKind::CutRange { from_ms, to_ms, title, game_id, category_ids, precise } => {
-                cut_range(&sh, *from_ms, *to_ms, title, *game_id, category_ids, *precise, &mut progress, &req.cancel)
+            JobKind::CutRange { from_ms, to_ms, title, game_id, category_ids, precise, gains, audio_edits } => {
+                let meta = ClipMeta { category_ids, gains, audio_edits };
+                cut_range(&sh, *from_ms, *to_ms, title, *game_id, &meta, *precise, &mut progress, &req.cancel)
             }
             JobKind::Trim { clip_id, start_s, end_s, replace, precise } => {
                 trim(&sh, *clip_id, *start_s, *end_s, *replace, *precise, &mut progress, &req.cancel)
@@ -152,6 +162,15 @@ fn encode_opts(cfg: &cv_core::config::Config) -> EncodeOptions {
     }
 }
 
+/// Metadata carried from the 24/7 view onto a new clip.
+struct ClipMeta<'a> {
+    category_ids: &'a [i64],
+    /// Track volumes in use when the clip was made.
+    gains: &'a [f32],
+    /// Edits in wall-clock seconds.
+    audio_edits: &'a [AudioEdit],
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cut_range(
     sh: &Shared,
@@ -159,7 +178,7 @@ fn cut_range(
     to_ms: i64,
     title: &str,
     game_id: Option<i64>,
-    category_ids: &[i64],
+    meta: &ClipMeta,
     precise: Option<bool>,
     progress: &mut dyn FnMut(f32),
     cancel: &AtomicBool,
@@ -240,8 +259,17 @@ fn cut_range(
         })?;
         drop(_lock);
         let mut db2 = Db::open_default()?;
-        if !category_ids.is_empty() {
-            db2.set_clip_categories(id, category_ids)?;
+        if !meta.category_ids.is_empty() {
+            db2.set_clip_categories(id, meta.category_ids)?;
+        }
+        // Non-destructive: the file keeps every original track; the volumes
+        // and edits are remembered with the clip and can be changed later.
+        if meta.gains.len() > 1 && meta.gains.len() as i64 == tracks.unwrap_or(0) {
+            db.set_clip_mixer(id, Some(meta.gains))?;
+        }
+        let edits = rebase_edits(meta.audio_edits, from_ms as f64 / 1000.0, to_ms as f64 / 1000.0);
+        if !edits.is_empty() {
+            db.set_clip_audio_edits(id, &edits)?;
         }
         probe_and_thumb(&db, &tools, id, &dest, cfg.clips.generate_thumbnails);
         sh.toast(ToastLevel::Success, format!("Clip created: {}", dest.file_stem().unwrap_or_default().to_string_lossy()));
@@ -287,6 +315,7 @@ fn trim(
         std::fs::rename(&tmp, &src)?;
         drop(_lock);
         probe_and_thumb(&db, &tools, clip_id, &src, cfg.clips.generate_thumbnails);
+        db.set_clip_audio_edits(clip_id, &rebase_edits(&clip.audio_edits, start_s, end_s))?;
         let new_start = clip.source_start_ms.map(|s| s + (start_s * 1000.0) as i64);
         let _ = db.set_clip_source_start(clip_id, new_start);
         let _ = db.set_clip_position(clip_id, 0.0);
@@ -308,6 +337,10 @@ fn trim(
         })?;
         drop(_lock);
         db.set_clip_categories(id, &clip.category_ids)?;
+        db.set_clip_audio_edits(id, &rebase_edits(&clip.audio_edits, start_s, end_s))?;
+        if let Some(m) = &clip.mixer {
+            db.set_clip_mixer(id, Some(m))?;
+        }
         probe_and_thumb(&db, &tools, id, &dest, cfg.clips.generate_thumbnails);
         sh.toast(ToastLevel::Success, "Trimmed copy saved");
         Ok((dest, Some(id)))
@@ -332,8 +365,11 @@ fn export(
     let info = tools.probe(&src)?;
     let n = info.audio.len();
     // Mix only if the user changed something or there are several tracks.
-    let gains_full: Vec<(usize, f32)> = (0..n).map(|i| (i, gains.get(i).copied().unwrap_or(if i == 0 { 1.0 } else { 0.0 }))).collect();
-    let untouched = n <= 1 && gains_full.first().map(|(_, g)| (*g - 1.0).abs() < 0.001).unwrap_or(true);
+    let gain_of = |i: usize| gains.get(i).copied().unwrap_or(if i == 0 { 1.0 } else { 0.0 });
+    let offset = range.map(|r| r.0).unwrap_or(0.0);
+    let gains_full: Vec<(usize, String)> =
+        (0..n).map(|i| (i, cv_core::mixer::track_expr(gain_of(i), &clip.audio_edits, i, offset))).collect();
+    let untouched = n <= 1 && (gain_of(0) - 1.0).abs() < 0.001 && clip.audio_edits.is_empty();
     let dur = match range {
         Some((a, b)) => (b - a).max(0.1),
         None => info.duration,

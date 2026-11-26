@@ -4,6 +4,7 @@
 use crate::mpv::Mpv;
 use crate::theme::{self, icon};
 use cv_core::config::{PlayerConfig, TRACK_NAMES};
+use cv_core::model::AudioEdit;
 use cv_core::util::format_duration;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Key, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::sync::Arc;
@@ -25,6 +26,8 @@ pub struct Player {
     pub mode: MixMode,
     /// Per-track gains used in "separate" mode.
     pub stem_gains: Vec<f32>,
+    /// Non-destructive per-track edits in the loaded file's time.
+    pub edits: Vec<AudioEdit>,
     pub volume: f32,
     pub muted: bool,
     pub show_mixer: bool,
@@ -49,9 +52,10 @@ impl Player {
             track_names: Vec::new(),
             mode: if cfg.default_mix_mode == "separate" { MixMode::Separate } else { MixMode::Full },
             stem_gains: Vec::new(),
+            edits: Vec::new(),
             volume: cfg.volume as f32 / 100.0,
             muted: false,
-            show_mixer: false,
+            show_mixer: true,
             fullscreen: false,
             scrubbing: false,
             speeds: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
@@ -99,6 +103,38 @@ impl Player {
         }
     }
 
+    /// Gain expressions (mode gains x edits) for every track.
+    pub fn exprs(&self) -> Vec<String> {
+        cv_core::mixer::exprs_for(&self.effective_gains(), &self.edits, 0.0)
+    }
+
+    /// Push the current gains/edits to mpv (`changed` = only that track).
+    pub fn apply_audio(&self, changed: Option<usize>) {
+        if let Some(m) = &self.mpv {
+            m.set_exprs(&self.exprs(), changed);
+        }
+    }
+
+    /// Replace the edits (file time) and apply them.
+    pub fn set_edits(&mut self, edits: Vec<AudioEdit>) {
+        if edits != self.edits {
+            self.edits = edits;
+            self.apply_audio(None);
+        }
+    }
+
+    pub fn set_track_gain(&mut self, track: usize, gain: f32) {
+        if self.stem_gains.len() <= track {
+            self.stem_gains.resize(track + 1, 1.0);
+        }
+        self.stem_gains[track] = gain;
+        if track > 0 && self.mode == MixMode::Full {
+            self.set_mode(MixMode::Separate);
+        } else {
+            self.apply_audio(Some(track));
+        }
+    }
+
     /// Open a file. `tracks` = known audio track count (0 = unknown).
     #[allow(clippy::too_many_arguments)]
     pub fn open(&mut self, path: &str, start: f64, tracks: usize, stored_names: &[String], saved_mix: Option<&[f32]>, live: bool, autoplay: bool, cfg: &PlayerConfig) {
@@ -119,7 +155,7 @@ impl Player {
         if tracks > 1 && self.stem_gains.iter().all(|g| *g == 0.0) {
             self.stem_gains = cv_core::mixer::default_gains(tracks, "separate", multitrack);
         }
-        let gains = self.effective_gains();
+        let exprs = self.exprs();
         let same_file = self.path.as_deref() == Some(path) && self.live == live;
         if same_file && mpv.state().loaded {
             mpv.seek_abs(start, true);
@@ -130,7 +166,7 @@ impl Player {
         }
         self.path = Some(path.to_string());
         self.live = live;
-        if let Err(e) = mpv.load(path, start, tracks, &gains, live, !autoplay) {
+        if let Err(e) = mpv.load(path, start, tracks, &exprs, live, !autoplay) {
             tracing::warn!("load {path}: {e:#}");
         }
         let _ = mpv.set("speed", &format!("{}", cfg.default_speed));
@@ -149,7 +185,7 @@ impl Player {
                 if n > 1 {
                     let lc = cv_core::mixer::mpv_lavfi_complex(n).unwrap_or_default();
                     let _ = mpv.set("lavfi-complex", &lc);
-                    let _ = mpv.set("af", &cv_core::mixer::mpv_af(&self.effective_gains()));
+                    let _ = mpv.set("af", &cv_core::mixer::mpv_af(&self.exprs()));
                 }
             }
         }
@@ -200,12 +236,11 @@ impl Player {
         }
     }
 
-    fn set_mode(&mut self, mode: MixMode) {
+    pub fn set_mode(&mut self, mode: MixMode) {
         self.mode = mode;
         if let Some(m) = &self.mpv {
-            m.set_gains(&self.effective_gains(), None);
-            // af-command can't target all tracks at once; apply the string now.
-            let _ = m.set("af", &cv_core::mixer::mpv_af(&self.effective_gains()));
+            m.set_exprs(&self.exprs(), None);
+            let _ = m.set("af", &cv_core::mixer::mpv_af(&self.exprs()));
         }
     }
 
@@ -355,7 +390,7 @@ impl Player {
                     self.fullscreen = !self.fullscreen;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
                 }
-                let mixer_tip = if self.track_count > 1 { format!("Audio tracks ({})", self.track_count) } else { "Audio".to_string() };
+                let mixer_tip = if self.show_mixer { "Hide audio tracks".to_string() } else { format!("Show audio tracks ({})", self.track_count.max(1)) };
                 let mresp = theme::icon_button(ui, icon::MIXER, 15.0, &mixer_tip);
                 if self.show_mixer {
                     ui.painter().rect_stroke(mresp.rect, CornerRadius::same(20), Stroke::new(1.0, theme::TEXT_DIM), egui::StrokeKind::Inside);
@@ -392,83 +427,6 @@ impl Player {
                 }
             });
         });
-    }
-
-    /// The audio mixer panel. Returns true if gains changed (to persist them).
-    pub fn mixer(&mut self, ui: &mut Ui, accent: Color32) -> bool {
-        let mut changed = false;
-        ui.label(theme::title("Audio tracks"));
-        if self.track_count <= 1 {
-            ui.label(theme::label_dim("This file has a single audio track. Clips recorded from now on have separate game, voice, music and mic tracks."));
-            return false;
-        }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let full = self.mode == MixMode::Full;
-            if ui.add(egui::Button::selectable(full, "Full mix")).clicked() && !full {
-                self.set_mode(MixMode::Full);
-                changed = true;
-            }
-            if ui.add(egui::Button::selectable(!full, "Separate tracks")).clicked() && full {
-                self.set_mode(MixMode::Separate);
-                changed = true;
-            }
-        });
-        ui.add_space(6.0);
-        let separate = self.mode == MixMode::Separate;
-        if !separate {
-            ui.label(theme::small("Playing everything you heard plus your mic. Switch to separate tracks to turn individual sources up or down."));
-        }
-        let n = self.track_count;
-        if self.stem_gains.len() != n {
-            self.stem_gains.resize(n, 1.0);
-        }
-        egui::Grid::new("mixer").num_columns(3).spacing([10.0, 10.0]).show(ui, |ui| {
-            for i in 0..n {
-                // In separate mode the "Full mix" track is just another slider
-                // (defaulting to 0 to avoid doubling everything).
-                let name = self.track_names.get(i).cloned().unwrap_or_else(|| format!("Track {}", i + 1));
-                let enabled = separate;
-                let mut g = self.stem_gains[i];
-                ui.add_enabled_ui(enabled, |ui| {
-                    let muted = g == 0.0;
-                    let glyph = if muted { icon::MUTE } else { icon::VOLUME };
-                    if theme::icon_button(ui, glyph, 13.0, if muted { "Unmute" } else { "Mute" }).clicked() {
-                        g = if muted { 1.0 } else { 0.0 };
-                    }
-                });
-                ui.add_enabled_ui(enabled, |ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&name).color(if enabled { theme::TEXT } else { theme::TEXT_FAINT }));
-                        ui.add(egui::Slider::new(&mut g, 0.0..=2.0).show_value(false).trailing_fill(true));
-                    });
-                });
-                ui.label(RichText::new(format!("{:.0}%", g * 100.0)).monospace().color(theme::TEXT_DIM));
-                ui.end_row();
-                if (g - self.stem_gains[i]).abs() > f32::EPSILON {
-                    self.stem_gains[i] = g;
-                    if let Some(m) = &self.mpv {
-                        m.set_gains(&self.effective_gains(), Some(i));
-                    }
-                    changed = true;
-                }
-            }
-        });
-        if separate {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if theme::ghost_button(ui, None, "Reset").clicked() {
-                    self.stem_gains = cv_core::mixer::default_gains(n, "separate", n == TRACK_NAMES.len());
-                    self.set_mode(MixMode::Separate);
-                    changed = true;
-                }
-            });
-            if n == TRACK_NAMES.len() {
-                ui.label(theme::small("\"Desktop\" already contains game, voice and music. \"Full mix\" also contains your mic."));
-            }
-        }
-        let _ = accent;
-        changed
     }
 }
 

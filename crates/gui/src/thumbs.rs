@@ -75,10 +75,4 @@ impl Thumbs {
         }
         None
     }
-
-    /// Forget a path (e.g. the thumbnail was regenerated).
-    pub fn invalidate(&mut self, path: &str) {
-        self.cache.remove(path);
-        self.failed.remove(path);
-    }
 }

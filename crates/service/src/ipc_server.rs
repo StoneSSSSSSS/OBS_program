@@ -119,8 +119,8 @@ fn handle(sh: &Arc<Shared>, req: Request) -> Result<Value, String> {
             crate::reload_config(sh, restart_obs).map_err(e2s)?;
             Ok(Value::Null)
         }
-        Request::CutRange { from_ms, to_ms, title, game_id, category_ids, precise } => {
-            let id = jobs::submit(sh, JobKind::CutRange { from_ms, to_ms, title, game_id, category_ids, precise });
+        Request::CutRange { from_ms, to_ms, title, game_id, category_ids, precise, gains, audio_edits } => {
+            let id = jobs::submit(sh, JobKind::CutRange { from_ms, to_ms, title, game_id, category_ids, precise, gains, audio_edits });
             Ok(json!({"job_id": id}))
         }
         Request::TrimClip { clip_id, start_s, end_s, replace, precise } => {

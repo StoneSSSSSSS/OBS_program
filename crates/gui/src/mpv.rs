@@ -399,7 +399,8 @@ impl Mpv {
     }
 
     /// Load a file. `tracks` is the known audio track count (0 = unknown).
-    pub fn load(&self, path: &str, start: f64, tracks: usize, gains: &[f32], live: bool, pause: bool) -> Result<()> {
+    /// `exprs` = per-track gain expressions (see `cv_core::mixer::track_expr`).
+    pub fn load(&self, path: &str, start: f64, tracks: usize, exprs: &[String], live: bool, pause: bool) -> Result<()> {
         {
             let mut st = self.state.lock();
             st.loaded = false;
@@ -411,7 +412,7 @@ impl Mpv {
         *self.pending_af.lock() = None;
         let lc = cv_core::mixer::mpv_lavfi_complex(tracks).unwrap_or_default();
         self.set("lavfi-complex", &lc)?;
-        self.set("af", &cv_core::mixer::mpv_af(gains))?;
+        self.set("af", &cv_core::mixer::mpv_af(exprs))?;
         self.set("pause", if pause { "yes" } else { "no" })?;
         let target = if live { format!("appending://{path}") } else { path.to_string() };
         let opts = format!("start={start:.3}");
@@ -419,23 +420,22 @@ impl Mpv {
         self.command(&["loadfile", &target, "replace", "-1", &opts])
     }
 
-    /// Change per-track gains live (instant via af-command, persisted shortly after).
-    pub fn set_gains(&self, gains: &[f32], changed: Option<usize>) {
-        match changed {
-            Some(i) if gains.len() >= 2 => {
-                let cmd = cv_core::mixer::mpv_gain_command(i, gains[i]);
+    /// Change per-track gain expressions live: the changed track (or all, if
+    /// `changed` is None) is updated instantly via af-command, and the full
+    /// filter string is re-applied shortly after so seeks keep the new values.
+    pub fn set_exprs(&self, exprs: &[String], changed: Option<usize>) {
+        let targets: Vec<usize> = match changed {
+            Some(i) => vec![i],
+            None => (0..exprs.len()).collect(),
+        };
+        for i in targets {
+            if let Some(e) = exprs.get(i) {
+                let cmd = cv_core::mixer::mpv_gain_command(i, e);
                 let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
                 let _ = self.command(&refs);
             }
-            _ => {
-                if gains.len() < 2 {
-                    let cmd = cv_core::mixer::mpv_gain_command(0, gains.first().copied().unwrap_or(1.0));
-                    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-                    let _ = self.command(&refs);
-                }
-            }
         }
-        *self.pending_af.lock() = Some((cv_core::mixer::mpv_af(gains), std::time::Instant::now()));
+        *self.pending_af.lock() = Some((cv_core::mixer::mpv_af(exprs), std::time::Instant::now()));
     }
 
     pub fn seek_abs(&self, t: f64, exact: bool) {

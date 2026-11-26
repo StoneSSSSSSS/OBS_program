@@ -34,6 +34,7 @@ pub fn accent(a: Accent) -> Color32 {
 }
 
 /// Segoe MDL2 Assets glyphs (present on every Windows 10/11 install).
+#[allow(dead_code)]
 pub mod icon {
     pub const PLAY: &str = "\u{E768}";
     pub const PAUSE: &str = "\u{E769}";

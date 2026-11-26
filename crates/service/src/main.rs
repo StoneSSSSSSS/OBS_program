@@ -19,6 +19,7 @@ mod shared;
 mod startup;
 mod status;
 mod supervisor;
+mod waves;
 mod win;
 
 use crate::shared::{LibCmd, Shared, SupCmd};
@@ -177,6 +178,7 @@ fn run_service() -> Result<()> {
     spawn("status", { let sh = sh.clone(); move || status::run(sh) });
     spawn("actions", { let sh = sh.clone(); move || actions(sh, action_rx) });
     spawn("tools", { let sh = sh.clone(); move || { let _ = sh.tools(); } });
+    spawn("waves", { let sh = sh.clone(); move || waves::run(sh) });
     if let Err(e) = ipc_server::start(sh.clone()) {
         tracing::error!("GUI connection unavailable: {e:#}");
     }

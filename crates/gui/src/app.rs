@@ -32,6 +32,7 @@ pub struct Ctx {
     pub service: Service,
     pub thumbs: Thumbs,
     pub player: Player,
+    pub waves: crate::lanes::Waves,
     pub db: Option<Db>,
     pub accent: Color32,
     pub toasts: Vec<Toast>,
@@ -110,6 +111,7 @@ impl App {
             tracing::error!("player: {e}");
         }
         let player = Player::new(mpv, &cfg.player);
+        crate::views::clips::set_repaint_ctx(ctx);
         let page = match cfg.general.start_page.as_str() {
             "recordings" => Page::Recordings,
             "clips" => Page::Clips,
@@ -119,6 +121,7 @@ impl App {
             service: Service::start(ctx.clone()),
             thumbs: Thumbs::new(ctx.clone()),
             player,
+            waves: Default::default(),
             db: Db::open_default().ok(),
             accent,
             toasts: Vec::new(),

@@ -15,45 +15,39 @@ below are what's left, in priority order.
 - The old Python files are still in the repo folder, untracked (listed in `.git/info/exclude`) and no longer
   started at login. They can be deleted.
 
-## 2. 24/7 timeline & player (user feedback)
-- [ ] The audio-tracks button (next to the speed menu) should show/hide **audio lanes under the timeline**
-      (one lane per track: name, mute, volume, waveform). Currently it does nothing.
-- [ ] **Scrubbing:** dragging on the timeline should move the playhead (fast keyframe seeks while dragging,
-      exact seek on release). Pan by dragging the ruler, with Shift+wheel, or with right-drag. Make the
-      playhead handle bigger.
-- [ ] **Fullscreen:** the bottom controls are cut off. Lay the controls out with a bottom panel so the
-      video takes only the remaining space (also fixes the clip view).
-- [ ] **Marker panel overflow:** long marker names widen the side panel and push the whole UI off screen.
-      Truncate labels and give the rename box a fixed width. Apply the same to the recording-file rows.
-- [ ] **Activity lane:** label it "Activity", show app/game names inside wide blocks, and merge tiny gaps.
-      (It shows which program was focused; "Claude" was the focused app.)
+## 2. 24/7 timeline & player (user feedback): implemented, needs the user's eyes
+- [x] Audio-tracks button toggles **audio lanes** under the timeline (per track: name, mute, volume, waveform).
+- [x] Drag on the timeline to **scrub** (keyframe seeks while dragging, exact on release, resumes playback).
+      Drag the time ruler or right-drag to pan; wheel zooms; Shift+wheel pans; auto-pans at the edges.
+      Bigger playhead handle.
+- [x] Controls live in a bottom panel, so fullscreen and small windows never cut them off (24/7 and clip views).
+- [x] Marker labels truncate; the rename box has a fixed width and char limit (no more layout blow-up).
+- [x] Activity lane labelled ("what was on screen"), app names drawn in wide blocks, alt-tab blips merged.
+- [ ] Verify with the user (they asked for no more automated screenshot testing).
 
-## 3. Non-destructive audio region edits
-Verified in libmpv: per-track `volume=eval=frame:volume='...if(between(t,a,b),g,1)...'` mutes or boosts
-exact time ranges with no audible artefacts.
-- [ ] Core: `AudioEdit { track, start, end, gain }`; DB schema v2 adds `clips.audio_edits` (JSON).
-- [ ] Core mixer: per-track gain expressions (base gain × region factors) for mpv `af` and ffmpeg export.
-- [ ] GUI: drag on a lane to select a region, then Mute / Quieter / Louder / exact %, with an "all tracks"
-      option. Existing regions are drawn on the lane; click one to edit or remove it.
-- [ ] Creating a clip from the 24/7 range carries the edits and track volumes inside the range into the
-      clip's metadata. **The file keeps every original track untouched** so edits can be undone later.
-      The 24/7 recording itself is never modified.
-- [ ] Clip view: same lanes and region editing, saved with the clip. Export bakes the edits into the shared file.
-- [ ] Trim: shift the edits into the new clip's time.
+## 3. Non-destructive audio region edits: implemented
+- [x] Core `AudioEdit`, `apply_edit`/`rebase_edits`, DB schema v2 `clips.audio_edits` (auto-migrates v1).
+- [x] Per-track gain expressions (`volume=eval=frame:volume='g*if(between(t,a,b),x,1)…'`) in mpv `af` and ffmpeg export.
+- [x] Lanes: drag to select, then Mute / −6 dB / +6 dB / exact % / Reset, with an "All tracks" option.
+      Click an edit to select it. Editing a stem while in full-mix mode switches to separate tracks.
+- [x] 24/7 edits persist in `%LOCALAPPDATA%\ClipVault	imeline_edits.json` (pruned with old footage).
+- [x] Create clip carries the track volumes plus the edits inside the range into the clip's metadata;
+      the file keeps all original tracks. Trim and export honour the edits.
+- [ ] Ideas: drag edges of an existing edit to resize; fades at edit boundaries (avoid clicks on hard mutes).
 
-## 4. Waveforms
-- [ ] Service worker: one low-priority ffmpeg pass per file
-      (`[0:a:i]aformat=mono … amerge, aeval=abs(..), aresample=200` → raw s16 on stdout) producing 10 peaks/s
-      per track in `%LOCALAPPDATA%\ClipVault\waves\<hash>.cvw`. Newest files first, the live file
-      incrementally (`-ss` from the last point) every ~60 s, clips too.
-- [ ] GUI: load/refresh wave files (check mtime), draw them in the lanes (strided max for zoomed-out views).
+## 4. Waveforms: implemented
+- [x] Service `waves.rs`: newest recordings first, then clips; the live file is extended every ~60 s;
+      below-normal priority; cleanup of orphaned files hourly. Files in `%LOCALAPPDATA%\ClipVault\waves`.
+- [x] GUI `lanes::Waves` cache reloads changed files; strided max for zoomed-out views.
+- [ ] Watch the CPU/disk impact while gaming. Each 1 h file is read once (~13 GB); consider throttling with
+      `-readrate`, or pausing while a game is focused.
 
 ## 5. Smaller items
 - [ ] "Music" track: maybe rename to "Music & media" and include browsers/VLC by default, so YouTube has
       its own slider. In separate-tracks mode, audio from apps that aren't in any list is currently only in
       Desktop/Full mix (the user asked about YouTube; awaiting their decision).
 - [ ] Home page cards: content now stacks vertically (fixed); re-check at small window sizes.
-- [ ] Clip detail: replace the mixer card with lanes (same component as the 24/7 view).
+- [x] Clip detail: lanes replace the mixer card; edits are saved per clip.
 - [ ] Remove the self-test/mpv-log env hooks before release, or keep them documented.
 - [ ] README: document install, settings and troubleshooting.
 
