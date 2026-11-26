@@ -16,9 +16,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static GO_LIVE: AtomicBool = AtomicBool::new(false);
+static PLAY_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 pub fn request_go_live() {
     GO_LIVE.store(true, Ordering::SeqCst);
+}
+
+/// Ask the 24/7 view to show and play a wall-clock moment (Unix ms).
+pub fn request_play_at(ms: i64) {
+    PLAY_AT.store(ms, Ordering::SeqCst);
+}
+
+/// A stretch of playing one game (activity spans merged across short breaks).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Session {
+    pub name: String,
+    pub game_id: Option<i64>,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// Group game activity into sessions: same game, breaks shorter than 10 min.
+pub fn game_sessions(spans: &[ActivitySpan]) -> Vec<Session> {
+    let mut out: Vec<Session> = Vec::new();
+    let mut games: Vec<&ActivitySpan> = spans.iter().filter(|s| s.is_game).collect();
+    games.sort_by_key(|s| s.start_ms);
+    for s in games {
+        if let Some(last) = out.iter_mut().rev().find(|x| x.game_id == s.game_id && x.name == s.name) {
+            if s.start_ms - last.end_ms < 10 * MIN {
+                last.end_ms = last.end_ms.max(s.end_ms);
+                continue;
+            }
+        }
+        out.push(Session { name: s.name.clone(), game_id: s.game_id, start_ms: s.start_ms, end_ms: s.end_ms });
+    }
+    out.retain(|x| x.end_ms - x.start_ms >= MIN);
+    out.sort_by_key(|x| std::cmp::Reverse(x.start_ms));
+    out
 }
 
 const MIN: i64 = 60_000;
@@ -248,6 +282,13 @@ impl RecordingsView {
         }
         if GO_LIVE.swap(false, Ordering::SeqCst) {
             self.go_live(c);
+        }
+        let jump = PLAY_AT.swap(0, Ordering::SeqCst);
+        if jump != 0 {
+            self.refresh(c);
+            self.follow_live = false;
+            self.view_end = jump + self.view_span / 2;
+            self.play_at(c, jump, true);
         }
         // Auto-advance to the next file at the end of a segment.
         let st = c.player.state();
@@ -787,6 +828,35 @@ impl RecordingsView {
             }
         });
         ui.add_space(12.0);
+        let sessions = game_sessions(&self.spans);
+        if !sessions.is_empty() {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::title("Game sessions"));
+                ui.label(theme::small("Click to jump to the start."));
+                ui.add_space(4.0);
+                for s in sessions.iter().take(25) {
+                    let dt = Local.timestamp_millis_opt(s.start_ms).single().unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.0, theme::game_color(s.game_id.unwrap_or(0)));
+                        let label = format!("{}  ·  {}", crate::views::clips::truncate(&s.name, 20), dt.format("%a %H:%M"));
+                        if ui.add(egui::Label::new(RichText::new(label).color(theme::TEXT)).truncate().sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.follow_live = false;
+                            // Frame the whole session with a little margin on both sides.
+                            let dur = s.end_ms - s.start_ms;
+                            self.view_span = (dur * 12 / 10).max(10 * MIN);
+                            self.view_end = s.start_ms - (self.view_span - dur) / 2 + self.view_span;
+                            self.play_at(c, s.start_ms, true);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(theme::small(cv_core::util::format_span_short((s.end_ms - s.start_ms) / 1000)));
+                        });
+                    });
+                }
+            });
+            ui.add_space(12.0);
+        }
         if !self.markers.is_empty() {
             theme::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -903,6 +973,18 @@ mod tests {
 
     fn span(key: &str, a: i64, b: i64) -> ActivitySpan {
         ActivitySpan { id: 0, key: key.into(), game_id: None, name: key.into(), is_game: false, title: String::new(), start_ms: a, end_ms: b }
+    }
+
+    #[test]
+    fn groups_game_sessions() {
+        let g = |name: &str, id: i64, a: i64, b: i64| ActivitySpan { id: 0, key: name.into(), game_id: Some(id), name: name.into(), is_game: true, title: String::new(), start_ms: a, end_ms: b };
+        let mut spans = vec![g("Deadlock", 1, 0, 20 * MIN), g("Deadlock", 1, 25 * MIN, 50 * MIN), g("CS2", 2, 60 * MIN, 61 * MIN - 1), g("Deadlock", 1, 3 * HOUR, 3 * HOUR + 30 * MIN)];
+        spans.push(span("chrome", 20 * MIN, 25 * MIN));
+        let s = game_sessions(&spans);
+        // Newest first; the 5-minute break merges; the <1 min CS2 blip is dropped.
+        assert_eq!(s.len(), 2);
+        assert_eq!((s[1].start_ms, s[1].end_ms), (0, 50 * MIN));
+        assert_eq!(s[0].start_ms, 3 * HOUR);
     }
 
     #[test]

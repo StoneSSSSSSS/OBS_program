@@ -936,6 +936,14 @@ impl ClipsView {
                 if theme::ghost_button(ui, Some(icon::FOLDER), "Show in folder").clicked() {
                     show_in_folder(&clip.path);
                 }
+                if let Some(src) = clip.source_start_ms {
+                    let available = c.db().and_then(|d| d.list_recordings().ok()).map(|v| v.iter().any(|r| r.start_ms <= src && r.end_ms() >= src || r.is_live() && r.start_ms <= src)).unwrap_or(false);
+                    if available && theme::ghost_button(ui, Some(icon::HISTORY), "Show in 24/7").on_hover_text("Jump to this moment in the continuous recording").clicked() {
+                        self.save_position(c);
+                        crate::views::recordings::request_play_at(src);
+                        c.goto = Some(crate::app::Page::Recordings);
+                    }
+                }
                 if theme::ghost_button(ui, Some(icon::DELETE), "Delete").clicked() {
                     self.detail.confirm_delete = true;
                 }
