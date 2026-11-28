@@ -5,6 +5,30 @@
 /.clipvault-local/
 /ClipVault Release/
 
+# Local handoff transcripts, launchers, media projects, libraries and recordings
+/*.jsonl
+*.lnk
+*.cvproj
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.m4a
+*.mp3
+*.wav
+*.flac
+
+# Compiled Windows artifacts and portable release archives
+*.exe
+*.dll
+*.pdb
+*.zip
+
 # Locally downloaded tools from older versions
 /third_party/
 
