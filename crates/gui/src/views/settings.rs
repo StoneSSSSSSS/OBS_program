@@ -1038,7 +1038,7 @@ mod layout_tests {
             let mut expected = None;
             for (mut selected, _, label) in TABS {
                 let mut bounds = None;
-                let _ = ctx.run_ui(
+                let mut output = ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 400.0))),
                         ..Default::default()
@@ -1049,6 +1049,7 @@ mod layout_tests {
                         bounds = Some((selector.rect, next.rect));
                     },
                 );
+                output.textures_delta.clear();
                 let bounds = bounds.unwrap();
                 assert_eq!(bounds, *expected.get_or_insert(bounds), "{label} shifted layout at {width}");
             }

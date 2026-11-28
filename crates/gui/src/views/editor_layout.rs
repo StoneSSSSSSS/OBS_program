@@ -491,7 +491,7 @@ mod tests {
             for names in [["23:59:30", "00:00:15"], ["00:00.000", "00:40.000"]] {
                 let context = egui::Context::default();
                 let mut row = Rect::NOTHING;
-                let output = context.run_ui(RawInput::default(), |ui| {
+                let mut output = context.run_ui(RawInput::default(), |ui| {
                     (row, _) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
                     let ruler = WatchingRuler::new(row);
                     let marks = [Some(ruler.axis.left()), Some(ruler.axis.right())];
@@ -504,6 +504,7 @@ mod tests {
                         Some(ruler.axis.center().x), Color32::LIGHT_BLUE,
                         [(ruler.axis.left() - 8.0, ruler.axis.center().x)]);
                 });
+                output.textures_delta.clear();
                 let mut labels = Vec::new();
                 for painted in output.shapes {
                     check(&painted.shape, row, &mut labels);

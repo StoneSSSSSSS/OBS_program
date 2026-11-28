@@ -15,11 +15,12 @@ fn render(ctx: &egui::Context, view: &mut RecordingsView, c: &mut Ctx, key: Opti
         }).collect(),
         None => Vec::new(),
     };
-    let _ = ctx.run_ui(egui::RawInput {
+    let mut output = ctx.run_ui(egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1182.0, 771.0))),
         events,
         ..Default::default()
     }, |ui| view.ui(ui, c));
+    output.textures_delta.clear();
 }
 
 fn wait_for(

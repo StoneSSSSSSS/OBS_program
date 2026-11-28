@@ -1460,7 +1460,7 @@ mod tests {
                 ("All clips", 98),
             ] {
                 let mut bounds = None;
-                let output = ctx.run_ui(
+                let mut output = ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 420.0))),
                         ..Default::default()
@@ -1477,6 +1477,7 @@ mod tests {
                         bounds = Some((sort.response.rect, search.rect, row.rect));
                     },
                 );
+                output.textures_delta.clear();
                 let bounds = bounds.unwrap();
                 assert!(bounds.2.right() <= width, "{caption}: {:?}", bounds.2);
                 assert_eq!(bounds, *background.get_or_insert(bounds), "{caption} shifted layout at {width}");
