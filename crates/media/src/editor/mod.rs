@@ -1,7 +1,9 @@
 //! WinRT composition for the multi-clip editor.
 
+mod cadence;
 mod captions;
 mod fades;
+mod reframe;
 mod stills;
 mod title;
 mod visual_transforms;
@@ -420,6 +422,12 @@ pub fn render(project: &Project, destination: &Path, control: &RenderControl) ->
         render_native(&composition, &staged, project.canvas, control)?;
     }
     control.check()?;
+    let remuxed = work.path().join("frame-grid.mp4");
+    let staged = if cadence::normalize(&staged, &remuxed, project.canvas.fps, project.duration(), control)? {
+        remuxed
+    } else {
+        staged
+    };
     let info = crate::probe::probe(&staged).context("Check the rendered MP4")?;
     ensure!(
         info.video_codec == "h264" && info.width == project.canvas.width && info.height == project.canvas.height,

@@ -291,6 +291,39 @@ impl Mp4Reader {
     }
 
     /// (type, header length, total size) of the box at `pos`, if its header is complete.
+    /// Locate the decode-time table of a flat movie's specified video track.
+    pub(crate) fn video_decode_timing_table(&self, id: u32) -> Result<Option<(u64, Vec<u8>)>> {
+        let len = self.file.metadata()?.len();
+        let mut offset = 0;
+        while let Some((kind, header, size)) = self.box_header(offset, len)? {
+            if size > len - offset { return Ok(None); }
+            let payload = offset + header;
+            if &kind == b"moov" {
+                let mut movie = vec![0; usize::try_from(size - header)?];
+                read_at(&self.file, payload, &mut movie)?;
+                for (_, track) in children(&movie).into_iter().filter(|(kind, _)| kind == b"trak") {
+                    let Some(tkhd) = child(track, b"tkhd") else { continue };
+                    let mut header = Rd::new(tkhd);
+                    let (version, _) = header.full()?;
+                    header.skip(if version == 1 { 16 } else { 8 })?;
+                    if header.u32()? != id {
+                        continue;
+                    }
+                    let table = child(track, b"mdia").and_then(|media| child(media, b"minf"))
+                        .and_then(|media| child(media, b"stbl")).and_then(|table| child(table, b"stts"))
+                        .context("The rendered video has no sample timing table")?;
+                    let relative = table.as_ptr() as usize - movie.as_ptr() as usize;
+                    return Ok(Some((payload + relative as u64, table.to_owned())));
+                }
+                return Ok(None);
+            }
+            offset += size;
+        }
+        Ok(None)
+    }
+
+
+    /// (type, header length, total size) of the box at `pos`, if its header is complete.
     fn box_header(&self, pos: u64, len: u64) -> Result<Option<([u8; 4], u64, u64)>> {
         if pos + 8 > len {
             return Ok(None);
