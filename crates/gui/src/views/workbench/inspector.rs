@@ -18,6 +18,7 @@ pub(super) struct Inspector {
     properties: Option<Properties>,
     original: Option<Properties>,
     validation_error: Option<String>,
+    camera_audio: bool,
     name: String,
     canvas: Option<Canvas>,
 }
@@ -148,7 +149,6 @@ impl Workbench {
                         seconds(i64::MAX as u64)
                     }
                 };
-                ui.label(RichText::new(format!("Timeline start {}", clock(at))).small().color(theme::TEXT_DIM));
                 let timed_video = matches!(source, Source::Asset(id) if project.asset(*id).is_some_and(|asset| asset.info.kind == AssetKind::Video));
                 if timed_video {
                     trim_fields(ui, input, output, limit);
@@ -158,11 +158,19 @@ impl Workbench {
                         *output = *input + duration;
                     }
                 }
-                if let Source::Asset(id) = source {
-                    visual_transform_fields(ui, visual_transform);
-                    if project.asset(*id).is_some_and(|asset| asset.info.kind == AssetKind::Video) {
+                ui.label(RichText::new(format!("Timeline start {}", clock(at))).small().color(theme::TEXT_DIM));
+                if matches!(source, Source::Asset(_)) {
+                    if timed_video {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(&mut state.camera_audio, false, "Picture");
+                            ui.selectable_value(&mut state.camera_audio, true, "Camera audio");
+                        });
+                    }
+                    if timed_video && state.camera_audio {
                         gain_field(ui, gain);
                         fade_fields(ui, fade, *output - *input);
+                    } else {
+                        visual_transform_fields(ui, visual_transform);
                     }
                 }
             }
@@ -270,11 +278,15 @@ pub(super) fn time_field(ui: &mut Ui, label: &str, value: &mut f64, limit: f64) 
 }
 
 fn trim_fields(ui: &mut Ui, input: &mut f64, output: &mut f64, limit: f64) {
+    let inline = ui.available_width() >= 310.0;
     ui.columns(2, |columns| {
-        let start = columns[0].label("Source In");
-        time_value(&mut columns[0], input, limit).labelled_by(start.id);
-        let end = columns[1].label("Source Out");
-        time_value(&mut columns[1], output, limit).labelled_by(end.id);
+        for ((column, label), value) in columns.iter_mut().zip(["Source In", "Source Out"]).zip([input, output]) {
+            let field = |ui: &mut Ui| {
+                let name = ui.label(label);
+                time_value(ui, value, limit).labelled_by(name.id);
+            };
+            if inline { column.horizontal(field); } else { column.vertical(field); }
+        }
     });
 }
 
@@ -307,6 +319,7 @@ fn fade_fields(ui: &mut Ui, values: &mut [f64; 2], duration: f64) {
 }
 
 fn visual_transform_fields(ui: &mut Ui, transform: &mut VisualTransform) {
+    framing_fields(ui, transform);
     let rotations = [
         (Rotation::None, "0°"),
         (Rotation::Clockwise90, "90°"),
@@ -335,6 +348,9 @@ fn visual_transform_fields(ui: &mut Ui, transform: &mut VisualTransform) {
     ui.checkbox(&mut transform.mirror, "Mirror Horizontally")
         .on_hover_text("Flip left to right after rotation");
 
+}
+
+fn framing_fields(ui: &mut Ui, transform: &mut VisualTransform) {
     ui.horizontal_wrapped(|ui| {
         let label = ui.label("Framing");
         let mut fill = matches!(transform.framing, Framing::Fill { .. });

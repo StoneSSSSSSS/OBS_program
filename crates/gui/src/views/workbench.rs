@@ -95,6 +95,7 @@ pub struct Workbench {
     dock_open: bool,
     preview_expanded: bool,
     compact_preview_height: Option<f32>,
+    wide_preview_height: Option<f32>,
     seek_input: Option<(String, bool)>,
     error_details: Option<String>,
     selected_asset: Option<Id>,
@@ -131,6 +132,7 @@ impl Default for Workbench {
             dock_open: false,
             preview_expanded: false,
             compact_preview_height: None,
+            wide_preview_height: None,
             seek_input: None,
             error_details: None,
             selected_asset: None,
@@ -168,12 +170,18 @@ impl Workbench {
         self.history = History::new(project);
         self.selected = Some(Selection::Shot(id));
         self.dock = Dock::Inspector;
-        self.dock_open = matches!(page, "workbench_short_inspector" | "workbench_short_bin");
-        if page == "workbench_short_bin" {
+        self.dock_open = matches!(page, "workbench_short_inspector" | "workbench_short_bin" | "workbench_short_bin_saved");
+        if matches!(page, "workbench_short_bin" | "workbench_short_bin_saved") {
             self.dock = Dock::Media;
             let info = AssetInfo { kind: AssetKind::Audio, fps_milli: None, duration: TICKS_PER_SECOND, width: 0, height: 0 };
             self.selected_asset = Some(self.history.project.import(PathBuf::from("Synthetic cue.wav"), info).expect("fixture asset"));
-            self.notice = Some(Notice::Error("Imported 1 file · Skipped 2 · Unsupported media".into()));
+            if page == "workbench_short_bin_saved" {
+                self.export.qa_saved(PathBuf::from("An exported film with a long descriptive filename.mp4"));
+            } else {
+                self.notice = Some(Notice::Error("Imported 1 file · Skipped 2 · Unsupported media".into()));
+            }
+        } else if page == "workbench_short_captions" {
+            self.history.project.caption("Opening cue".into(), cv_core::editor::Span { start: 0, end: TICKS_PER_SECOND }).expect("fixture cue");
         }
         self.preview_expanded = page == "workbench_preview";
         self.tab = if page == "workbench_wiki" { Tab::Wiki } else { Tab::Workbench };
@@ -302,7 +310,7 @@ impl Workbench {
         let mut choose_export = false;
         if let Some(status) = self.export.status() {
             row = true;
-            ui.horizontal_wrapped(|ui| match status {
+            ui.horizontal(|ui| match status {
                 preview::ExportStatus::Running(progress, name) => {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
                     ui.add(egui::ProgressBar::new(progress).desired_width(104.0).show_percentage())
@@ -313,15 +321,16 @@ impl Workbench {
                 }
                 preview::ExportStatus::Saved(path) => {
                     if ui.small_button("Dismiss").on_hover_text("Hide the export result").clicked() { self.export.clear_result(); }
-                    let label = format!("Exported {}", filename(&path));
-                    ui.add(egui::Label::new(&label).truncate()).on_hover_text(path.display().to_string());
-                    if ui.button("Open Output Folder").clicked() {
+                    let folder_button = if ui.ctx().viewport_rect().width() < 800.0 { "Show in folder" } else { "Open Output Folder" };
+                    if ui.small_button(folder_button).on_hover_text("Open Output Folder").clicked() {
                         let mut target = std::ffi::OsString::from("/select,");
-                        target.push(path);
+                        target.push(&path);
                         if let Err(error) = std::process::Command::new("explorer.exe").arg(target).spawn() {
                             self.notice = Some(Notice::Error(format!("Open folder: {error}")));
                         }
                     }
+                    let label = format!("Exported {}", filename(&path));
+                    ui.add(egui::Label::new(&label).truncate()).on_hover_text(path.display().to_string());
                 }
                 preview::ExportStatus::Failed(error) => {
                     choose_export = ui.small_button("Choose new filename…").clicked();
@@ -392,10 +401,11 @@ impl Workbench {
     fn compact_workspace(&mut self, ui: &mut Ui, frame: &eframe::Frame, accent: Color32) {
         let width = ui.available_width();
         let available = ui.available_height();
-        if available < 265.0 {
+        let has_captions = !self.history.project.captions.is_empty();
+        if available < if has_captions { 320.0 } else { 265.0 } {
             if !self.dock_open || self.history.project.duration() > 0 {
                 ui.horizontal(|ui| {
-                    let thumbnail = if self.dock_open { egui::vec2(50.0, 28.0) } else { egui::vec2(70.0, 40.0) };
+                    let thumbnail = if self.dock_open || !self.history.project.captions.is_empty() { egui::vec2(50.0, 28.0) } else { egui::vec2(70.0, 40.0) };
                     let (picture, open) = ui.allocate_exact_size(thumbnail, Sense::click());
                     self.preview.picture(ui, picture, &self.history.project, accent, self.revision, self.playhead);
                     if open.on_hover_text("Expand preview").clicked() { self.preview_expanded = true; }
@@ -408,19 +418,12 @@ impl Workbench {
                 });
             }
         } else {
-            let maximum = (available - 138.0).max(123.0);
+            let maximum = (available - if has_captions { 188.0 } else { 138.0 }).max(123.0);
             let preferred = self.compact_preview_height.unwrap_or(available * 0.40);
             let height = preferred.clamp(123.0, maximum);
             let (stage, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
             region(ui, "editor-stage", stage, |ui| self.stage_card(ui, accent));
-            let (grip, drag) = ui.allocate_exact_size(egui::vec2(width, 13.0), Sense::click_and_drag());
-            let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical)
-                .on_hover_text("Drag to resize the preview. Double-click to reset.");
-            ui.painter().hline(grip.x_range(), grip.center().y, egui::Stroke::new(1.0, theme::BORDER));
-            let center = egui::Rect::from_center_size(grip.center(), egui::vec2(38.0, 3.0));
-            ui.painter().rect_filled(center, 2.0, theme::TEXT_FAINT);
-            if drag.double_clicked() { self.compact_preview_height = None; }
-            else if drag.dragged() { self.compact_preview_height = Some((height + drag.drag_delta().y).clamp(123.0, maximum)); }
+            resize_preview_grip(ui, height, 123.0, maximum, &mut self.compact_preview_height);
         }
         if self.dock_open {
             let (dock, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
@@ -445,7 +448,12 @@ impl Workbench {
             return;
         }
 
-        let height = (ui.clip_rect().height() * 0.43).clamp(222.0, 328.0);
+        let viewport = ui.clip_rect().height();
+        let maximum = (viewport - 135.0).clamp(222.0, 900.0);
+        let canvas = self.history.project.canvas;
+        let default = if canvas.height > canvas.width { (viewport * 0.66).clamp(260.0, 625.0) }
+            else { (viewport * 0.43).clamp(222.0, 328.0) };
+        let height = self.wide_preview_height.unwrap_or(default).clamp(222.0, maximum);
         let (row, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
         let gap = 9.0;
         if width >= 900.0 {
@@ -464,6 +472,7 @@ impl Workbench {
             region(ui, "editor-stage", stage, |ui| self.stage_card(ui, accent));
             region(ui, "editor-dock", dock, |ui| self.dock_card(ui, frame, true));
         }
+        resize_preview_grip(ui, height, 222.0, maximum, &mut self.wide_preview_height);
     }
 
     fn dock_card(&mut self, ui: &mut Ui, frame: &eframe::Frame, show_switcher: bool) {
@@ -1121,6 +1130,17 @@ fn parse_time(text: &str) -> Option<f64> {
 
 fn format_fps(milli: u32) -> String {
     format!("{:.3}", f64::from(milli) / 1000.0).trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+fn resize_preview_grip(ui: &mut Ui, height: f32, minimum: f32, maximum: f32, preference: &mut Option<f32>) {
+    let (grip, drag) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 13.0), Sense::click_and_drag());
+    let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical)
+        .on_hover_text("Drag to resize the preview. Double-click to reset.");
+    ui.painter().hline(grip.x_range(), grip.center().y, egui::Stroke::new(1.0, theme::BORDER));
+    let handle = egui::Rect::from_center_size(grip.center(), egui::vec2(38.0, 3.0));
+    ui.painter().rect_filled(handle, 2.0, if drag.hovered() || drag.dragged() { theme::TEXT } else { theme::TEXT_FAINT });
+    if drag.double_clicked() { *preference = None; }
+    else if drag.dragged() { *preference = Some((height + drag.drag_delta().y).clamp(minimum, maximum)); }
 }
 
 fn media_row(ui: &mut Ui, asset: &Asset, selected: bool, missing: bool) -> egui::Response {

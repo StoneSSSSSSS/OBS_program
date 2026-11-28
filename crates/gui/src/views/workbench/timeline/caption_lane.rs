@@ -36,7 +36,7 @@ impl Workbench {
         self.timeline.caption_rows.update(self.revision, cues);
         let rows = &self.timeline.caption_rows.rows;
         let mut action = None;
-        let height = 23.0;
+        let height = if ui.ctx().viewport_rect().height() < 410.0 { 20.0 } else { 23.0 };
         egui::ScrollArea::vertical().id_salt("editor-caption-tracks")
             .max_height((height + ui.spacing().item_spacing.y) * 2.0)
             .auto_shrink([false, true]).show_rows(ui, height, rows.len(), |ui, visible| {
@@ -64,8 +64,12 @@ impl Workbench {
                         let border = if response.hovered() || response.has_focus() { theme::TEXT } else { theme::BORDER_STRONG };
                         painter.rect(clip, 2.0, theme::SURFACE2, Stroke::new(1.0, border), StrokeKind::Inside);
                         if clip.width() > 18.0 {
-                            ui.painter_at(clip.shrink2(egui::vec2(4.0, 0.0))).text(clip.left_center() + egui::vec2(4.0, 0.0),
-                                Align2::LEFT_CENTER, first_line, FontId::proportional(11.0), theme::TEXT);
+                            let mut label = egui::text::LayoutJob::simple(first_line.to_owned(), FontId::proportional(11.0), theme::TEXT, clip.width() - 8.0);
+                            label.wrap.max_rows = 1;
+                            label.wrap.break_anywhere = true;
+                            let galley = painter.layout_job(label);
+                            let origin = clip.left_center() + egui::vec2(4.0, -galley.size().y * 0.5);
+                            painter.with_clip_rect(clip.intersect(ui.clip_rect())).galley(origin, galley, theme::TEXT);
                         }
                         let edit = response.double_clicked();
                         if edit || response.clicked() {

@@ -425,6 +425,8 @@ pub(super) struct Export {
 impl Export {
     pub(super) fn idle(&self) -> bool { self.task.is_none() }
 
+    pub(super) fn qa_saved(&mut self, path: PathBuf) { self.completed = Some(Ok(path)); }
+
     pub(super) fn clear_result(&mut self) { self.completed = None; }
 
     pub(super) fn start(&mut self, ctx: &egui::Context, project: Project, destination: PathBuf) -> Result<()> {

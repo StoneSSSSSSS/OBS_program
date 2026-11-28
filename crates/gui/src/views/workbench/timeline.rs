@@ -104,7 +104,7 @@ impl Workbench {
                         self.navigation_actions(ui, domain, false);
                     });
                 }
-                ui.add_space(5.0);
+                ui.add_space(if short { 1.0 } else { 5.0 });
                 self.board(ui, domain, accent);
             });
     }
@@ -174,7 +174,8 @@ impl Workbench {
         let window = Window::visible(self.timeline.window, domain);
         let width = ui.available_width();
         let labels = (width * 0.22).clamp(54.0, 92.0);
-        let (ruler, _) = ui.allocate_exact_size(egui::vec2(width, TICK_HEIGHT), Sense::hover());
+        let ruler_height = if ui.ctx().viewport_rect().height() < 410.0 { 23.0 } else { TICK_HEIGHT };
+        let (ruler, _) = ui.allocate_exact_size(egui::vec2(width, ruler_height), Sense::hover());
         let axis = Rect::from_min_max(ruler.left_top() + egui::vec2(labels, 0.0), ruler.right_bottom() - egui::vec2(9.0, 0.0));
         let response = ui.interact(axis, ui.make_persistent_id("editor-ruler"), Sense::click_and_drag());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Scrub Timeline"));
@@ -450,7 +451,7 @@ fn lanes(project: &Project) -> Vec<Lane> {
 }
 
 fn edge_at(x: f32, left: f32, right: f32, visible_width: f32) -> Drag {
-    let tolerance = (visible_width * 0.24).min(7.0);
+    let tolerance = (visible_width * 0.28).min(11.0);
     if visible_width < 12.0 { Drag::Move }
     else if (x - left).abs() <= tolerance { Drag::TrimIn }
     else if (x - right).abs() <= tolerance { Drag::TrimOut }
@@ -508,14 +509,22 @@ fn paint_item(ui: &Ui, rect: Rect, item: &Item, selected: bool, focused: bool, a
     painter.rect(rect, 4.0, item.rgb, Stroke::new(if selected || focused { 1.8 } else { 1.0 }, border), StrokeKind::Inside);
     if rect.width() >= 14.0 {
         let color = if theme::on_fill(item.rgb) == Color32::WHITE { Color32::WHITE } else { Color32::BLACK };
-        let mut text = egui::text::LayoutJob::simple(item.label.clone(), FontId::proportional(12.0), color, rect.width() - 12.0);
+        let mut label = item.label.as_str();
+        let font = FontId::proportional(12.0);
+        let padding = if rect.width() < 70.0 { 3.0 } else { 6.0 };
+        let available = rect.width() - 2.0 * padding;
+        if matches!(item.selection, Selection::Sound(_))
+            && painter.layout_no_wrap(label.to_owned(), font.clone(), color).size().x > available {
+            label = std::path::Path::new(label).file_stem().and_then(|name| name.to_str()).unwrap_or(label);
+        }
+        let mut text = egui::text::LayoutJob::simple(label.to_owned(), font, color, available);
         text.wrap.max_rows = 1;
         text.wrap.break_anywhere = true;
         let galley = painter.layout_job(text);
-        painter.galley(rect.left_center() + egui::vec2(6.0, -galley.size().y * 0.5), galley, color);
+        painter.galley(rect.left_center() + egui::vec2(padding, -galley.size().y * 0.5), galley, color);
         if selected && rect.width() >= 35.0 {
-            for x in [rect.left() + 3.0, rect.right() - 3.0] {
-                painter.line_segment([Pos2::new(x, rect.center().y - 4.0), Pos2::new(x, rect.center().y + 4.0)], Stroke::new(1.5, accent));
+            for x in [rect.left() + 3.5, rect.right() - 3.5] {
+                painter.line_segment([Pos2::new(x, rect.center().y - 6.0), Pos2::new(x, rect.center().y + 6.0)], Stroke::new(2.5, accent));
             }
         }
     }

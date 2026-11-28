@@ -27,6 +27,8 @@ const PAGES: &[(&str, &str)] = &[
     ("workbench_short_timeline", "Video"),
     ("workbench_short_inspector", "Apply Changes"),
     ("workbench_short_bin", "Add to Timeline"),
+    ("workbench_short_bin_saved", "Add to Timeline"),
+    ("workbench_short_captions", "Captions"),
     ("settings_general", "Startup"),
     ("settings_recording", "Recording history"),
     ("settings_clips", "Saved clip length"),
@@ -210,7 +212,8 @@ fn inspect(
             "workbench_wiki" => &["All topics", "Clear"],
             "workbench_short_timeline" => &["Edit", "View", "Selected Item"],
             "workbench_short_inspector" => &["Inspector", "Apply Changes"],
-            "workbench_short_bin" => &["Add to Timeline", "Relink Media…", "Synthetic cue.wav"],
+            "workbench_short_bin" | "workbench_short_bin_saved" => &["Add to Timeline", "Relink Media…", "Synthetic cue.wav"],
+            "workbench_short_captions" => &["Edit", "View", "Captions", "Video"],
             page if page.starts_with("settings_") => &["Save", "Discard"],
             _ => &[],
         };

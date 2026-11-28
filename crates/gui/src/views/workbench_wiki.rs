@@ -50,7 +50,7 @@ const GUIDES: &[Guide] = &[
         intro: "Each timeline occurrence has its own trims and volume, even when two shots use the same source.",
         steps: &["Use Project → Save Project As… to start a named revision of an existing edit.",
         "Select the closing shot or title and choose Move Earlier until it reaches the front. Move Later sends a shot toward the end. Duplicate inserts a second occurrence immediately after the selection.",
-        "Drag the duplicate’s right trim handle left to try a shorter version. For an exact change, enter Duration for a title, color or still, or Source Out for a video. Choose Apply Changes. Undo restores the previous length.",
+        "Drag the duplicate’s right trim handle left to try a shorter version. For an exact change, enter Duration for a title, color or still, or Source Out for a video. Press Enter to apply the typed value immediately, or click Apply Changes after leaving the field. Undo restores the previous length.",
         "Save the revision and reopen it to check the order before exporting."] },
     Guide { section: "Timeline", title: "Navigate a long sequence", terms: "zoom pan scroll horizontal scrub fit overview navigate playhead long timeline seek",
         intro: "The playhead is a position in the assembled video. A source start refers to time inside an imported file.",
@@ -59,7 +59,7 @@ const GUIDES: &[Guide] = &[
         "Use the frame controls to check a cut. Fit returns to the full sequence. On a narrow screen choose Timeline. Use View for Fit, Zoom or Pan when space is tight. Drag the divider beneath the preview to change its height when available."] },
     Guide { section: "Sound", title: "Keep or mute the original camera audio", terms: "audio embedded source footage camera microphone original recorded sound mute clip split reorder duplicate",
         intro: "The audio recorded in a video follows that shot when you move, copy or trim it.",
-        steps: &["Select the video shot in the timeline. Leave its Inspector Gain at 100% to keep the original level.",
+        steps: &["Select the video shot in the timeline. In the Inspector, choose Camera audio and leave Gain at 100% to keep the original level.",
         "To quiet just this occurrence, reduce Gain or set it to 0% to mute it. Choose Apply Changes and check the preview.",
         "Use the separate Voice, Music and Effects lanes for additional sound. Export MP4 includes the same gains and placements."] },
     Guide { section: "Sound", title: "Mix narration and music", terms: "voiceover voice over dialog dialogue gain quiet lower music soundtrack duck ducking audio level volume tutorial",
@@ -68,32 +68,32 @@ const GUIDES: &[Guide] = &[
         "Set the narration's timeline start for a short lead-in. Source start trims the beginning of the sound itself.",
         "Select the music, lower Gain in the Inspector and choose Apply Changes. Select the video to adjust its original sound separately.",
         "For ducking, split the music at the start and end of the narration and lower the middle piece. Sound splits use the exact playhead time. Picture splits use the nearest project frame."] },
-    Guide { section: "Sound", title: "Place repeated sound effects", terms: "cue effects sfx beats audio snip repeat delayed delay timing offset silent silence tail ending credits half volume quiet quieter loud level gain percentage",
+    Guide { section: "Sound", title: "Place repeated sound effects", terms: "foley knocks footsteps sound design cue effects sfx beats audio snip repeat delayed delay timing offset silent silence tail ending credits half volume quiet quieter loud level gain percentage",
         intro: "Independent cues let one sound play at several points with a different level each time.",
         steps: &["Import the cue and select it in the Media Bin. Set the timeline Playhead field to the first entrance time. Select Effects and choose Add to Timeline, or drag the source onto the Effects lane.",
         "Duplicate the cue for each additional entrance. In the Inspector set Start on Timeline, then choose Apply Changes or press Enter.",
         "Set Gain to 50% for half volume on an individual occurrence. Apply Changes, then preview. Source Out trims the cue itself before the credits.",
-        "For a silent tail, keep the picture running after the last effect. Check other sound lanes and embedded video gain for remaining audio. Preview the final seconds. Audio extending beyond the last picture adds time on a black background."] },
+        "For a silent tail, keep the picture running after the last effect. Select the video and choose Camera audio in the Inspector to mute its Gain. Hover over a short effect to see its full filename and timing, or zoom in for a longer label. Preview the final seconds. Audio extending beyond the last picture adds time on a black background."] },
     Guide { section: "Pictures", title: "Make a portrait or square montage", terms: "vertical portrait horizontal landscape aspect 9:16 16:9 square canvas resolution still photo montage social fit fill crop reframe zoom in focus subject left right top bottom framing letterbox letterboxing black bars pillarbox border",
         intro: "Choose the output shape first so you can check how landscape footage and portrait stills fit inside it.",
         steps: &["In Project Settings choose a portrait or square Canvas, then Apply Project Settings. The 1080 × 1920 portrait preset is full HD. Add pictures and videos in viewing order.",
-        "Select each still, set Duration in the Inspector, then choose Apply Changes. Under Framing, Fit keeps the whole source visible and can leave black bars. Fill crops the picture to cover the canvas.",
-        "With Fill selected, adjust Horizontal Focus toward the left or right subject, or Vertical Focus toward the top or bottom. Choose Apply Changes and check Preview. Each shot keeps its own framing.",
+        "Select a still, click its Duration value in the Inspector, press Ctrl+A, type the exact length in seconds (for example 1.50), then press Enter to apply. For a video, choose Picture in the Inspector. Under Framing, Fit keeps the whole source visible and can leave black bars. Fill crops the picture to cover the canvas.",
+        "With Fill selected, adjust Horizontal Focus toward the left or right subject, or Vertical Focus toward the top or bottom. Choose Apply Changes. Drag the divider below Preview for a larger picture alongside the Inspector, or choose Expand Preview to check the whole composition. Each shot keeps its own framing.",
         "For an opener, choose + Title and select Beginning. Check text, framing and the final image in Preview.",
         "Export MP4… creates a file using the selected canvas and frame rate."] },
     Guide { section: "Pictures", title: "Rotate or mirror a picture", terms: "sideways rotate rotation upside down flip horizontal mirror orientation photo video",
         intro: "An orientation change applies to the selected occurrence of a video or still.",
-        steps: &["Select the picture in the timeline and find Rotation in the Inspector.",
+        steps: &["Select the shot in the timeline. For a video, choose Picture in the Inspector, then find Rotation.",
         "Choose a clockwise angle. For a left-to-right reflection after rotation, select Mirror Horizontally.",
         "Choose Apply Changes. Use Expand Preview to inspect the result and Restore Preview to return to editing."] },
     Guide { section: "Sound", title: "Fade audio in or out", terms: "smooth volume soften ending ramp fade fades audio music click optional gain",
         intro: "A fade gradually changes volume while preserving your original recording.",
-        steps: &["Select a sound occurrence or a video shot with audio. In the Inspector set Fade in or Fade out in seconds.",
+        steps: &["Select a sound occurrence or a video shot with audio. For a video, choose Camera audio in the Inspector. Set Fade in or Fade out in seconds.",
         "Choose Apply Changes and play across the boundary. Set a fade back to zero to remove it.",
         "Splitting a sound during a fade preserves the level on both sides of the cut."] },
     Guide { section: "Pictures", title: "Add timed captions or import subtitles", terms: "bilingual multilingual subtitle subtitles caption captions accessibility srt subrip transcript closed open burned burn cue boundaries text position bottom top background frame counter scoreboard legible keep visible",
         intro: "Time a subtitle to speech, burn it into the shared MP4, or save a separate SubRip file.",
-        steps: &["Open Captions… and choose New at Playhead. Enter Caption text. Click a time, use Ctrl+A and type seconds or minutes:seconds, then press Enter. Choose Add Caption.",
+        steps: &["Open Captions… and choose New at Playhead. Enter Caption text. Press Enter within the text box for a second language on a new line. Click a time, use Ctrl+A and type seconds or minutes:seconds, then press Enter. Choose Add Caption.",
         "The Captions lane shows each cue below the time ruler. Click a cue to jump to its start, or click its right edge to jump to the end. Double-click a cue to edit its text and times, then choose Save Caption.",
         "Use Import SRT… for existing subtitles. Caption position moves subtitles to the top or bottom of the picture so important detail stays visible. Export SRT… writes a separate subtitle file. Choose a fresh filename.",
         "Start is the first included time and End is the first time without that cue. Check both sides with Previous Frame and Next Frame. Export MP4… includes the captions in the picture."] },
@@ -223,7 +223,7 @@ pub(crate) fn show(ui: &mut Ui, state: &mut Wiki) {
         let mut reader = ui.new_child(egui::UiBuilder::new().id_salt("wiki-guide").max_rect(article_rect));
         egui::ScrollArea::vertical().id_salt(("wiki-article", state.topic)).show(&mut reader, |ui| article(ui, state.topic));
     } else {
-        egui::ScrollArea::vertical().id_salt("wiki-narrow").show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(("wiki-narrow", state.topic)).show(ui, |ui| {
             egui::ComboBox::from_id_salt("wiki-choose").width(ui.available_width().max(1.0)).truncate()
                 .selected_text(GUIDES[state.topic].title).show_ui(ui, |ui| links(ui, &mut state.topic, visible, true));
             ui.add_space(8.0);
@@ -264,7 +264,7 @@ mod tests {
     fn search_finds_workflows_by_user_vocabulary() {
         for (query, expected) in [("black after video", "closing credits"), ("caption boundaries", "captions"), ("missing file", "relink"), ("frame counter", "one frame"), ("how do I nudge a frame", "one frame"),
             ("voiceover music", "narration"), ("camera audio", "camera audio"), ("portrait montage", "portrait"), ("penultimate shot", "long sequence"), ("cancel export", "Export"),
-            ("move shot to beginning", "Reorder"), ("move title to front", "Reorder"), ("move closing chaptercard to front", "Reorder"), ("save as revision", "revise"), ("effects cue", "effects"), ("silent tail", "effects"), ("half volume", "effects"), ("letterbox", "portrait"), ("crop fill focus", "portrait")] {
+            ("move shot to beginning", "Reorder"), ("move title to front", "Reorder"), ("move closing chaptercard to front", "Reorder"), ("save as revision", "revise"), ("foley", "effects"), ("effects cue", "effects"), ("silent tail", "effects"), ("half volume", "effects"), ("letterbox", "portrait"), ("crop fill focus", "portrait")] {
             assert!(GUIDES.iter().any(|g| g.title.to_lowercase().contains(&expected.to_lowercase()) && rank(g, query).is_some()), "{query}");
         }
         assert!(GUIDES.iter().all(|g| rank(g, "unfindable0001").is_none()));
