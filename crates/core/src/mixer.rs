@@ -172,7 +172,21 @@ pub struct GainCurve {
     pub edits: Vec<(f64, f64, f32)>,
     /// Ramp length in seconds at each edit boundary (0 = instant).
     pub fade: f64,
+    /// App occupants in time order. Unoccupied slots use the track's base gain.
+    pub slots: Vec<SlotGain>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotGain {
+    start: f64,
+    end: f64,
+    base: f32,
+    edits: Vec<(f64, f64, f32)>,
+}
+
+// A block's t0 + i * dt may round just below the same time expressed as
+// absolute sample position / rate. This tolerance is much smaller than one sample.
+const SLOT_BOUNDARY_EPSILON: f64 = 1e-10;
 
 fn smoothstep(x: f64) -> f64 {
     let x = x.clamp(0.0, 1.0);
@@ -181,12 +195,12 @@ fn smoothstep(x: f64) -> f64 {
 
 impl GainCurve {
     pub fn constant(g: f32) -> GainCurve {
-        GainCurve { base: g, edits: Vec::new(), fade: 0.0 }
+        GainCurve { base: g, edits: Vec::new(), fade: 0.0, slots: Vec::new() }
     }
 
     /// Nothing audible ever (skip decoding the track).
     pub fn is_silent(&self) -> bool {
-        self.base <= 1e-5
+        self.base <= 1e-5 && self.slots.iter().all(|slot| slot.base <= 1e-5)
     }
 
     fn edit_factor(&self, e: &(f64, f64, f32), t: f64) -> f32 {
@@ -203,15 +217,33 @@ impl GainCurve {
     }
 
     pub fn at(&self, t: f64) -> f32 {
-        let mut g = self.base;
-        for e in &self.edits {
-            g *= self.edit_factor(e, t);
-        }
-        g
+        let edge = t + SLOT_BOUNDARY_EPSILON;
+        let i = self.slots.partition_point(|slot| slot.end <= edge);
+        self.at_slot(self.slots.get(i), t, edge)
+    }
+
+    fn at_slot(&self, slot: Option<&SlotGain>, t: f64, edge: f64) -> f32 {
+        let (base, edits) = match slot {
+            Some(slot) if slot.start <= edge => (slot.base, &slot.edits),
+            _ => (self.base, &self.edits),
+        };
+        edits.iter().fold(base, |g, e| g * self.edit_factor(e, t))
     }
 
     /// `out[i] = at(t0 + i * dt)`, fast when no edit boundary is nearby.
     pub fn fill(&self, t0: f64, dt: f64, out: &mut [f32]) {
+        if !self.slots.is_empty() {
+            let mut i = self.slots.partition_point(|slot| slot.end <= t0 + SLOT_BOUNDARY_EPSILON);
+            for (sample, gain) in out.iter_mut().enumerate() {
+                let t = t0 + dt * sample as f64;
+                let edge = t + SLOT_BOUNDARY_EPSILON;
+                while self.slots.get(i).is_some_and(|slot| slot.end <= edge) {
+                    i += 1;
+                }
+                *gain = self.at_slot(self.slots.get(i), t, edge);
+            }
+            return;
+        }
         let t1 = t0 + dt * out.len() as f64;
         let relevant: Vec<&(f64, f64, f32)> = self.edits.iter().filter(|e| e.0 < t1 && e.1 > t0).collect();
         if relevant.is_empty() {
@@ -274,7 +306,7 @@ pub fn compose(tracks: &[TrackSource], mix: &MixSettings, edits: &[AudioEdit], e
                 e.extend(lane_edits(edits, l, edit_offset));
             }
             e.sort_by(|a, b| a.0.total_cmp(&b.0));
-            GainCurve { base, edits: e, fade }
+            GainCurve { base, edits: e, fade, slots: Vec::new() }
         })
         .collect()
 }
@@ -285,29 +317,23 @@ pub fn compose_slot(intervals: &[(f64, f64, TrackSource)], mix: &MixSettings, ed
     if mix.mode == MixMode::Full || intervals.is_empty() {
         return GainCurve::constant(0.0);
     }
-    let mut out = Vec::new();
+    let mut slots = Vec::new();
     for (a, b, src) in intervals {
         let ov = match src {
             TrackSource::App { key, .. } => overrides.get(&key.to_lowercase()).map(String::as_str),
             _ => None,
         };
         let lanes = src.lanes(ov);
-        let g = lanes.iter().fold(1.0f32, |g, l| g * mix.lane(l).effective());
-        if (g - 1.0).abs() > 1e-6 {
-            out.push((*a, *b, g));
-        }
-        for l in &lanes {
-            for (ea, eb, eg) in lane_edits(edits, l, edit_offset) {
-                let (x, y) = (ea.max(*a), eb.min(*b));
-                if y > x {
-                    out.push((x, y, eg));
-                }
-            }
-        }
+        let base = lanes.iter().fold(1.0f32, |g, l| g * mix.lane(l).effective());
+        // Keep the original edit endpoints. A slot switch gates the audio
+        // immediately and doesn't create a second fade inside an existing edit.
+        let edits = lanes.iter().flat_map(|lane| lane_edits(edits, lane, edit_offset))
+            .filter(|(start, end, _)| *start < *b && *end > *a)
+            .collect();
+        slots.push(SlotGain { start: *a, end: *b, base, edits });
     }
-    out.sort_by(|x, y| x.0.total_cmp(&y.0));
-    // Interval gains switch instantly at app changes (fades only on edits).
-    GainCurve { base: 1.0, edits: out, fade }
+    slots.sort_by(|a, b| a.start.total_cmp(&b.start));
+    GainCurve { base: 0.0, edits: Vec::new(), fade, slots }
 }
 
 /// Soft limiter used on every mix so boosted tracks don't clip harshly.
@@ -378,24 +404,24 @@ mod tests {
 
     #[test]
     fn smooth_fades() {
-        let g = GainCurve { base: 1.0, edits: vec![(1.0, 2.0, 0.0)], fade: 0.1 };
+        let g = GainCurve { base: 1.0, edits: vec![(1.0, 2.0, 0.0)], fade: 0.1, slots: Vec::new() };
         assert_eq!(g.at(0.99), 1.0);
         assert!((g.at(1.05) - 0.5).abs() < 0.01, "halfway through the ramp");
         assert_eq!(g.at(1.5), 0.0);
         assert!(g.at(1.97) > 0.1 && g.at(1.97) < 0.9);
         assert_eq!(g.at(2.0), 1.0);
         // Short edits ramp over half their length each way.
-        let s = GainCurve { base: 1.0, edits: vec![(1.0, 1.04, 0.0)], fade: 0.1 };
+        let s = GainCurve { base: 1.0, edits: vec![(1.0, 1.04, 0.0)], fade: 0.1, slots: Vec::new() };
         assert!((s.at(1.02) - 0.0).abs() < 1e-3);
         // Hard edits switch instantly.
-        let h = GainCurve { base: 0.8, edits: vec![(1.0, 2.0, 2.0)], fade: 0.0 };
+        let h = GainCurve { base: 0.8, edits: vec![(1.0, 2.0, 2.0)], fade: 0.0, slots: Vec::new() };
         assert_eq!(h.at(1.0), 1.6);
         assert_eq!(h.at(0.999), 0.8);
     }
 
     #[test]
     fn fill_matches_at() {
-        let g = GainCurve { base: 0.9, edits: vec![(0.010, 0.020, 0.0), (0.015, 0.050, 2.0)], fade: 0.003 };
+        let g = GainCurve { base: 0.9, edits: vec![(0.010, 0.020, 0.0), (0.015, 0.050, 2.0)], fade: 0.003, slots: Vec::new() };
         let mut out = vec![0.0; 3000];
         g.fill(0.0, 1.0 / 48_000.0, &mut out);
         for (i, v) in out.iter().enumerate() {
@@ -441,6 +467,46 @@ mod tests {
         assert_eq!(g.at(17.0), 2.0, "chrome edit inside its interval");
         mix.mode = MixMode::Full;
         assert!(compose_slot(&iv, &mix, &edits, 0.0, 0.0, &BTreeMap::new()).is_silent());
+    }
+
+    #[test]
+    fn slot_boundaries_apply_base_gains_without_fading_user_edits_again() {
+        let iv = [
+            (1.0, 1.6, app("muted.exe", "game")),
+            (1.6, 2.0, app("reduced.exe", "voice")),
+            (2.2, 2.6, app("normal.exe", "media")),
+        ];
+        let mut mix = MixSettings::default();
+        mix.set("app:muted.exe", LaneGain { gain: 1.0, muted: true });
+        mix.set("cat:voice", LaneGain { gain: 0.5, muted: false });
+        let edits = [
+            edit("app:reduced.exe", 1.45, 1.8, 0.0),
+            edit("app:normal.exe", 2.3, 2.5, 0.0),
+        ];
+        let fade = 0.03;
+        let gain = compose_slot(&iv, &mix, &edits, 0.0, fade, &BTreeMap::new());
+        let dt = 1.0 / 48_000.0;
+        let around = |edge: f64| {
+            let t0 = edge - dt;
+            let mut samples = [f32::NAN; 3];
+            gain.fill(t0, dt, &mut samples);
+            for (i, &sample) in samples.iter().enumerate() {
+                assert_eq!(sample, gain.at(t0 + i as f64 * dt));
+            }
+            samples
+        };
+        assert_eq!(around(1.0), [0.0, 0.0, 0.0]); // First samples of muted app.
+        assert_eq!(around(1.6), [0.0, 0.0, 0.0]); // Last mute sample and first reduced app samples.
+        assert_eq!(around(2.0), [0.5, 0.0, 0.0]); // Reduced gain until the last occupied sample.
+        assert_eq!(around(2.2), [0.0, 1.0, 1.0]); // Silence until the next app owns the slot.
+        assert_eq!(around(2.6), [1.0, 0.0, 0.0]);
+        assert!((gain.at(2.3 + fade / 2.0) - 0.5).abs() < 1e-6);
+        assert_eq!(gain.at(2.4), 0.0);
+        assert!((gain.at(2.5 - fade / 2.0) - 0.5).abs() < 1e-6);
+
+        let without_edits = compose_slot(&iv, &mix, &[], 0.0, fade, &BTreeMap::new());
+        assert_eq!(without_edits.at(1.6 - dt), 0.0);
+        assert_eq!(without_edits.at(1.6), 0.5);
     }
 
     #[test]

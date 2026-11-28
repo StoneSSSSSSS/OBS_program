@@ -5,7 +5,10 @@ use crate::mp4::reader::{Mp4Reader, TrackKind};
 use crate::mp4::Codec;
 use crate::recorder::{parse_meta, AppIdent, SegmentMeta};
 use anyhow::Result;
+use cv_core::mixer::{compose, compose_slot, GainCurve, MixSettings, TrackSource};
+use cv_core::model::AudioEdit;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// What an audio track holds.
@@ -153,8 +156,7 @@ pub fn slot_app(history: &[SegmentMeta], slot: u32, at_s: f64) -> Option<AppIden
 
 /// How each audio track maps onto the mixing lanes. 24/7 app tracks
 /// ("slots") hold different apps over time; see [`slot_intervals`].
-pub fn track_sources(info: &MediaInfo) -> Vec<cv_core::mixer::TrackSource> {
-    use cv_core::mixer::TrackSource;
+pub fn track_sources(info: &MediaInfo) -> Vec<TrackSource> {
     let n = info.audio.len();
     let legacy = n == LEGACY_NAMES.len() && info.audio.iter().all(|a| a.role == TrackRole::Other);
     info.audio
@@ -176,6 +178,28 @@ pub fn track_sources(info: &MediaInfo) -> Vec<cv_core::mixer::TrackSource> {
             TrackRole::Other => TrackSource::Other(i),
         })
         .collect()
+}
+
+/// Playback and export gains for decodable audio tracks in file order.
+pub fn mix_gains(
+    info: &MediaInfo,
+    mix: &MixSettings,
+    edits: &[AudioEdit],
+    edit_offset: f64,
+    fade: f64,
+    overrides: &BTreeMap<String, String>,
+) -> Vec<GainCurve> {
+    let mut gains = compose(&track_sources(info), mix, edits, edit_offset, fade, overrides);
+    for (gain, track) in gains.iter_mut().zip(&info.audio) {
+        if let TrackRole::Slot { slot } = track.role {
+            let intervals = slot_intervals(info, slot, info.duration).into_iter()
+                .map(|(start, end, app)| (start, end, TrackSource::App {
+                    key: app.key, name: app.name, category: app.category,
+                })).collect::<Vec<_>>();
+            *gain = compose_slot(&intervals, mix, edits, edit_offset, fade, overrides);
+        }
+    }
+    gains
 }
 
 /// When each app occupied recording slot `slot`: (start s, end s, app), in

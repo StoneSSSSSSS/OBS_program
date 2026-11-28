@@ -7,7 +7,7 @@ use crate::win::ui::{ToastLevel, UiCmd};
 use anyhow::{Context, Result};
 use cv_core::db::Db;
 use cv_core::ipc::{Event, ExportSource, JobInfo};
-use cv_core::mixer::{compose, compose_slot, MixSettings, TrackSource};
+use cv_core::mixer::MixSettings;
 use cv_core::model::{rebase_edits, AudioEdit, NewClip};
 use cv_core::naming::{render_template, sanitize_component, unique_path};
 use cv_core::util::now_ms;
@@ -366,18 +366,7 @@ fn share_retry_bitrate(kbps: u32, actual: u64, cap: u64) -> Option<u32> {
 /// Gain curve for every audio track of `path` from a mix + edits (file time).
 pub fn gains_for(path: &Path, mix: &MixSettings, edits: &[AudioEdit], edit_offset: f64, fade: f64, overrides: &std::collections::BTreeMap<String, String>) -> Result<Vec<cv_core::mixer::GainCurve>> {
     let info = cv_media::probe::probe(path)?;
-    let sources = cv_media::probe::track_sources(&info);
-    let mut gains = compose(&sources, mix, edits, edit_offset, fade, overrides);
-    for (i, a) in info.audio.iter().enumerate() {
-        if let cv_media::probe::TrackRole::Slot { slot } = a.role {
-            let iv: Vec<(f64, f64, TrackSource)> = cv_media::probe::slot_intervals(&info, slot, info.duration)
-                .into_iter()
-                .map(|(a, b, app)| (a, b, TrackSource::App { key: app.key, name: app.name, category: app.category }))
-                .collect();
-            gains[i] = compose_slot(&iv, mix, edits, edit_offset, fade, overrides);
-        }
-    }
-    Ok(gains)
+    Ok(cv_media::probe::mix_gains(&info, mix, edits, edit_offset, fade, overrides))
 }
 
 #[allow(clippy::too_many_arguments)]
