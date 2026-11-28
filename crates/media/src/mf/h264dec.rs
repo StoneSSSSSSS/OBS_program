@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::d3d::Gpu;
+use anyhow::ensure;
 use std::sync::Arc;
 use windows::core::VARIANT;
 
@@ -26,6 +27,7 @@ pub struct VideoDecoder {
     len_size: usize,
     sps: Vec<Vec<u8>>,
     pps: Vec<Vec<u8>>,
+    layout: Nv12Layout,
     /// Display size (from the SPS, after cropping).
     pub width: u32,
     pub height: u32,
@@ -34,6 +36,104 @@ pub struct VideoDecoder {
 }
 
 unsafe impl Send for VideoDecoder {}
+
+#[derive(Clone, Copy, Debug)]
+struct Nv12Layout {
+    frame_width: usize,
+    frame_height: usize,
+    default_stride: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Nv12Layout {
+    fn from_type(media_type: &IMFMediaType, visible_size: (u32, u32)) -> Result<Self> {
+        let size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }?;
+        let frame_width = (size >> 32) as usize;
+        let frame_height = (size as u32) as usize;
+        let default_stride = unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
+            .map_or(frame_width, |value| value as usize);
+        let aperture = display_aperture(media_type, &MF_MT_MINIMUM_DISPLAY_APERTURE)
+            .or_else(|| display_aperture(media_type, &MF_MT_GEOMETRIC_APERTURE));
+        let (x, y, width, height) = aperture.unwrap_or((
+            0, 0, frame_width.min(visible_size.0 as usize), frame_height.min(visible_size.1 as usize),
+        ));
+        ensure!(frame_width >= 2 && frame_height >= 2 && frame_width % 2 == 0 && frame_height % 2 == 0,
+            "Invalid NV12 frame size {frame_width}×{frame_height}");
+        ensure!(width >= 2 && height >= 2 && x % 2 == 0 && y % 2 == 0 && width % 2 == 0 && height % 2 == 0
+            && x.checked_add(width).is_some_and(|right| right <= frame_width)
+            && y.checked_add(height).is_some_and(|bottom| bottom <= frame_height),
+            "Invalid NV12 display aperture ({x}, {y}) {width}×{height} inside {frame_width}×{frame_height}");
+        Ok(Self { frame_width, frame_height, default_stride, x, y, width, height })
+    }
+
+    fn pack(self, bytes: &[u8], stride: usize) -> Result<Vec<u8>> {
+        ensure!(stride >= self.frame_width, "Invalid NV12 stride {stride}");
+        let y_size = stride.checked_mul(self.frame_height).context("NV12 frame size overflow")?;
+        let uv_size = stride.checked_mul(self.frame_height / 2).context("NV12 plane size overflow")?;
+        let required = y_size.checked_add(uv_size).context("NV12 buffer size overflow")?;
+        ensure!(bytes.len() >= required, "Truncated NV12 buffer: {} bytes, need {required}", bytes.len());
+        if self.x == 0 && self.y == 0 && self.width == stride && self.height == self.frame_height {
+            return Ok(bytes[..required].to_vec());
+        }
+        let mut packed = Vec::with_capacity(self.width * (self.height + self.height / 2));
+        let (y, uv) = bytes[..required].split_at(y_size);
+        for row in y.chunks_exact(stride).skip(self.y).take(self.height) {
+            packed.extend_from_slice(&row[self.x..self.x + self.width]);
+        }
+        for row in uv.chunks_exact(stride).skip(self.y / 2).take(self.height / 2) {
+            packed.extend_from_slice(&row[self.x..self.x + self.width]);
+        }
+        Ok(packed)
+    }
+
+    fn copy_sample(self, buffer: &IMFMediaBuffer) -> Result<Vec<u8>> {
+        unsafe {
+            if let Ok(surface) = buffer.cast::<IMF2DBuffer>() {
+                // Ask MF to normalize surface pitch. GetContiguousLength
+                // describes this packed copy, never the Lock2D memory layout.
+                let mut bytes = vec![0; surface.GetContiguousLength()? as usize];
+                surface.ContiguousCopyTo(&mut bytes)?;
+                return self.pack(&bytes, self.frame_width);
+            }
+            let mut data = std::ptr::null_mut();
+            let mut length = 0;
+            buffer.Lock(&mut data, None, Some(&mut length))?;
+            let packed = if data.is_null() || length == 0 {
+                Err(anyhow::anyhow!("Empty NV12 decoder buffer"))
+            } else {
+                // The exact Lock length bounds all plane and aperture reads.
+                self.pack(std::slice::from_raw_parts(data, length as usize), self.default_stride)
+            };
+            let unlocked = buffer.Unlock();
+            let packed = packed?;
+            unlocked?;
+            Ok(packed)
+        }
+    }
+}
+
+fn display_aperture(media_type: &IMFMediaType, key: &GUID) -> Option<(usize, usize, usize, usize)> {
+    let mut area = MFVideoArea::default();
+    let size = std::mem::size_of::<MFVideoArea>();
+    let mut actual = 0;
+    unsafe {
+        // MFVideoArea contains only integer fields and occupies the documented attribute layout.
+        let bytes = std::slice::from_raw_parts_mut((&mut area as *mut MFVideoArea).cast::<u8>(), size);
+        media_type.GetBlob(key, bytes, Some(&mut actual)).ok()?;
+    }
+    if actual as usize != size || area.OffsetX.fract != 0 || area.OffsetY.fract != 0 {
+        return None;
+    }
+    Some((
+        area.OffsetX.value.try_into().ok()?,
+        area.OffsetY.value.try_into().ok()?,
+        area.Area.cx.try_into().ok()?,
+        area.Area.cy.try_into().ok()?,
+    ))
+}
 
 impl VideoDecoder {
     /// `low_latency`: the stream has no B-frames (ClipVault's own files), so
@@ -68,9 +168,10 @@ impl VideoDecoder {
             mft.SetInputType(0, &inp, 0).context("decoder input type")?;
             let out = find_output_type(&mft, &MFVideoFormat_NV12).context("decoder can't output NV12")?;
             mft.SetOutputType(0, &out, 0).context("decoder output type")?;
+            let layout = Nv12Layout::from_type(&mft.GetOutputCurrentType(0)?, (width, height))?;
             let mut m = SyncMft::new(mft);
             m.begin()?;
-            Ok(VideoDecoder { m, len_size, sps, pps, width, height, _gpu: gpu, hardware })
+            Ok(VideoDecoder { m, len_size, sps, pps, layout, width, height, _gpu: gpu, hardware })
         }
     }
 
@@ -96,9 +197,7 @@ impl VideoDecoder {
             let mut samples = Vec::new();
             let changed = self.m.pull_all(&mut samples)?;
             for s in samples {
-                if let Some(f) = self.frame(&s)? {
-                    out.push(f);
-                }
+                out.push(self.frame(&s)?);
             }
             if !changed {
                 return Ok(());
@@ -106,48 +205,24 @@ impl VideoDecoder {
             unsafe {
                 let t = find_output_type(&self.m.mft, &MFVideoFormat_NV12)?;
                 self.m.mft.SetOutputType(0, &t, 0)?;
+                self.layout = Nv12Layout::from_type(
+                    &self.m.mft.GetOutputCurrentType(0)?, (self.width, self.height),
+                )?;
             }
             self.m.refresh_out_info();
         }
     }
 
-    fn frame(&self, s: &IMFSample) -> Result<Option<DecodedFrame>> {
-        unsafe {
-            let pts = s.GetSampleTime().unwrap_or(0);
-            let buf = s.GetBufferByIndex(0)?;
-            let (w, h) = (self.width as usize, self.height as usize);
-            let mut nv12 = vec![0u8; w * h * 3 / 2];
-            if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
-                let mut p = std::ptr::null_mut();
-                let mut pitch = 0i32;
-                b2.Lock2D(&mut p, &mut pitch)?;
-                let pitch = pitch.unsigned_abs() as usize;
-                // The UV plane starts after the (possibly padded) Y plane.
-                let total = b2.GetContiguousLength().unwrap_or(0) as usize;
-                let padded_h = if pitch > 0 && total > 0 { total * 2 / 3 / pitch } else { h };
-                for y in 0..h {
-                    std::ptr::copy_nonoverlapping(p.add(y * pitch), nv12.as_mut_ptr().add(y * w), w);
-                }
-                for y in 0..h / 2 {
-                    std::ptr::copy_nonoverlapping(p.add((padded_h + y) * pitch), nv12.as_mut_ptr().add(w * h + y * w), w);
-                }
-                b2.Unlock2D()?;
-            } else {
-                let mut p = std::ptr::null_mut();
-                let mut len = 0u32;
-                buf.Lock(&mut p, None, Some(&mut len))?;
-                let stride = self.width as usize;
-                let rows = len as usize / stride.max(1) * 2 / 3;
-                for y in 0..h {
-                    std::ptr::copy_nonoverlapping(p.add(y * stride), nv12.as_mut_ptr().add(y * w), w);
-                }
-                for y in 0..h / 2 {
-                    std::ptr::copy_nonoverlapping(p.add((rows + y) * stride), nv12.as_mut_ptr().add(w * h + y * w), w);
-                }
-                buf.Unlock()?;
-            }
-            Ok(Some(DecodedFrame { pts_hns: pts, width: self.width, height: self.height, nv12 }))
-        }
+    fn frame(&self, sample: &IMFSample) -> Result<DecodedFrame> {
+        let pts_hns = unsafe { sample.GetSampleTime() }.unwrap_or(0);
+        let buffer = unsafe { sample.ConvertToContiguousBuffer() }?;
+        let nv12 = self.layout.copy_sample(&buffer)?;
+        Ok(DecodedFrame {
+            pts_hns,
+            width: self.layout.width as u32,
+            height: self.layout.height as u32,
+            nv12,
+        })
     }
 
     /// Forget buffered frames (after a seek).
@@ -191,5 +266,29 @@ pub fn nv12_to_rgb(f: &DecodedFrame, max_w: u32) -> image::RgbImage {
         image::imageops::thumbnail(&img, max_w, nh)
     } else {
         img
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_aperture_from_padded_nv12_and_rejects_short_buffers() -> Result<()> {
+        let layout = Nv12Layout {
+            frame_width: 6,
+            frame_height: 4,
+            default_stride: 8,
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 2,
+        };
+        let backing: Vec<u8> = (0..48).collect();
+        let packed = layout.pack(&backing, layout.default_stride)?;
+        assert_eq!(packed, [18, 19, 20, 21, 26, 27, 28, 29, 42, 43, 44, 45]);
+        assert!(layout.pack(&backing[..47], layout.default_stride).is_err());
+        assert!(layout.pack(&backing, 4).is_err());
+        Ok(())
     }
 }
