@@ -199,7 +199,7 @@ impl Workbench {
         self.availability.poll(ui.ctx());
         self.export.poll();
         if self.tab == Tab::Workbench {
-            self.preview.poll(ui.ctx(), &self.history.project, self.revision, &mut self.playhead);
+            self.preview.poll(ui.ctx(), &self.history.project, self.revision, &mut self.playhead, &mut self.availability);
         }
 
         ui.horizontal_wrapped(|ui| {

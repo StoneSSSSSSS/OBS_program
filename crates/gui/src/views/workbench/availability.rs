@@ -53,6 +53,18 @@ impl Availability {
         self.next_scan = (!self.sources.is_empty()).then(Instant::now);
     }
 
+    pub(super) fn mark_offline(&mut self, id: Id) {
+        if let Some(source) = self.sources.get_mut(&id) {
+            if source.available != Some(false) {
+                source.available = Some(false);
+                self.summarize_missing();
+                // A scan started before the decoder found the missing file may still say it exists.
+                self.scan = None;
+                self.refresh();
+            }
+        }
+    }
+
     pub(super) fn missing(&self, id: Id) -> bool {
         self.sources.get(&id).is_some_and(|source| source.available == Some(false))
     }
@@ -81,7 +93,13 @@ impl Availability {
                 Err(TryRecvError::Disconnected) => self.scan = None,
             }
         }
-        let Some(paths) = self.take_scan(Instant::now()) else { return; };
+        let now = Instant::now();
+        let Some(paths) = self.take_scan(now) else {
+            if self.missing_summary.is_some() {
+                if let Some(next) = self.next_scan { ctx.request_repaint_after(next.saturating_duration_since(now)); }
+            }
+            return;
+        };
         let (tx, rx) = mpsc::channel();
         let wake = ctx.clone();
         match std::thread::Builder::new().name("clipvault-editor-bin-scan".into()).spawn(move || {
@@ -109,6 +127,20 @@ mod tests {
             path: path.into(),
             info: AssetInfo { kind: AssetKind::Video, fps_milli: None, duration: 10_000_000, width: 1280, height: 720 },
         }
+    }
+
+    #[test]
+    fn newly_offline_source_supersedes_a_scan_started_before_removal() {
+        let mut availability = Availability::default();
+        availability.sync(&[asset("recording.mp4")]);
+        let (tx, rx) = mpsc::channel();
+        availability.scan = Some(rx);
+        tx.send(vec![(1, "recording.mp4".into(), true)]).unwrap();
+        availability.mark_offline(1);
+        assert!(availability.scan.is_none());
+        assert!(availability.missing(1));
+        assert_eq!(availability.missing_summary, Some((1, 1)));
+        assert!(availability.take_scan(Instant::now()).is_some());
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! A composed preview and export worker. Both use the same renderer.
-use super::{seconds, ticks};
+use super::{availability::Availability, seconds, ticks};
 use crate::{native_player::NativePlayer, theme};
 use anyhow::{bail, Context as _, Result};
-use cv_core::editor::{Project, Span, TICKS_PER_SECOND};
+use cv_core::editor::{Id, Project, Span, TICKS_PER_SECOND};
 use cv_media::editor::{self, RenderControl};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2};
 use std::{
@@ -90,6 +90,7 @@ pub(super) struct Preview {
     thumbnail: Option<Receiver<Thumbnail>>,
     shown: Option<(u64, u64)>,
     error: Option<String>,
+    offline_source: Option<Id>,
     playing: bool,
     pending_play: bool,
     wait_seek: Option<(u64, Instant)>,
@@ -126,6 +127,7 @@ impl Preview {
         self.serial = None;
         self.shown = None;
         self.error = None;
+        self.offline_source = None;
         self.wait_seek = None;
         self.next_thumb = None;
     }
@@ -164,7 +166,8 @@ impl Preview {
         ctx.request_repaint();
     }
 
-    pub(super) fn poll(&mut self, ctx: &egui::Context, project: &Project, revision: u64, at: &mut u64) {
+    pub(super) fn poll(&mut self, ctx: &egui::Context, project: &Project, revision: u64, at: &mut u64, availability: &mut Availability) {
+        if self.offline_source.is_some_and(|id| !availability.missing(id)) { self.invalidate(ctx); }
         if project.duration() == 0 { return; }
         if let Some(result) = self.task.as_ref().and_then(|task| task.worker.result()) {
             let task = self.task.take().unwrap();
@@ -182,7 +185,7 @@ impl Preview {
                 Err(error) => {
                     self.playing = false;
                     self.pending_play = false;
-                    self.error = Some(preview_error(project, &error));
+                    self.report_error(project, &error, availability);
                 }
             }
         }
@@ -235,7 +238,7 @@ impl Preview {
                             self.displayed = Some((revision, rendered_at));
                             self.set_image(ctx, image);
                         }
-                        Err(error) if self.error.is_none() => self.error = Some(preview_error(project, &error)),
+                        Err(error) if self.error.is_none() => self.report_error(project, &error, availability),
                         Err(_) => {}
                     }
                 }
@@ -250,6 +253,21 @@ impl Preview {
         if self.playing || self.task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
+    }
+
+    fn report_error(&mut self, project: &Project, error: &anyhow::Error, availability: &mut Availability) {
+        let details = format!("{error:#}");
+        self.offline_source = None;
+        for asset in &project.assets {
+            let name = super::filename(&asset.path);
+            if details.contains(&name) && !asset.path.is_file() {
+                self.offline_source = Some(asset.id);
+                availability.mark_offline(asset.id);
+                self.error = Some(format!("Media offline · {name}\nChoose Relink beside the project name."));
+                return;
+            }
+        }
+        self.error = Some(format!("Preview failed: {details}"));
     }
 
     fn ensure_proxy(&mut self, ctx: &egui::Context, project: &Project, at: u64) {
@@ -381,17 +399,6 @@ fn preview_keeps_a_subframe_audio_tail_with_the_last_picture() {
         assert_eq!(playback_span(total, at, 30), Span { start: 0, end: total });
     }
     assert_eq!(playback_span(3 * PROXY_LENGTH, PROXY_LENGTH, 30), Span { start: PROXY_LENGTH, end: 2 * PROXY_LENGTH });
-}
-
-fn preview_error(project: &Project, error: &anyhow::Error) -> String {
-    let details = format!("{error:#}");
-    for asset in &project.assets {
-        let name = super::filename(&asset.path);
-        if details.contains(&name) && !asset.path.is_file() {
-            return format!("Media offline · {name}\nChoose Relink Media… in the Media Bin.");
-        }
-    }
-    format!("Preview failed: {details}")
 }
 
 fn in_span(span: Span, at: u64, duration: u64) -> bool {
