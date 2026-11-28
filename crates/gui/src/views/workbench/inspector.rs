@@ -1,5 +1,5 @@
 //! Exact timeline and canvas values, committed as a single history edit.
-use super::{clock, filename, frame_tick, role_picker, seconds, ticks, Selection, Workbench};
+use super::{clock, filename, frame_tick, seconds, ticks, Selection, Workbench};
 use crate::theme;
 use anyhow::{ensure, Context as _, Result};
 use cv_core::editor::{AssetKind, AudioFade, Canvas, Framing, Project, Rotation, SoundRole, Source, Span, VisualTransform};
@@ -170,13 +170,19 @@ impl Workbench {
                 let Selection::Sound(id) = selection else { return; };
                 let sound = project.sounds.iter().find(|sound| sound.id == id).unwrap();
                 let asset = project.asset(sound.asset).unwrap();
-                ui.add(egui::Label::new(filename(&asset.path)).truncate()).on_hover_text(asset.path.display().to_string());
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("editor-sound-role").width(83.0)
+                        .selected_text(format!("{} lane", super::role_name(*role))).show_ui(ui, |ui| {
+                            for lane in [SoundRole::Voice, SoundRole::Music, SoundRole::Effect] {
+                                ui.selectable_value(role, lane, super::role_name(lane));
+                            }
+                        }).response.on_hover_text("Choose the audio lane");
+                    ui.add(egui::Label::new(filename(&asset.path)).truncate()).on_hover_text(asset.path.display().to_string());
+                });
                 time_field(ui, "Start on Timeline", at, seconds(i64::MAX as u64));
                 gain_field(ui, gain);
                 let limit = seconds(asset.info.duration);
                 trim_fields(ui, input, output, limit);
-                ui.label("Audio Lane");
-                role_picker(ui, "editor-sound-role", role);
                 fade_fields(ui, fade, *output - *input);
             }
         }

@@ -347,6 +347,9 @@ impl Preview {
         };
         if let Some((message, color)) = message {
             let message = if rect.width() >= 110.0 { message }
+                else if rect.width() < 60.0 {
+                    if self.error.is_some() { "!".into() } else { "…".into() }
+                }
                 else if self.error.is_some() { "Error".into() }
                 else if project.duration() == 0 { "Empty".into() }
                 else { "Loading…".into() };

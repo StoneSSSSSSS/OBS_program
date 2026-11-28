@@ -9,6 +9,8 @@ pub(crate) struct Wiki {
     section: Option<&'static str>,
     last_search: Option<(String, Option<&'static str>)>,
     results: Vec<(usize, usize)>,
+    matching_titles: usize,
+    show_related: bool,
 }
 
 struct Guide {
@@ -55,6 +57,11 @@ const GUIDES: &[Guide] = &[
         steps: &["Choose Fit to see the entire sequence. Open Select Item and choose the picture or sound to jump to its start. For the penultimate shot choose the second-to-last Video entry. Zoom in to inspect the cut.",
         "Choose Pan → Pan Left or Pan Right to move the visible time window. Click or drag on the ruler to seek within it.",
         "Use the frame controls to check a cut. Fit returns to the full sequence. On a narrow screen choose Timeline. Use View for Fit, Zoom or Pan when space is tight. Drag the divider beneath the preview to change its height when available."] },
+    Guide { section: "Sound", title: "Keep or mute the original camera audio", terms: "audio embedded source footage camera microphone original recorded sound mute clip split reorder duplicate",
+        intro: "The audio recorded in a video follows that shot when you move, copy or trim it.",
+        steps: &["Select the video shot in the timeline. Leave its Inspector Gain at 100% to keep the original level.",
+        "To quiet just this occurrence, reduce Gain or set it to 0% to mute it. Choose Apply Changes and check the preview.",
+        "Use the separate Voice, Music and Effects lanes for additional sound. Export MP4 includes the same gains and placements."] },
     Guide { section: "Sound", title: "Mix narration and music", terms: "voiceover voice over dialog dialogue gain quiet lower music soundtrack duck ducking audio level volume tutorial",
         intro: "Give narration, music and effects their own timeline items so you can change timing and volume independently.",
         steps: &["Add the picture first. Import your voiceover and music, then add each to its corresponding audio lane.",
@@ -108,7 +115,7 @@ const GUIDES: &[Guide] = &[
         "To share the finished video for viewing, use Export MP4… and share that output."] },
     Guide { section: "Files", title: "Find missing media and relink it", terms: "missing offline not found broken moved renamed locate reconnect relink original sources file",
         intro: "Relinking updates references to a source while preserving trims, placement and gain.",
-        steps: &["Open the project and look for the missing item in the Media Bin. Check its filename before choosing a replacement.",
+        steps: &["Open the project. Choose Relink in the missing-file notice beside the project name, or select a missing item in the Media Bin. Check its filename before choosing a replacement.",
         "Select the item, choose Relink Media… and locate its original file at the new path.",
         "Use the same kind of media with enough duration to cover the existing trims. Preview every occurrence, then save the project."] },
     Guide { section: "Files", title: "Export, cancel and find the result", terms: "render delivery job mp4 progress cancel overwrite existing location destination folder output share",
@@ -124,6 +131,16 @@ const GUIDES: &[Guide] = &[
         "Match the footage using the fps menu above Preview. Use Previous Frame and Next Frame, or comma and period, to check both sides of the cut. Balance each shot, save, then export."] },
 ];
 
+fn search_terms(query: &str) -> impl Iterator<Item = &str> {
+    query.split(|c: char| !c.is_alphanumeric()).filter(|word| !matches!(*word,
+        "" | "a" | "an" | "the" | "how" | "do" | "does" | "i" | "my" | "it" | "to" | "can" | "t" |
+        "what" | "where" | "is" | "with" | "for" | "of" | "and"))
+}
+
+fn has_term(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric()).any(|token| token.starts_with(word))
+}
+
 fn rank(guide: &Guide, query: &str) -> Option<usize> {
     if query.is_empty() { return Some(0); }
     let title = guide.title.to_lowercase();
@@ -132,11 +149,10 @@ fn rank(guide: &Guide, query: &str) -> Option<usize> {
     let mut terms = 0;
     let mut matched = 0;
     let query = query.to_lowercase();
-    for word in query.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
-        if matches!(word, "a" | "an" | "the" | "how" | "do" | "does" | "i" | "my" | "it" | "to" | "can" | "t" | "what" | "where" | "is" | "with" | "for" | "of" | "and") { continue; }
+    for word in search_terms(&query) {
         terms += 1;
-        let weight = if title.contains(word) { 5 } else if guide.terms.contains(word) { 3 }
-            else if body.contains(word) { 1 } else { 0 };
+        let weight = if has_term(&title, word) { 5 } else if has_term(guide.terms, word) { 3 }
+            else if has_term(&body, word) { 1 } else { 0 };
         if weight > 0 { matched += 1; score += weight; }
     }
     if terms == 0 { return Some(0); }
@@ -166,7 +182,14 @@ pub(crate) fn show(ui: &mut Ui, state: &mut Wiki) {
         state.results = GUIDES.iter().enumerate()
             .filter(|(_, g)| state.section.is_none_or(|section| section == g.section))
             .filter_map(|(i, g)| rank(g, &query).map(|score| (i, score))).collect();
-        state.results.sort_by_key(|&(i, score)| (std::cmp::Reverse(score), i));
+        let words = search_terms(&query).collect::<Vec<_>>();
+        let title_hit = |i: usize| {
+            let title = GUIDES[i].title.to_lowercase();
+            words.len() >= 2 && words.iter().all(|word| has_term(&title, word))
+        };
+        state.results.sort_by_key(|&(i, score)| (!title_hit(i), std::cmp::Reverse(score), i));
+        state.matching_titles = state.results.iter().take_while(|&&(i, _)| title_hit(i)).count();
+        state.show_related = false;
         if let Some(&(first, _)) = state.results.first() { state.topic = first; }
         state.last_search = Some((state.query.clone(), state.section));
     }
@@ -176,6 +199,14 @@ pub(crate) fn show(ui: &mut Ui, state: &mut Wiki) {
         if ui.button("Show all topics").clicked() { state.query.clear(); state.section = None; }
         return;
     }
+    let mut visible = state.results.as_slice();
+    if state.matching_titles > 0 && state.matching_titles < visible.len() {
+        ui.checkbox(&mut state.show_related, "Show related guides");
+        if !state.show_related {
+            visible = &visible[..state.matching_titles];
+            if !visible.iter().any(|&(id, _)| id == state.topic) { state.topic = visible[0].0; }
+        }
+    }
     ui.separator();
     if ui.available_width() >= 650.0 {
         let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
@@ -183,13 +214,13 @@ pub(crate) fn show(ui: &mut Ui, state: &mut Wiki) {
         let list_rect = egui::Rect::from_min_max(rect.min, egui::pos2(split - 7.0, rect.bottom()));
         let article_rect = egui::Rect::from_min_max(egui::pos2(split + 7.0, rect.top()), rect.max);
         let mut list = ui.new_child(egui::UiBuilder::new().id_salt("wiki-sections").max_rect(list_rect));
-        egui::ScrollArea::vertical().id_salt("wiki-list").show(&mut list, |ui| links(ui, &mut state.topic, &state.results, false));
+        egui::ScrollArea::vertical().id_salt("wiki-list").show(&mut list, |ui| links(ui, &mut state.topic, visible, false));
         let mut reader = ui.new_child(egui::UiBuilder::new().id_salt("wiki-guide").max_rect(article_rect));
         egui::ScrollArea::vertical().id_salt(("wiki-article", state.topic)).show(&mut reader, |ui| article(ui, state.topic));
     } else {
         egui::ScrollArea::vertical().id_salt("wiki-narrow").show(ui, |ui| {
             egui::ComboBox::from_id_salt("wiki-choose").width(ui.available_width().max(1.0)).truncate()
-                .selected_text(GUIDES[state.topic].title).show_ui(ui, |ui| links(ui, &mut state.topic, &state.results, true));
+                .selected_text(GUIDES[state.topic].title).show_ui(ui, |ui| links(ui, &mut state.topic, visible, true));
             ui.add_space(8.0);
             article(ui, state.topic);
         });
@@ -227,7 +258,7 @@ mod tests {
     #[test]
     fn search_finds_workflows_by_user_vocabulary() {
         for (query, expected) in [("missing file", "relink"), ("frame counter", "one frame"), ("how do I nudge a frame", "one frame"),
-            ("voiceover music", "narration"), ("portrait montage", "portrait"), ("penultimate shot", "long sequence"), ("cancel export", "Export"),
+            ("voiceover music", "narration"), ("camera audio", "camera audio"), ("portrait montage", "portrait"), ("penultimate shot", "long sequence"), ("cancel export", "Export"),
             ("move shot to beginning", "Reorder"), ("move title to front", "Reorder"), ("move closing chaptercard to front", "Reorder"), ("save as revision", "revise"), ("effects cue", "effects"), ("silent tail", "effects"), ("half volume", "effects"), ("letterbox", "portrait"), ("crop fill focus", "portrait")] {
             assert!(GUIDES.iter().any(|g| g.title.to_lowercase().contains(&expected.to_lowercase()) && rank(g, query).is_some()), "{query}");
         }

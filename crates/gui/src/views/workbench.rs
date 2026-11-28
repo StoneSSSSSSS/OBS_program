@@ -173,7 +173,7 @@ impl Workbench {
             self.dock = Dock::Media;
             let info = AssetInfo { kind: AssetKind::Audio, fps_milli: None, duration: TICKS_PER_SECOND, width: 0, height: 0 };
             self.selected_asset = Some(self.history.project.import(PathBuf::from("Synthetic cue.wav"), info).expect("fixture asset"));
-            self.notice = Some(Notice::Info("Imported 1 file".into()));
+            self.notice = Some(Notice::Error("Imported 1 file · Skipped 2 · Unsupported media".into()));
         }
         self.preview_expanded = page == "workbench_preview";
         self.tab = if page == "workbench_wiki" { Tab::Wiki } else { Tab::Workbench };
@@ -279,6 +279,15 @@ impl Workbench {
                 self.pause();
                 self.captions.open = true;
             }
+            if let Some((id, count)) = self.availability.missing_summary {
+                let label = format!("Relink {count} missing {}", if count == 1 { "file" } else { "files" });
+                if ui.button(label).on_hover_text("Locate a missing source used in this project").clicked() {
+                    self.selected_asset = Some(id);
+                    self.dock = Dock::Media;
+                    self.dock_open = true;
+                    self.relink(id, frame, ui.ctx());
+                }
+            }
             let name = self.file.as_deref().map(filename).unwrap_or_else(|| self.history.project.name.clone());
             let label = format!("{name}{}", if self.dirty() { " *" } else { "" });
             let details = self.file.as_ref().map_or_else(|| name.clone(), |file| {
@@ -346,7 +355,7 @@ impl Workbench {
                 }
                 Notice::Error(message) | Notice::ExportError(message) => {
                     let export_problem = matches!(notice, Notice::ExportError(_));
-                    ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
                         if export_problem { choose_export = ui.small_button("Choose new filename…").clicked(); }
                         if ui.small_button("Details").clicked() { self.error_details = Some(message.clone()); }
                         ui.add(egui::Label::new(RichText::new(message.lines().next().unwrap_or(message)).color(theme::DANGER)).truncate()).on_hover_text(message);
@@ -384,18 +393,20 @@ impl Workbench {
         let width = ui.available_width();
         let available = ui.available_height();
         if available < 265.0 {
-            ui.horizontal(|ui| {
-                let thumbnail = if self.dock_open { egui::vec2(50.0, 28.0) } else { egui::vec2(70.0, 40.0) };
-                let (picture, open) = ui.allocate_exact_size(thumbnail, Sense::click());
-                self.preview.picture(ui, picture, &self.history.project, accent, self.revision, self.playhead);
-                if open.on_hover_text("Expand preview").clicked() { self.preview_expanded = true; }
-                let duration = self.history.project.duration();
-                if ui.add_enabled(duration > 0, egui::Button::new(if self.preview.playing() { "Pause" } else { "Play" })).clicked() { self.toggle_play(ui.ctx()); }
-                if ui.add_enabled(duration > 0, egui::Button::new(clock(self.playhead))).on_hover_text("Go to time…").clicked() {
-                    self.seek_input = Some((String::new(), true));
-                }
-                if ui.small_button("Expand").clicked() { self.preview_expanded = true; }
-            });
+            if !self.dock_open || self.history.project.duration() > 0 {
+                ui.horizontal(|ui| {
+                    let thumbnail = if self.dock_open { egui::vec2(50.0, 28.0) } else { egui::vec2(70.0, 40.0) };
+                    let (picture, open) = ui.allocate_exact_size(thumbnail, Sense::click());
+                    self.preview.picture(ui, picture, &self.history.project, accent, self.revision, self.playhead);
+                    if open.on_hover_text("Expand preview").clicked() { self.preview_expanded = true; }
+                    let duration = self.history.project.duration();
+                    if ui.add_enabled(duration > 0, egui::Button::new(if self.preview.playing() { "Pause" } else { "Play" })).clicked() { self.toggle_play(ui.ctx()); }
+                    if ui.add_enabled(duration > 0, egui::Button::new(clock(self.playhead))).on_hover_text("Go to time…").clicked() {
+                        self.seek_input = Some((String::new(), true));
+                    }
+                    if ui.small_button("Expand").clicked() { self.preview_expanded = true; }
+                });
+            }
         } else {
             let maximum = (available - 138.0).max(123.0);
             let preferred = self.compact_preview_height.unwrap_or(available * 0.40);
@@ -571,7 +582,8 @@ impl Workbench {
     }
 
     fn bin(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
-        ui.strong("Media Bin");
+        let short_dock = self.dock_open && ui.ctx().viewport_rect().height() < 590.0 && ui.available_width() < 600.0;
+        if !short_dock { ui.strong("Media Bin"); }
         if self.history.project.assets.is_empty() {
             ui.add(egui::Label::new("Import video, images or audio, or drop files here.").wrap());
             if ui.add_enabled(self.imports.is_none(), egui::Button::new("Import Media…")).clicked() {
@@ -624,6 +636,8 @@ impl Workbench {
 
     fn import_files(&mut self, files: Vec<PathBuf>, ctx: &egui::Context) {
         if self.imports.is_some() || files.is_empty() { return; }
+        self.export.clear_result();
+        self.notice = None;
         let (tx, rx) = mpsc::channel();
         let wake = ctx.clone();
         let task = std::thread::Builder::new().name("clipvault-editor-import".into()).spawn(move || {

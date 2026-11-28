@@ -19,6 +19,7 @@ struct Source {
 #[derive(Default)]
 pub(super) struct Availability {
     sources: HashMap<Id, Source>,
+    pub(super) missing_summary: Option<(Id, usize)>,
     next_scan: Option<Instant>,
     scan: Option<Receiver<Scan>>,
 }
@@ -39,7 +40,13 @@ impl Availability {
             });
             (asset.id, source)
         }).collect();
+        self.summarize_missing();
         self.refresh();
+    }
+
+    fn summarize_missing(&mut self) {
+        let mut missing = self.sources.iter().filter_map(|(&id, source)| (source.available == Some(false)).then_some(id));
+        self.missing_summary = missing.next().map(|id| missing.fold((id, 1), |(first, count), next| (first.min(next), count + 1)));
     }
 
     pub(super) fn refresh(&mut self) {
@@ -68,6 +75,7 @@ impl Availability {
                             source.available = Some(available);
                         }
                     }
+                    self.summarize_missing();
                 }
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => self.scan = None,
