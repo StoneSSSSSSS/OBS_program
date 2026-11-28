@@ -1,6 +1,6 @@
 //! Current-frame geometry for editor regions.
 
-use eframe::egui::{self, Align, Layout, Rect, Sense, Ui, UiBuilder};
+use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, Vec2};
 
 pub(super) const TWO_COLUMN_WIDTH: f32 = 840.0;
 pub(crate) const SINGLE_TRANSPORT_ROW_WIDTH: f32 = 830.0;
@@ -203,6 +203,81 @@ impl EditorLayout {
     }
 }
 
+/// Watching mode uses the full width for a single scrub strip.
+pub(super) struct WatchingRuler {
+    pub axis: Rect,
+    pub track: Rect,
+}
+
+impl WatchingRuler {
+    pub fn new(row: Rect) -> Self {
+        let padding = (row.width() * 0.08).min(8.0);
+        let axis = row.shrink2(Vec2::new(padding, 0.0));
+        let center_y = row.top() + row.height() * if row.height() >= 26.0 { 0.70 } else { 0.5 };
+        let track = Rect::from_center_size(
+            egui::pos2(axis.center().x, center_y),
+            egui::vec2(axis.width(), row.height().min(16.0) * 0.5),
+        );
+        Self { axis, track }
+    }
+
+    pub fn grip(&self, x: f32) -> Option<Pos2> {
+        self.axis.x_range().contains(x).then_some(egui::pos2(x, self.track.center().y))
+    }
+
+    pub fn paint(
+        &self, ui: &Ui, row: Rect, labels: [&str; 2], marks: [Option<f32>; 2],
+        selection: Option<(f32, f32)>, playhead: Option<f32>, accent: Color32,
+        recorded: impl IntoIterator<Item = (f32, f32)>,
+    ) {
+        use crate::theme;
+        let painter = ui.painter_at(row);
+        painter.rect(row, 5.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+        if row.height() >= 26.0 && self.axis.width() >= 130.0 {
+            let font = FontId::monospace(10.0);
+            for (label, x, align) in [
+                (labels[0], self.axis.left(), Align2::LEFT_TOP),
+                (labels[1], self.axis.right(), Align2::RIGHT_TOP),
+            ] {
+                let text = painter.layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT_DIM);
+                if text.size().x <= self.axis.width() * 0.5 - 4.0 {
+                    painter.galley(align.anchor_size(egui::pos2(x, row.top() + 3.0), text.size()).min,
+                        text, theme::TEXT_DIM);
+                }
+            }
+        }
+        painter.rect_filled(self.track, 3.0, theme::SURFACE3);
+        for (a, b) in recorded {
+            let range = Rect::from_x_y_ranges(a..=b, self.track.y_range()).intersect(self.track);
+            if range.is_positive() {
+                painter.rect_filled(range, 2.0, theme::BORDER_STRONG);
+            }
+        }
+        if let Some((a, b)) = selection {
+            let range = Rect::from_x_y_ranges(a..=b, self.track.y_range()).intersect(self.track);
+            if range.is_positive() {
+                painter.rect_filled(range, 2.0, accent.gamma_multiply(0.40));
+            }
+        }
+        let grip_radius = (row.height() * 0.14).min(5.0).min(self.axis.left() - row.left());
+        for x in marks.into_iter().flatten() {
+            if let Some(grip) = self.grip(x) {
+                painter.rect_filled(
+                    Rect::from_center_size(grip, egui::vec2(grip_radius * 1.4, grip_radius * 2.6)),
+                    2.0, accent,
+                );
+            }
+        }
+        if let Some(grip) = playhead.and_then(|x| self.grip(x)) {
+            let cursor = grip_radius * 0.84;
+            painter.add(egui::Shape::convex_polygon(vec![
+                grip - egui::vec2(0.0, cursor), grip + egui::vec2(cursor, 0.0),
+                grip + egui::vec2(0.0, cursor), grip - egui::vec2(cursor, 0.0),
+            ], Color32::WHITE, Stroke::new(1.0, theme::SIDEBAR)));
+        }
+    }
+}
+
 /// Draw into a fixed current-frame rectangle. The child can grow internally,
 /// for example for scrolling, while shapes and hit regions stay in its slot.
 pub(super) fn region(ui: &mut Ui, id: &'static str, rect: Rect, render: impl FnOnce(&mut Ui)) {
@@ -397,6 +472,44 @@ mod tests {
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn watching_ruler_keeps_both_trim_grips_and_time_labels_inside_one_row() {
+        use eframe::egui::{epaint::Shape, RawInput};
+
+        let check = |shape: &Shape, row: Rect, labels: &mut Vec<String>| {
+            let bounds = shape.visual_bounding_rect();
+            assert!(!bounds.is_positive() || row.expand(0.5).contains_rect(bounds), "{shape:?}");
+            if let Shape::Text(text) = shape {
+                labels.push(text.galley.text().to_owned());
+            }
+        };
+        for (width, height) in [(650.0, 40.0), (225.0, 36.0), (225.0, 25.0), (100.0, 40.0)] {
+            for names in [["23:59:30", "00:00:15"], ["00:00.000", "00:40.000"]] {
+                let context = egui::Context::default();
+                let mut row = Rect::NOTHING;
+                let output = context.run_ui(RawInput::default(), |ui| {
+                    (row, _) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
+                    let ruler = WatchingRuler::new(row);
+                    let marks = [Some(ruler.axis.left()), Some(ruler.axis.right())];
+                    assert!(marks.into_iter().flatten().all(|x| {
+                        ruler.grip(x).is_some_and(|point| row.contains(point)
+                            && ruler.track.contains(point))
+                    }));
+                    ruler.paint(ui, row, names, marks,
+                        Some((ruler.axis.left(), ruler.axis.right())),
+                        Some(ruler.axis.center().x), Color32::LIGHT_BLUE,
+                        [(ruler.axis.left() - 8.0, ruler.axis.center().x)]);
+                });
+                let mut labels = Vec::new();
+                for painted in output.shapes {
+                    check(&painted.shape, row, &mut labels);
+                }
+                let expected: &[&str] = if width >= 225.0 && height >= 26.0 { &names } else { &[] };
+                assert_eq!(labels.iter().map(String::as_str).collect::<Vec<_>>(), expected);
             }
         }
     }

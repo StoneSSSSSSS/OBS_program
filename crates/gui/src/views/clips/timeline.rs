@@ -48,7 +48,7 @@ impl ClipsView {
         };
         if lanes_on && ui.available_width() < 395.0 {
             ui.horizontal_wrapped(|ui| zoom(&mut self.detail.timeline.view, ui));
-            self.clip_timeline(ui, c, duration);
+            self.clip_timeline(ui, c, duration, false);
         } else {
             let gutter = gutter_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -59,7 +59,7 @@ impl ClipsView {
                         |ui| zoom(&mut self.detail.timeline.view, ui),
                     );
                 }
-                self.clip_timeline(ui, c, duration);
+                self.clip_timeline(ui, c, duration, false);
             });
         }
     }
@@ -91,47 +91,61 @@ impl ClipsView {
         (end > start + 0.1).then_some((start, end))
     }
 
-    fn clip_timeline(&mut self, ui: &mut Ui, c: &mut Ctx, duration: f64) {
+    pub(super) fn clip_timeline(&mut self, ui: &mut Ui, c: &mut Ctx, duration: f64, watching: bool) {
         let window = self.detail.timeline.view.visible(duration);
         let (start, end) = (window.start, window.end());
         let width = ui.available_width().max(1.0);
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click_and_drag());
-        let x_of = |time| rect.left() + window.fraction_at(time) as f32 * rect.width();
-        let fraction_of = |x: f32| f64::from((x - rect.left()) / rect.width());
+        let height = if watching { ui.available_height().clamp(1.0, 40.0) } else { 30.0 };
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+        let compact = watching.then(|| crate::views::editor_layout::WatchingRuler::new(rect));
+        let axis = compact.as_ref().map_or(rect, |ruler| ruler.axis);
+        let x_of = |time| axis.left() + window.fraction_at(time) as f32 * axis.width();
+        let fraction_of = |x: f32| f64::from((x - axis.left()) / axis.width());
         let t_of = |x| window.time_at(fraction_of(x));
-        let p = ui.painter_at(rect);
-        p.rect(rect, 5.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
-        if let Some((a, b)) = self.selection(duration) {
-            if a < end && b > start {
-                let selection = Rect::from_x_y_ranges(x_of(a)..=x_of(b), rect.top() + 13.0..=rect.bottom());
-                p.rect(selection, 2.0, c.accent.gamma_multiply(0.18), Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
-            }
-        }
-        let intervals = if width >= 360.0 { 4 } else if width >= 190.0 { 2 } else { 1 };
-        for i in 0..=intervals {
-            let at = window.time_at(i as f64 / f64::from(intervals));
-            let x = x_of(at);
-            let align = if i == 0 { Align2::LEFT_TOP } else if i == intervals { Align2::RIGHT_TOP } else { Align2::CENTER_TOP };
-            p.text(Pos2::new(x, rect.top() + 2.0), align, format_duration_precise(at), FontId::monospace(10.0), theme::TEXT_DIM);
-        }
-        let mut hover_handle = false;
-        for (mark, label) in [(self.detail.in_pt, "Start"), (self.detail.out_pt, "End")] {
-            if let Some(at) = mark.filter(|at| (start..=end).contains(at)) {
-                let x = x_of(at);
-                p.line_segment(
-                    [Pos2::new(x, rect.top() + 13.0), Pos2::new(x, rect.bottom())],
-                    Stroke::new(2.0, c.accent),
-                );
-                p.circle_filled(Pos2::new(x, rect.top() + 19.0), 4.0, c.accent);
-                hover_handle |= response.hover_pos().is_some_and(|pos| (pos.x - x).abs() <= 6.0);
-                p.text(Pos2::new(x + 5.0, rect.bottom()), Align2::LEFT_BOTTOM, label,
-                    FontId::monospace(10.0), theme::TEXT);
-            }
-        }
+        let visible_x = |at: f64| (start..=end).contains(&at).then(|| x_of(at));
         let time = c.player.state().time_pos;
-        if (start..=end).contains(&time) {
-            let x = x_of(time);
-            p.line_segment([Pos2::new(x, rect.top() + 14.0), Pos2::new(x, rect.bottom())], Stroke::new(2.0, Color32::WHITE));
+        let mut hover_handle = false;
+        if let Some(compact) = &compact {
+            let marks = [self.detail.in_pt.and_then(visible_x), self.detail.out_pt.and_then(visible_x)];
+            compact.paint(ui, rect, [&format_duration_precise(start), &format_duration_precise(end)],
+                marks, self.selection(duration).filter(|(a, b)| *a < end && *b > start).map(|(a, b)| (x_of(a), x_of(b))),
+                visible_x(time), c.accent, [(axis.left(), axis.right())]);
+            hover_handle = response.hover_pos().is_some_and(|pos| {
+                marks.into_iter().flatten().any(|x| (x - pos.x).abs() <= 6.0)
+            });
+        } else {
+            let p = ui.painter_at(rect);
+            p.rect(rect, 5.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+            if let Some((a, b)) = self.selection(duration) {
+                if a < end && b > start {
+                    let selection = Rect::from_x_y_ranges(x_of(a)..=x_of(b), rect.top() + 13.0..=rect.bottom());
+                    p.rect(selection, 2.0, c.accent.gamma_multiply(0.18), Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
+                }
+            }
+            let intervals = if width >= 360.0 { 4 } else if width >= 190.0 { 2 } else { 1 };
+            for i in 0..=intervals {
+                let at = window.time_at(i as f64 / f64::from(intervals));
+                let x = x_of(at);
+                let align = if i == 0 { Align2::LEFT_TOP } else if i == intervals { Align2::RIGHT_TOP } else { Align2::CENTER_TOP };
+                p.text(Pos2::new(x, rect.top() + 2.0), align, format_duration_precise(at), FontId::monospace(10.0), theme::TEXT_DIM);
+            }
+            for (mark, label) in [(self.detail.in_pt, "Start"), (self.detail.out_pt, "End")] {
+                if let Some(at) = mark.filter(|at| (start..=end).contains(at)) {
+                    let x = x_of(at);
+                    p.line_segment(
+                        [Pos2::new(x, rect.top() + 13.0), Pos2::new(x, rect.bottom())],
+                        Stroke::new(2.0, c.accent),
+                    );
+                    p.circle_filled(Pos2::new(x, rect.top() + 19.0), 4.0, c.accent);
+                    hover_handle |= response.hover_pos().is_some_and(|pos| (pos.x - x).abs() <= 6.0);
+                    p.text(Pos2::new(x + 5.0, rect.bottom()), Align2::LEFT_BOTTOM, label,
+                        FontId::monospace(10.0), theme::TEXT);
+                }
+            }
+            if (start..=end).contains(&time) {
+                let x = x_of(time);
+                p.line_segment([Pos2::new(x, rect.top() + 14.0), Pos2::new(x, rect.bottom())], Stroke::new(2.0, Color32::WHITE));
+            }
         }
         if let Some(pos) = response.interact_pointer_pos() {
             let at = t_of(pos.x).min(duration);

@@ -671,7 +671,8 @@ impl RecordingsView {
         }
 
         let fullscreen = c.player.fullscreen;
-        let compact = self.preview_size.watching() || ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
+        let watching = self.preview_size.watching() && !fullscreen;
+        let compact = watching || ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
         if !fullscreen {
             if compact {
                 ui.horizontal_wrapped(|ui| {
@@ -741,9 +742,13 @@ impl RecordingsView {
             });
         });
         editor_layout::region(ui, "rec_controls", layout.timeline, |ui| {
+            if watching {
+                self.timeline(ui, c, true);
+                return;
+            }
             editor_layout::controls(ui, "rec_controls_scroll", |ui| {
                 ui.add_space(6.0);
-                self.timeline(ui, c);
+                self.timeline(ui, c, false);
                 if show_lanes {
                     ui.add_space(4.0);
                     self.audio_lanes(ui, c, layout.timeline.height() - 106.0);
@@ -853,137 +858,159 @@ impl RecordingsView {
         }
     }
 
-    fn timeline(&mut self, ui: &mut Ui, c: &mut Ctx) {
+    fn timeline(&mut self, ui: &mut Ui, c: &mut Ctx, watching: bool) {
         let w = ui.available_width().max(1.0);
-        let (row, _) = ui.allocate_exact_size(Vec2::new(w, 96.0), Sense::hover());
-        let rect = lanes::axis_rect(row);
+        let height = if watching { ui.available_height().clamp(1.0, 40.0) } else { 96.0 };
+        let (row, _) = ui.allocate_exact_size(Vec2::new(w, height), Sense::hover());
+        let compact = watching.then(|| editor_layout::WatchingRuler::new(row));
+        let rect = compact.as_ref().map_or_else(|| lanes::axis_rect(row), |ruler| ruler.axis);
         let span = self.view_span.max(MIN);
         let start = self.view_end - span;
         let px_per_ms = rect.width() as f64 / span as f64;
         let x_of = |t: i64| rect.left() + ((t - start) as f64 * px_per_ms) as f32;
         let t_of = |x: f32| start + ((x - rect.left()) as f64 / px_per_ms) as i64;
 
-        // Gutter labels.
         let ruler = Rect::from_x_y_ranges(rect.x_range(), row.top()..=row.top() + 20.0);
         let seg_band = Rect::from_x_y_ranges(rect.x_range(), row.top() + 24.0..=row.top() + 54.0);
         let act_band = Rect::from_x_y_ranges(rect.x_range(), row.top() + 60.0..=row.top() + 80.0);
-        let gutter = Rect::from_x_y_ranges(row.left()..=rect.left(), row.y_range());
-        let gp = ui.painter_at(gutter);
-        let gx = row.left() + 10.0;
-        gp.text(Pos2::new(gx, seg_band.center().y), Align2::LEFT_CENTER, "Recording", FontId::new(12.0, theme::semibold()), theme::TEXT_DIM);
-        gp.text(Pos2::new(gx, act_band.center().y), Align2::LEFT_CENTER, "Activity", FontId::new(12.0, theme::semibold()), theme::TEXT_DIM);
-        gp.text(Pos2::new(gx, act_band.bottom() + 9.0), Align2::LEFT_CENTER, "what was on screen", FontId::proportional(10.5), theme::TEXT_FAINT);
-
-        let p = ui.painter_at(rect);
-        p.rect(Rect::from_x_y_ranges(rect.x_range(), row.y_range()), 5.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
-
-        // Ticks.
-        let steps = [MIN, 2 * MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR];
-        let step = *steps.iter().find(|s| **s as f64 * px_per_ms >= 90.0).unwrap_or(&(24 * HOUR));
-        let tz = Local.timestamp_millis_opt(start).single().map(|d| d.offset().local_minus_utc() as i64 * 1000).unwrap_or(0);
-        let mut t = ((start + tz) / step) * step - tz;
-        while t <= self.view_end {
-            let x = x_of(t);
-            if x >= rect.left() {
-                let dt = Local.timestamp_millis_opt(t).single().unwrap_or_default();
-                let midnight = dt.format("%H:%M").to_string() == "00:00";
-                let label = if midnight || step >= 24 * HOUR { dt.format("%a %d").to_string() } else { dt.format("%H:%M").to_string() };
-                p.line_segment([Pos2::new(x, ruler.bottom() - 4.0), Pos2::new(x, act_band.bottom())], Stroke::new(1.0, if midnight { theme::BORDER_STRONG } else { Color32::from_white_alpha(10) }));
-                p.text(Pos2::new(x + 4.0, ruler.top() + 3.0), Align2::LEFT_TOP, label, FontId::proportional(11.0), if midnight { theme::TEXT_DIM } else { theme::TEXT_FAINT });
-            }
-            t += step;
-        }
-
-        // Recording segments.
-        for r in &self.recs {
-            let (a, b) = (r.start_ms, self.seg_end(r));
-            if b < start || a > self.view_end {
-                continue;
-            }
-            let sr = Rect::from_x_y_ranges(x_of(a).max(rect.left())..=x_of(b).min(rect.right()).max(x_of(a) + 1.0), seg_band.y_range());
-            let fill = if r.kept { theme::blend(theme::SURFACE3, c.accent, 0.43) } else { theme::BORDER_STRONG };
-            p.rect_filled(sr.shrink2(Vec2::new(0.5, 0.0)), CornerRadius::same(4), fill);
-            if r.is_live() {
-                p.rect_filled(Rect::from_x_y_ranges(sr.right() - 3.0..=sr.right(), sr.y_range()), CornerRadius::same(1), theme::LIVE);
-            }
-        }
-        // Clips saved in this range (thin accent bars along the bottom of the band).
-        for cl in &self.clips {
-            let a = cl.source_start_ms.unwrap_or(cl.created_at - (cl.duration * 1000.0) as i64);
-            let b = cl.created_at;
-            if b < start || a > self.view_end {
-                continue;
-            }
-            let cr = Rect::from_x_y_ranges(x_of(a).max(rect.left())..=x_of(b).max(x_of(a) + 2.0), seg_band.bottom() - 6.0..=seg_band.bottom() - 2.0);
-            p.rect_filled(cr, CornerRadius::same(2), c.accent.gamma_multiply(0.85));
-        }
-        // Activity lane: which program was focused.
-        if c.cfg.player.show_activity_on_timeline {
-            for s in &self.spans {
-                if s.end_ms < start || s.start_ms > self.view_end {
-                    continue;
-                }
-                let x0 = x_of(s.start_ms).max(rect.left());
-                let x1 = x_of(s.end_ms).min(rect.right());
-                if x1 - x0 < 0.5 {
-                    continue;
-                }
-                let color = if s.is_game { theme::game_color(s.game_id.unwrap_or(0)) } else { Color32::from_white_alpha(30) };
-                let br = Rect::from_x_y_ranges(x0..=x1, act_band.y_range());
-                p.rect_filled(br, CornerRadius::same(3), color);
-                if x1 - x0 > 46.0 {
-                    let text_color = if s.is_game { Color32::from_black_alpha(220) } else { theme::TEXT_DIM };
-                    p.with_clip_rect(br).text(Pos2::new(x0 + 5.0, br.center().y), Align2::LEFT_CENTER, crate::views::clips::truncate(&s.name, ((x1 - x0) / 7.0) as usize), FontId::new(10.5, theme::semibold()), text_color);
+        if let Some(compact) = &compact {
+            let label = |at| Local.timestamp_millis_opt(at).single().unwrap_or_default().format("%H:%M:%S").to_string();
+            let marks = [self.in_ms.map(x_of), self.out_ms.map(x_of)];
+            let recorded = self.recs.iter().filter_map(|recording| {
+                let (a, b) = (recording.start_ms, self.seg_end(recording));
+                (b > a && b > start && a < self.view_end).then(|| (x_of(a), x_of(b)))
+            });
+            compact.paint(ui, row, [&label(start), &label(self.view_end)], marks,
+                self.selection().map(|(a, b)| (x_of(a), x_of(b))),
+                self.playhead(c).map(x_of), c.accent, recorded);
+            editor_layout::remember_interaction_rect(ui, "watching_ruler", row);
+            for (name, mark) in ["trim_start", "trim_end"].into_iter().zip(marks) {
+                if let Some(grip) = mark.and_then(|x| compact.grip(x)) {
+                    editor_layout::remember_interaction_rect(ui, name, Rect::from_center_size(grip, Vec2::splat(10.0)));
                 }
             }
-        }
-        // Selection.
-        if let (Some(a), Some(b)) = (self.in_ms, self.out_ms) {
-            let (a, b) = (a.min(b), a.max(b));
-            let sr = Rect::from_x_y_ranges(x_of(a)..=x_of(b), seg_band.top() - 2.0..=act_band.bottom() + 2.0);
-            p.rect_filled(sr, CornerRadius::same(3), c.accent.gamma_multiply(0.16));
-            p.rect_stroke(sr, CornerRadius::same(3), Stroke::new(1.5, c.accent), egui::StrokeKind::Inside);
-        }
-        for (pt, label) in [(self.in_ms, "START"), (self.out_ms, "END")] {
-            if let Some(t) = pt {
+        } else {
+            // Gutter labels.
+            let gutter = Rect::from_x_y_ranges(row.left()..=rect.left(), row.y_range());
+            let gp = ui.painter_at(gutter);
+            let gx = row.left() + 10.0;
+            gp.text(Pos2::new(gx, seg_band.center().y), Align2::LEFT_CENTER, "Recording", FontId::new(12.0, theme::semibold()), theme::TEXT_DIM);
+            gp.text(Pos2::new(gx, act_band.center().y), Align2::LEFT_CENTER, "Activity", FontId::new(12.0, theme::semibold()), theme::TEXT_DIM);
+            gp.text(Pos2::new(gx, act_band.bottom() + 9.0), Align2::LEFT_CENTER, "what was on screen", FontId::proportional(10.5), theme::TEXT_FAINT);
+
+            let p = ui.painter_at(rect);
+            p.rect(Rect::from_x_y_ranges(rect.x_range(), row.y_range()), 5.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+
+            // Ticks.
+            let steps = [MIN, 2 * MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR];
+            let step = *steps.iter().find(|s| **s as f64 * px_per_ms >= 90.0).unwrap_or(&(24 * HOUR));
+            let tz = Local.timestamp_millis_opt(start).single().map(|d| d.offset().local_minus_utc() as i64 * 1000).unwrap_or(0);
+            let mut t = ((start + tz) / step) * step - tz;
+            while t <= self.view_end {
                 let x = x_of(t);
-                p.line_segment([Pos2::new(x, seg_band.top() - 4.0), Pos2::new(x, act_band.bottom() + 4.0)], Stroke::new(2.0, c.accent));
-                let grip = Pos2::new(x, act_band.bottom() + 4.0);
-                p.circle_filled(grip, 5.0, c.accent);
-                if rect.x_range().contains(x) {
-                    let id = if label == "START" { "trim_start" } else { "trim_end" };
-                    editor_layout::remember_interaction_rect(ui, id, Rect::from_center_size(grip, Vec2::splat(10.0)));
+                if x >= rect.left() {
+                    let dt = Local.timestamp_millis_opt(t).single().unwrap_or_default();
+                    let midnight = dt.format("%H:%M").to_string() == "00:00";
+                    let label = if midnight || step >= 24 * HOUR { dt.format("%a %d").to_string() } else { dt.format("%H:%M").to_string() };
+                    p.line_segment([Pos2::new(x, ruler.bottom() - 4.0), Pos2::new(x, act_band.bottom())], Stroke::new(1.0, if midnight { theme::BORDER_STRONG } else { Color32::from_white_alpha(10) }));
+                    p.text(Pos2::new(x + 4.0, ruler.top() + 3.0), Align2::LEFT_TOP, label, FontId::proportional(11.0), if midnight { theme::TEXT_DIM } else { theme::TEXT_FAINT });
                 }
-                let align = if label == "START" { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM };
-                let offset = if label == "START" { -4.0 } else { 4.0 };
-                p.text(Pos2::new(x + offset, row.bottom() - 2.0), align, label, FontId::new(10.0, theme::semibold()), c.accent);
+                t += step;
             }
-        }
-        // Markers.
-        for m in &self.markers {
-            if m.at_ms < start || m.at_ms > self.view_end {
-                continue;
+
+            // Recording segments.
+            for r in &self.recs {
+                let (a, b) = (r.start_ms, self.seg_end(r));
+                if b < start || a > self.view_end {
+                    continue;
+                }
+                let sr = Rect::from_x_y_ranges(x_of(a).max(rect.left())..=x_of(b).min(rect.right()).max(x_of(a) + 1.0), seg_band.y_range());
+                let fill = if r.kept { theme::blend(theme::SURFACE3, c.accent, 0.43) } else { theme::BORDER_STRONG };
+                p.rect_filled(sr.shrink2(Vec2::new(0.5, 0.0)), CornerRadius::same(4), fill);
+                if r.is_live() {
+                    p.rect_filled(Rect::from_x_y_ranges(sr.right() - 3.0..=sr.right(), sr.y_range()), CornerRadius::same(1), theme::LIVE);
+                }
             }
-            let x = x_of(m.at_ms);
-            let tri = vec![Pos2::new(x - 5.0, seg_band.top() - 6.0), Pos2::new(x + 5.0, seg_band.top() - 6.0), Pos2::new(x, seg_band.top() + 2.0)];
-            p.add(egui::Shape::convex_polygon(tri, theme::WARNING, Stroke::NONE));
-        }
-        // Now + playhead (with a big grab handle).
-        let nx = x_of(now_ms());
-        if nx <= rect.right() {
-            p.line_segment([Pos2::new(nx, seg_band.top() - 4.0), Pos2::new(nx, act_band.bottom())], Stroke::new(1.5, theme::LIVE));
-        }
-        if let Some(t) = self.playhead(c) {
-            let x = x_of(t);
-            p.line_segment([Pos2::new(x, ruler.bottom()), Pos2::new(x, act_band.bottom() + 4.0)], Stroke::new(2.0, Color32::WHITE));
-            p.circle_filled(Pos2::new(x, ruler.bottom()), 7.0, Color32::WHITE);
+            // Clips saved in this range (thin accent bars along the bottom of the band).
+            for cl in &self.clips {
+                let a = cl.source_start_ms.unwrap_or(cl.created_at - (cl.duration * 1000.0) as i64);
+                let b = cl.created_at;
+                if b < start || a > self.view_end {
+                    continue;
+                }
+                let cr = Rect::from_x_y_ranges(x_of(a).max(rect.left())..=x_of(b).max(x_of(a) + 2.0), seg_band.bottom() - 6.0..=seg_band.bottom() - 2.0);
+                p.rect_filled(cr, CornerRadius::same(2), c.accent.gamma_multiply(0.85));
+            }
+            // Activity lane: which program was focused.
+            if c.cfg.player.show_activity_on_timeline {
+                for s in &self.spans {
+                    if s.end_ms < start || s.start_ms > self.view_end {
+                        continue;
+                    }
+                    let x0 = x_of(s.start_ms).max(rect.left());
+                    let x1 = x_of(s.end_ms).min(rect.right());
+                    if x1 - x0 < 0.5 {
+                        continue;
+                    }
+                    let color = if s.is_game { theme::game_color(s.game_id.unwrap_or(0)) } else { Color32::from_white_alpha(30) };
+                    let br = Rect::from_x_y_ranges(x0..=x1, act_band.y_range());
+                    p.rect_filled(br, CornerRadius::same(3), color);
+                    if x1 - x0 > 46.0 {
+                        let text_color = if s.is_game { Color32::from_black_alpha(220) } else { theme::TEXT_DIM };
+                        p.with_clip_rect(br).text(Pos2::new(x0 + 5.0, br.center().y), Align2::LEFT_CENTER, crate::views::clips::truncate(&s.name, ((x1 - x0) / 7.0) as usize), FontId::new(10.5, theme::semibold()), text_color);
+                    }
+                }
+            }
+            // Selection.
+            if let (Some(a), Some(b)) = (self.in_ms, self.out_ms) {
+                let (a, b) = (a.min(b), a.max(b));
+                let sr = Rect::from_x_y_ranges(x_of(a)..=x_of(b), seg_band.top() - 2.0..=act_band.bottom() + 2.0);
+                p.rect_filled(sr, CornerRadius::same(3), c.accent.gamma_multiply(0.16));
+                p.rect_stroke(sr, CornerRadius::same(3), Stroke::new(1.5, c.accent), egui::StrokeKind::Inside);
+            }
+            for (pt, label) in [(self.in_ms, "START"), (self.out_ms, "END")] {
+                if let Some(t) = pt {
+                    let x = x_of(t);
+                    p.line_segment([Pos2::new(x, seg_band.top() - 4.0), Pos2::new(x, act_band.bottom() + 4.0)], Stroke::new(2.0, c.accent));
+                    let grip = Pos2::new(x, act_band.bottom() + 4.0);
+                    p.circle_filled(grip, 5.0, c.accent);
+                    if rect.x_range().contains(x) {
+                        let id = if label == "START" { "trim_start" } else { "trim_end" };
+                        editor_layout::remember_interaction_rect(ui, id, Rect::from_center_size(grip, Vec2::splat(10.0)));
+                    }
+                    let align = if label == "START" { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM };
+                    let offset = if label == "START" { -4.0 } else { 4.0 };
+                    p.text(Pos2::new(x + offset, row.bottom() - 2.0), align, label, FontId::new(10.0, theme::semibold()), c.accent);
+                }
+            }
+            // Markers.
+            for m in &self.markers {
+                if m.at_ms < start || m.at_ms > self.view_end {
+                    continue;
+                }
+                let x = x_of(m.at_ms);
+                let tri = vec![Pos2::new(x - 5.0, seg_band.top() - 6.0), Pos2::new(x + 5.0, seg_band.top() - 6.0), Pos2::new(x, seg_band.top() + 2.0)];
+                p.add(egui::Shape::convex_polygon(tri, theme::WARNING, Stroke::NONE));
+            }
+            // Now + playhead (with a big grab handle).
+            let nx = x_of(now_ms());
+            if nx <= rect.right() {
+                p.line_segment([Pos2::new(nx, seg_band.top() - 4.0), Pos2::new(nx, act_band.bottom())], Stroke::new(1.5, theme::LIVE));
+            }
+            if let Some(t) = self.playhead(c) {
+                let x = x_of(t);
+                p.line_segment([Pos2::new(x, ruler.bottom()), Pos2::new(x, act_band.bottom() + 4.0)], Stroke::new(2.0, Color32::WHITE));
+                p.circle_filled(Pos2::new(x, ruler.bottom()), 7.0, Color32::WHITE);
+            }
+
         }
 
         // Interaction: drag = scrub (drag the ruler or right-drag = pan),
         // wheel = zoom, Shift+wheel = pan, Shift+click = select.
         let resp = ui.interact(Rect::from_x_y_ranges(rect.x_range(), row.y_range()), ui.scope_id().with("timeline"), Sense::click_and_drag());
         let trim_handle = |pos: Pos2| {
-            if pos.y < seg_band.top() {
+            let trim_top = compact.as_ref().map_or(seg_band.top(), |ruler| ruler.track.top() - 5.0);
+            if pos.y < trim_top {
                 return None;
             }
             [(self.in_ms, DragMode::TrimStart), (self.out_ms, DragMode::TrimEnd)]
@@ -1023,7 +1050,8 @@ impl RecordingsView {
             }
         }
         if dragging_trim.is_none() && resp.drag_started() {
-            let on_ruler = resp.interact_pointer_pos().map(|p| p.y <= ruler.bottom()).unwrap_or(false);
+            let pan_band_end = compact.as_ref().map_or(ruler.bottom(), |ruler| ruler.track.top() - 3.0);
+            let on_ruler = resp.interact_pointer_pos().is_some_and(|p| p.y <= pan_band_end);
             let secondary = ui.input(|i| i.pointer.secondary_down() || i.pointer.middle_down());
             self.drag_mode = Some(if on_ruler || secondary { DragMode::Pan } else { DragMode::Scrub });
             if self.drag_mode == Some(DragMode::Scrub) {
@@ -1134,7 +1162,9 @@ impl RecordingsView {
                 ui.close();
             }
         });
-        timeline_help(ui);
+        if !watching {
+            timeline_help(ui);
+        }
     }
 
     fn audio_lanes(&mut self, ui: &mut Ui, c: &mut Ctx, height_budget: f32) {

@@ -27,6 +27,9 @@ enum Step {
     ArmLive,
     GoLive,
     LiveLatest,
+    LiveProgress,
+    LiveRollover,
+    LiveScreenshot,
     Done,
 }
 
@@ -41,6 +44,9 @@ pub(super) struct Interaction {
     pictures: (Rect, Rect),
     marks: (i64, i64),
     edge_lag: f64,
+    capture_window: bool,
+    first_live: Option<(String, f64, i64)>,
+    live_report: String,
     screenshot: Arc<AtomicBool>,
 }
 
@@ -57,6 +63,9 @@ impl Interaction {
             pictures: (Rect::NOTHING, Rect::NOTHING),
             marks: (0, 0),
             edge_lag: 0.0,
+            capture_window: std::env::var("CLIPVAULT_QA_CAPTURE_WINDOW").as_deref() == Ok("1"),
+            first_live: None,
+            live_report: String::new(),
             screenshot: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -127,7 +136,8 @@ impl Interaction {
         if !self.pending.is_empty() {
             return Ok(false);
         }
-        if self.since.elapsed() > Duration::from_secs(10) && !matches!(self.step, Step::Open) {
+        let timeout = if matches!(self.step, Step::LiveProgress | Step::LiveRollover) { 24 } else { 10 };
+        if self.since.elapsed() > Duration::from_secs(timeout) && !matches!(self.step, Step::Open) {
             let st = app.c.player.state();
             return Err(format!(
                 "{:?} timed out (loaded {}, paused {}, time {:.3}, last frame {}, picture {:?}, baseline {:?}, restore visible {})",
@@ -238,7 +248,13 @@ impl Interaction {
             Step::CaptureLargerPreview => {
                 if app.c.toasts.is_empty() && self.since.elapsed() >= Duration::from_millis(250) {
                     let Some(picture) = Self::target_rect(ctx, "preview_picture") else { return Ok(false) };
+                    let grips_fit = Self::target_rect(ctx, "watching_ruler").is_some_and(|row| {
+                        ["trim_start", "trim_end"].into_iter().all(|name| {
+                            Self::target_rect(ctx, name).is_some_and(|grip| row.contains_rect(grip))
+                        })
+                    });
                     if Self::target(ctx, "preview_restore").is_some()
+                        && grips_fit
                         && picture.area() >= self.pictures.0.area() * 1.5
                         && picture.height() >= self.pictures.0.height() + 80.0
                     {
@@ -274,8 +290,64 @@ impl Interaction {
                 if st.loaded && !st.paused && app.c.player.path.as_deref().is_some_and(|p| {
                     app.c.service.status().is_some_and(|s| s.recording.path == p)
                 }) {
-                    self.edge_lag = st.time_pos;
-                    self.click(ctx, "jump_latest", Step::Done);
+                    if self.capture_window {
+                        let Some(status) = app.c.service.status() else { return Ok(false) };
+                        self.first_live = Some((status.recording.path.clone(), st.time_pos, status.recording.written_until_ms));
+                        self.set_step(Step::LiveProgress);
+                    } else {
+                        self.edge_lag = st.time_pos;
+                        self.click(ctx, "jump_latest", Step::Done);
+                    }
+                }
+            }
+            Step::LiveProgress => {
+                let Some(status) = app.c.service.status() else { return Ok(false) };
+                let Some((path, initial_pos, initial_edge)) = &self.first_live else { return Ok(false) };
+                if app.c.player.path.as_ref() == Some(path)
+                    && status.recording.path == *path
+                    && st.loaded && !st.paused && st.time_pos >= initial_pos + 0.45
+                    && status.recording.written_until_ms > *initial_edge
+                    && Self::target_rect(ctx, "preview_picture").is_some()
+                {
+                    let lag = status.recording.written_until_ms.saturating_sub(
+                        status.recording.started_ms + (st.time_pos * 1000.0) as i64,
+                    );
+                    self.live_report = format!(
+                        "Go live: {path}\nNative playback advanced {:.3}s → {:.3}s; IPC edge advanced {}ms; player behind written edge {lag}ms.\n",
+                        initial_pos, st.time_pos, status.recording.written_until_ms - initial_edge,
+                    );
+                    self.set_step(Step::LiveRollover);
+                }
+            }
+            Step::LiveRollover => {
+                let Some(status) = app.c.service.status() else { return Ok(false) };
+                let Some((first_path, _, _)) = &self.first_live else { return Ok(false) };
+                if status.recording.path != *first_path
+                    && app.c.player.path.as_ref() == Some(&status.recording.path)
+                    && st.loaded && !st.paused && st.time_pos >= 0.45
+                    && Self::target_rect(ctx, "preview_picture").is_some()
+                {
+                    let lag = status.recording.written_until_ms.saturating_sub(
+                        status.recording.started_ms + (st.time_pos * 1000.0) as i64,
+                    );
+                    if !(-750..=5_000).contains(&lag) {
+                        return Err(format!("Unexpected lag after live rollover: {lag}ms"));
+                    }
+                    self.live_report += &format!(
+                        "Followed rollover to {} at {:.3}s; player behind written edge {lag}ms.\n",
+                        status.recording.path, st.time_pos,
+                    );
+                    self.take_screenshot(ctx, dir.join("recordings-live-owned-window.png"));
+                    self.set_step(Step::LiveScreenshot);
+                }
+            }
+            Step::LiveScreenshot => {
+                if self.screenshot.load(Ordering::Acquire) {
+                    std::fs::write(dir.join("interaction-result.txt"), format!("PASS: genuine owned-window capture.\n{}", self.live_report))
+                        .map_err(|e| e.to_string())?;
+                    std::fs::write(self.profile.join("qa-live-window-done"), self.live_report.as_bytes())
+                        .map_err(|e| e.to_string())?;
+                    return Ok(true);
                 }
             }
             Step::Done => {

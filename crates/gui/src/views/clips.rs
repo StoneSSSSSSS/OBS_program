@@ -760,7 +760,8 @@ impl ClipsView {
             return;
         }
 
-        let compact = self.preview_size.watching() || ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
+        let watching = self.preview_size.watching();
+        let compact = watching || ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
         if compact {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.detail.compact_inspector, false, "Player");
@@ -794,6 +795,10 @@ impl ClipsView {
             });
         });
         editor_layout::region(ui, "clip_controls", layout.timeline, |ui| {
+            if watching {
+                self.clip_timeline(ui, c, duration, true);
+                return;
+            }
             editor_layout::controls(ui, "clip_controls_scroll", |ui| {
                 ui.add_space(4.0);
                 let lanes_on = c.player.show_mixer;
