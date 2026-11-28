@@ -16,6 +16,7 @@ pub type Reply = Option<Sender<Result<(), String>>>;
 /// Commands for the recording engine thread.
 pub enum EngineCmd {
     SaveClip { short: bool, reply: Reply },
+    SaveRecentRolling { seconds: u32, reply: Reply },
     SetRecording { enabled: bool, reply: Reply },
     Restart { reply: Reply },
     ConfigChanged { restart: bool },
@@ -32,10 +33,16 @@ pub struct Footage {
     pub duration_s: f64,
 }
 
+impl Footage {
+    pub fn end_ms(&self) -> i64 {
+        self.start_ms + (self.duration_s.max(0.0) * 1000.0) as i64
+    }
+}
+
 /// Work for the clip-saving thread.
 pub enum ClipTask {
     /// Save `[from_ms, to_ms)` (wall clock) from these files as a new clip.
-    SaveRange { footage: Vec<Footage>, from_ms: i64, to_ms: i64, short: bool },
+    SaveRange { footage: Vec<Footage>, from_ms: i64, to_ms: i64, short: bool, _lease: Arc<()> },
 }
 
 /// Work for the library thread.

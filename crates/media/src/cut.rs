@@ -26,11 +26,21 @@ pub struct CutSource {
     pub to_s: Option<f64>,
 }
 
+/// A retained source interval and where it appears in the joined cut.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutSpan {
+    pub source_index: usize,
+    pub from_s: f64,
+    pub to_s: f64,
+    pub output_start_s: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CutOutput {
     pub duration: f64,
     pub size: u64,
     pub audio: Vec<AudioTrackInfo>,
+    pub spans: Vec<CutSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -87,6 +97,7 @@ pub fn cut(sources: &[CutSource], dest: &Path, start_ms: Option<i64>, progress: 
     let mut out: Vec<OutSample> = Vec::new();
     let mut keys: Vec<(Key, f64, AppIdent, Vec<u8>, String)> = Vec::new(); // key, first time, app, asc, name
     let mut audio_samples: HashMap<Key, Vec<(f64, usize, Sample)>> = HashMap::new();
+    let mut spans = Vec::new();
     let mut offset = 0.0f64;
     let mut preroll = 0.0f64;
     let mut video_dts_total: u64 = 0;
@@ -148,6 +159,7 @@ pub fn cut(sources: &[CutSource], dest: &Path, start_ms: Option<i64>, progress: 
                 audio_samples.entry(key).or_default().push((clip_t, k, s));
             }
         }
+        spans.push(CutSpan { source_index: k, from_s: from, to_s: to, output_start_s: offset });
         offset += to - from;
     }
     if out.is_empty() {
@@ -249,5 +261,5 @@ pub fn cut(sources: &[CutSource], dest: &Path, start_ms: Option<i64>, progress: 
     let meta = SegmentMeta { at_s: 0.0, start_ms, tracks: metas, slots: Vec::new() };
     let size = w.finish(dest, Some(&serde_json::to_vec(&meta)?))?;
     progress(1.0);
-    Ok(CutOutput { duration, size, audio: audio_info })
+    Ok(CutOutput { duration, size, audio: audio_info, spans })
 }

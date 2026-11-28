@@ -51,6 +51,8 @@ pub enum Request {
     Status,
     /// Save the last `clip_length_secs` (or `short_clip_secs`) as a clip.
     SaveClip { short: bool },
+    /// Save a range of the temporary replay buffer configured in Replay only mode.
+    SaveRecentRolling { seconds: u32 },
     AddMarker { label: String },
     /// Pause/resume the 24/7 recording.
     SetRecording { enabled: bool },
@@ -141,6 +143,10 @@ pub struct ReplayStatus {
     /// The clip hotkey works right now.
     pub active: bool,
     pub seconds: u32,
+    #[serde(default)]
+    pub rolling_minutes: Option<u32>,
+    #[serde(default)]
+    pub available_seconds: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -179,6 +185,8 @@ pub struct JobInfo {
     pub state: String,
     pub message: String,
     pub output: Option<String>,
+    #[serde(default)]
+    pub output_bytes: Option<u64>,
     pub clip_id: Option<i64>,
 }
 

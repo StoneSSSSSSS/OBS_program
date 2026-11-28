@@ -88,9 +88,23 @@ impl Default for GeneralConfig {
 
 // -------------------------------------------------------------- recording
 
+/// Whether continuous footage becomes a searchable archive or expires as replay.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryMode {
+    #[default]
+    Archive,
+    Rolling,
+}
+
+pub const ROLLING_SEGMENT_SECS: u32 = 10;
+pub const MAX_ROLLING_MINUTES: u32 = 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RecordingConfig {
+    pub history_mode: HistoryMode,
+    pub rolling_minutes: u32,
     /// Keep a continuous 24/7 recording. When off, only a short rolling
     /// buffer is kept so the clip hotkey still works.
     pub enabled: bool,
@@ -137,6 +151,8 @@ impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            history_mode: HistoryMode::Archive,
+            rolling_minutes: 2,
             folder: default_media_folder("Recordings"),
             segment_minutes: 30,
             retention_hours: 48,
@@ -164,6 +180,11 @@ pub const QUALITIES: &[(&str, &str)] = &[("low", "Low (small files)"), ("medium"
 pub const HEIGHTS: &[(u32, &str)] = &[(0, "Full resolution"), (1440, "1440p"), (1080, "1080p (recommended)"), (720, "720p")];
 
 impl RecordingConfig {
+    pub fn rolling_seconds(&self) -> Option<u32> {
+        (self.history_mode == HistoryMode::Rolling)
+            .then(|| self.rolling_minutes.clamp(1, MAX_ROLLING_MINUTES) * 60)
+    }
+
     /// Video bitrate (kbit/s) for a picture of this size.
     pub fn video_kbps(&self, w: u32, h: u32) -> u32 {
         let bpp = match self.quality.as_str() {
@@ -549,6 +570,7 @@ impl Config {
         }
 
         let r = &mut self.recording;
+        clamp(&mut r.rolling_minutes, 1, MAX_ROLLING_MINUTES);
         clamp(&mut r.segment_minutes, 1, 240);
         clamp(&mut r.retention_hours, 1, 24 * 60);
         clamp(&mut r.max_age_days, 0, 3650);
@@ -682,7 +704,8 @@ impl Config {
     /// Settings that need the recorder restarted to take effect.
     pub fn recorder_restart_needed(&self, other: &Config) -> bool {
         let (a, b) = (&self.recording, &other.recording);
-        a.enabled != b.enabled
+        a.history_mode != b.history_mode
+            || a.enabled != b.enabled
             || a.folder != b.folder
             || a.segment_minutes != b.segment_minutes
             || a.fps != b.fps
@@ -811,6 +834,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_mode_is_opt_in_and_window_updates_without_restarting() {
+        let archive: Config = toml::from_str("[recording]\nenabled = true").unwrap();
+        assert_eq!(archive.recording.history_mode, HistoryMode::Archive);
+        assert_eq!(archive.recording.rolling_seconds(), None);
+        let mut replay = archive.clone();
+        replay.recording.history_mode = HistoryMode::Rolling;
+        assert!(archive.recorder_restart_needed(&replay));
+
+        let mut resized = replay.clone();
+        resized.recording.rolling_minutes = 0;
+        resized.sanitize();
+        assert_eq!(resized.recording.rolling_seconds(), Some(60));
+        assert!(!replay.recorder_restart_needed(&resized));
+        resized.recording.rolling_minutes = MAX_ROLLING_MINUTES + 1;
+        resized.sanitize();
+        assert_eq!(resized.recording.rolling_seconds(), Some(MAX_ROLLING_MINUTES * 60));
+    }
 
     #[test]
     fn defaults_roundtrip_through_toml() {

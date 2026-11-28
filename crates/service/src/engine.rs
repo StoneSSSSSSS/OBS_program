@@ -9,16 +9,16 @@ use crate::shared::{ClipTask, EngineCmd, Footage, LibCmd, Reply, Shared};
 use crate::win::ui::{ToastLevel, UiCmd};
 use crossbeam_channel::{select, Receiver};
 use cv_core::audio_names::MicDecision;
-use cv_core::config::Config;
+use cv_core::config::{Config, ROLLING_SEGMENT_SECS};
 use cv_core::db::Db;
 use cv_core::ipc::{Event, Meter};
 use cv_core::util::now_ms;
 use cv_media::capture::CaptureMethod;
 use cv_media::mf::h264::{EncoderChoice, RateControl};
 use cv_media::recorder::{AppIdent, AppNamer, MonitorChoice, RecEvent, Recorder, RecorderConfig};
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 const META_RECORDING_WANTED: &str = "recording_wanted";
@@ -34,6 +34,63 @@ fn stall_restart_allowed(starts: &mut VecDeque<Instant>, now: Instant) -> bool {
 
 pub fn buffer_dir() -> PathBuf {
     cv_core::paths::data_dir().join("buffer")
+}
+
+fn rolling_dir() -> PathBuf {
+    cv_core::paths::data_dir().join("rolling")
+}
+
+fn rolling_dir_conflicts(cfg: &Config) -> bool {
+    fn comparable(path: &Path) -> String {
+        let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        crate::shared::norm_path(&absolute.to_string_lossy())
+            .trim_start_matches(r"\\?\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    let dir = comparable(&rolling_dir());
+    let prefix = format!("{dir}\\");
+    [PathBuf::from(&cfg.recording.folder), PathBuf::from(&cfg.clips.folder), cfg.exports_dir()]
+        .iter()
+        .map(|path| comparable(path))
+        .any(|path| path == dir || path.starts_with(&prefix))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordingMode {
+    Archive,
+    Paused,
+    Rolling,
+}
+
+impl RecordingMode {
+    fn segment_secs(self, cfg: &Config) -> u32 {
+        match self {
+            Self::Archive => cfg.recording.segment_minutes * 60,
+            Self::Paused => 60,
+            Self::Rolling => ROLLING_SEGMENT_SECS,
+        }
+    }
+}
+
+fn recording_mode(cfg: &Config, wanted: bool) -> RecordingMode {
+    if cfg.recording.rolling_seconds().is_some() {
+        RecordingMode::Rolling
+    } else if wanted && cfg.recording.enabled {
+        RecordingMode::Archive
+    } else {
+        RecordingMode::Paused
+    }
+}
+
+fn clip_seconds(requested: u32, rolling_seconds: Option<u32>) -> u32 {
+    requested.max(1).min(rolling_seconds.unwrap_or(u32::MAX))
+}
+
+/// Files are removed at the end of their last frame, so a partially retained
+/// segment may overlap the expiry boundary without extending the saved clip.
+fn rolling_expired(segment_end_ms: i64, cutoff_ms: Option<i64>) -> bool {
+    cutoff_ms.is_none_or(|cutoff| segment_end_ms <= cutoff)
 }
 
 /// Names and categorises apps for the recorder's per-app tracks.
@@ -89,7 +146,8 @@ struct Engine {
     events_rx: Receiver<RecEvent>,
     namer: Arc<Namer>,
     wanted: bool,
-    buffer_mode: bool,
+    mode: RecordingMode,
+    clip_leases: Vec<(Weak<()>, Vec<PathBuf>)>,
     /// Recent files written by this engine, including footage across mode changes.
     footage: Vec<Footage>,
     mic: Option<MicDecision>,
@@ -103,19 +161,18 @@ struct Engine {
     last_buffer_clean: Instant,
 }
 
-pub fn run(sh: Arc<Shared>, rx: Receiver<EngineCmd>) {
-    cv_media::util::disable_background_throttling();
-    let wanted = Db::open_default().ok().and_then(|db| db.meta_get(META_RECORDING_WANTED).ok().flatten()).map(|v| v != "0").unwrap_or(true);
+fn new_engine(sh: Arc<Shared>, wanted: bool) -> Engine {
     let (events_tx, events_rx) = crossbeam_channel::unbounded();
     let namer = Arc::new(Namer { sh: sh.clone(), cache: Default::default() });
-    let mut e = Engine {
+    Engine {
         sh,
         rec: None,
         events_tx,
         events_rx,
         namer,
         wanted,
-        buffer_mode: false,
+        mode: RecordingMode::Paused,
+        clip_leases: Vec::new(),
         footage: Vec::new(),
         mic: None,
         last_save: None,
@@ -126,7 +183,13 @@ pub fn run(sh: Arc<Shared>, rx: Receiver<EngineCmd>) {
         mic_warned: false,
         warned: HashMap::new(),
         last_buffer_clean: Instant::now(),
-    };
+    }
+}
+
+pub fn run(sh: Arc<Shared>, rx: Receiver<EngineCmd>) {
+    cv_media::util::disable_background_throttling();
+    let wanted = Db::open_default().ok().and_then(|db| db.meta_get(META_RECORDING_WANTED).ok().flatten()).map(|v| v != "0").unwrap_or(true);
+    let mut e = new_engine(sh, wanted);
     // Give the mic guard a moment to pick the microphone first.
     std::thread::sleep(Duration::from_millis(600));
     let mut pending = Vec::new();
@@ -140,6 +203,8 @@ pub fn run(sh: Arc<Shared>, rx: Receiver<EngineCmd>) {
     if e.sh.is_shutting_down() {
         return;
     }
+    // A fresh service session starts a fresh temporary replay buffer.
+    e.clean_rolling(None);
     e.start();
     for cmd in pending {
         e.command(cmd);
@@ -164,6 +229,7 @@ pub fn run(sh: Arc<Shared>, rx: Receiver<EngineCmd>) {
     while let Ok(ev) = e.events_rx.try_recv() {
         e.event(ev);
     }
+    e.clean_rolling(None);
     tracing::info!("recording engine stopped");
 }
 
@@ -191,10 +257,14 @@ impl Engine {
                 Some(MicDecision::WindowsDefault) | None => Some(None),
             }
         };
-        let (folder, segment_secs) = if self.wanted && r.enabled { (PathBuf::from(&r.folder), r.segment_minutes * 60) } else { (buffer_dir(), 60) };
+        let folder = match self.mode {
+            RecordingMode::Archive => PathBuf::from(&r.folder),
+            RecordingMode::Paused => buffer_dir(),
+            RecordingMode::Rolling => rolling_dir(),
+        };
         RecorderConfig {
             folder,
-            segment_secs,
+            segment_secs: self.mode.segment_secs(cfg),
             fps: r.fps,
             max_height: r.max_height,
             monitor,
@@ -205,7 +275,11 @@ impl Engine {
             },
             encoder: if r.encoder == "software" { EncoderChoice::Software } else { EncoderChoice::Auto },
             rate: RateControl::Vbr { kbps, max_kbps: kbps * 3 / 2 },
-            keyframe_secs: r.keyframe_interval_secs as f32,
+            keyframe_secs: if self.mode == RecordingMode::Rolling {
+                r.keyframe_interval_secs.min(2) as f32
+            } else {
+                r.keyframe_interval_secs as f32
+            },
             cursor: r.show_cursor,
             audio_kbps: r.audio_bitrate_kbps,
             app_kbps: r.app_bitrate_kbps,
@@ -222,16 +296,25 @@ impl Engine {
             return;
         }
         let cfg = self.sh.cfg();
-        self.buffer_mode = !(self.wanted && cfg.recording.enabled);
+        self.mode = recording_mode(&cfg, self.wanted);
         let rc = self.recorder_config(&cfg);
         let folder = rc.folder.clone();
-        match Recorder::start(rc, self.namer.clone(), self.events_tx.clone()) {
+        let capture = if self.mode == RecordingMode::Rolling && rolling_dir_conflicts(&cfg) {
+            Err(anyhow::anyhow!("The replay buffer folder is also configured for saved media. Choose a different recordings, clips, or exports folder."))
+        } else {
+            Recorder::start(rc, self.namer.clone(), self.events_tx.clone())
+        };
+        match capture {
             Ok(r) => {
                 self.rec = Some(r);
                 self.progress = (0, Instant::now());
                 self.sh.update_status(|s| s.engine.last_error.clear());
                 self.retry_at = None;
-                let what = if self.buffer_mode { "clip buffer only (24/7 paused)" } else { "24/7 recording" };
+                let what = match self.mode {
+                    RecordingMode::Archive => "24/7 recording",
+                    RecordingMode::Paused => "clip buffer only (24/7 paused)",
+                    RecordingMode::Rolling => "temporary replay only",
+                };
                 self.sh.log_event("info", format!("Recording started: {what} to {}", folder.display()));
             }
             Err(e) => {
@@ -295,7 +378,24 @@ impl Engine {
                 }
                 reply(r, res);
             }
+            EngineCmd::SaveRecentRolling { seconds, reply: r } => {
+                let result = if self.mode == RecordingMode::Rolling {
+                    self.save_requested_clip(seconds, true)
+                } else {
+                    Err("Replay only is not active".into())
+                };
+                if let Err(error) = &result {
+                    self.sh.toast(ToastLevel::Error, format!("Clip not saved: {error}"));
+                }
+                reply(r, result);
+            }
             EngineCmd::SetRecording { enabled, reply: r } => {
+                if self.mode == RecordingMode::Rolling {
+                    let message = "Replay only is active. Choose Full history in Settings to save continuous recordings.".to_string();
+                    self.sh.toast(ToastLevel::Info, &message);
+                    reply(r, Err(message));
+                    return;
+                }
                 if enabled && !self.sh.cfg().recording.enabled {
                     let msg = "Turn on 24/7 recording in Settings before resuming".to_string();
                     self.sh.toast(ToastLevel::Warning, &msg);
@@ -332,7 +432,7 @@ impl Engine {
             }
             EngineCmd::ConfigChanged { restart } => {
                 let cfg = self.sh.cfg();
-                if restart || (self.buffer_mode != !(self.wanted && cfg.recording.enabled)) {
+                if restart || self.mode != recording_mode(&cfg, self.wanted) {
                     self.restart("settings changed");
                 } else if let Some(r) = &self.rec {
                     r.set_mic(self.mic_choice(&cfg), cfg.audio.mic_gain);
@@ -363,6 +463,12 @@ impl Engine {
 
     fn save_clip(&mut self, short: bool) -> Result<(), String> {
         let cfg = self.sh.cfg();
+        let requested = if short { cfg.clips.short_clip_secs } else { cfg.clips.clip_length_secs };
+        self.save_requested_clip(requested, short)
+    }
+
+    fn save_requested_clip(&mut self, requested: u32, short: bool) -> Result<(), String> {
+        let cfg = self.sh.cfg();
         if let Some(t) = self.last_save {
             if t.elapsed() < Duration::from_millis(cfg.clips.save_cooldown_ms as u64) {
                 return Ok(()); // double press
@@ -374,8 +480,14 @@ impl Engine {
         self.last_save = Some(Instant::now());
         self.sh.ui.send(UiCmd::ShowOverlay);
         let end_ms = rec.flush(Duration::from_secs(6)).map_err(|e| format!("{e:#}"))?;
-        let secs = if short { cfg.clips.short_clip_secs } else { cfg.clips.clip_length_secs };
-        let from_ms = end_ms - secs as i64 * 1000;
+        self.queue_flushed_clip(requested, short, end_ms)
+    }
+
+    fn queue_flushed_clip(&mut self, requested: u32, short: bool, end_ms: i64) -> Result<(), String> {
+        let cfg = self.sh.cfg();
+        let rolling_seconds = if self.mode == RecordingMode::Rolling { cfg.recording.rolling_seconds() } else { None };
+        let secs = clip_seconds(requested, rolling_seconds);
+        let from_ms = end_ms - i64::from(secs) * 1000;
         // The flush can rotate the file. Consume those events before taking a snapshot.
         while let Ok(event) = self.events_rx.try_recv() {
             self.event(event);
@@ -386,18 +498,31 @@ impl Engine {
                 segment.duration_s = segment.duration_s.max((end_ms - segment.start_ms) as f64 / 1000.0);
             }
         }
-        // Use the library for history, including recordings from earlier service runs.
-        // The engine's live snapshot wins, while the library's finalized path wins after a move to Kept.
-        let db = Db::open_default().map_err(|error| format!("{error:#}"))?;
-        let records = db.list_recordings().map_err(|error| format!("{error:#}"))?;
-        for record in records.into_iter().filter(|record| !record.is_live() && record.end_ms() > from_ms) {
-            let path = PathBuf::from(record.path);
-            if !footage.iter().any(|segment| crate::shared::same_path(&segment.path.to_string_lossy(), &path.to_string_lossy())) {
-                footage.push(Footage { path, start_ms: record.start_ms, duration_s: record.duration });
+        if self.mode == RecordingMode::Rolling {
+            let rolling = rolling_dir();
+            footage.retain(|segment| segment.path.starts_with(&rolling));
+        } else {
+            // Use the library for archived history, including earlier service runs.
+            let rolling = rolling_dir();
+            footage.retain(|segment| !segment.path.starts_with(&rolling));
+            let db = Db::open_default().map_err(|error| format!("{error:#}"))?;
+            let records = db.list_recordings().map_err(|error| format!("{error:#}"))?;
+            for record in records.into_iter().filter(|record| !record.is_live() && record.end_ms() > from_ms) {
+                let path = PathBuf::from(record.path);
+                if !footage.iter().any(|segment| crate::shared::same_path(&segment.path.to_string_lossy(), &path.to_string_lossy())) {
+                    footage.push(Footage { path, start_ms: record.start_ms, duration_s: record.duration });
+                }
             }
         }
-        footage.retain(|segment| segment.path.is_file());
-        self.sh.clip_tx.send(ClipTask::SaveRange { footage, from_ms, to_ms: end_ms, short })
+        footage.retain(|segment| segment.end_ms() > from_ms && segment.start_ms < end_ms && segment.path.is_file());
+        if footage.is_empty() {
+            return Err("There is no recent footage to save yet".into());
+        }
+        let lease = Arc::new(());
+        if self.mode == RecordingMode::Rolling {
+            self.clip_leases.push((Arc::downgrade(&lease), footage.iter().map(|segment| segment.path.clone()).collect()));
+        }
+        self.sh.clip_tx.send(ClipTask::SaveRange { footage, from_ms, to_ms: end_ms, short, _lease: lease })
             .map_err(|_| "Clip worker is unavailable".to_string())?;
         Ok(())
     }
@@ -407,7 +532,7 @@ impl Engine {
             RecEvent::SegmentStarted { path, start_ms } => {
                 *self.sh.live_path.lock() = Some(path.clone());
                 self.footage.push(Footage { path: path.clone(), start_ms, duration_s: 0.0 });
-                if !self.buffer_mode {
+                if self.mode == RecordingMode::Archive {
                     if let Ok(db) = Db::open_default() {
                         let _ = db.upsert_recording(&path.to_string_lossy(), start_ms, 0, "recording");
                     }
@@ -424,7 +549,7 @@ impl Engine {
                 if let Some(f) = self.footage.iter_mut().find(|f| f.path == path) {
                     f.duration_s = duration_s;
                 }
-                if !self.buffer_mode {
+                if self.mode == RecordingMode::Archive {
                     if let Ok(db) = Db::open_default() {
                         if let Ok(id) = db.upsert_recording(&path.to_string_lossy(), start_ms, bytes as i64, "complete") {
                             let tracks = cv_media::probe::probe(&path).map(|i| i.audio.len() as i64).unwrap_or(0);
@@ -437,7 +562,7 @@ impl Engine {
             }
             RecEvent::Slots { slots, .. } => {
                 tracing::debug!("app tracks: {:?}", slots.iter().map(|s| (&s.app.name, s.slot)).collect::<Vec<_>>());
-                if !self.buffer_mode {
+                if self.mode == RecordingMode::Archive {
                     self.sh.emit(Event::RecordingsChanged);
                 }
             }
@@ -445,7 +570,14 @@ impl Engine {
         }
     }
 
+    fn expire_replay(&mut self, cfg: &Config) {
+        let cutoff = cfg.recording.rolling_seconds().map(|seconds| now_ms() - i64::from(seconds) * 1000);
+        self.clean_rolling(cutoff);
+    }
+
     fn tick(&mut self) {
+        let cfg = self.sh.cfg();
+        self.expire_replay(&cfg);
         if self.rec.is_none() {
             if self.retry_at.map(|t| Instant::now() >= t).unwrap_or(true) && !self.sh.is_shutting_down() {
                 self.start();
@@ -472,7 +604,6 @@ impl Engine {
             }
         }
         // Mic silence warning.
-        let cfg = self.sh.cfg();
         if st.levels.mic > 0.003 {
             self.mic_last_sound = Instant::now();
             self.mic_warned = false;
@@ -531,10 +662,43 @@ impl Engine {
         }
     }
 
+    fn clean_rolling(&mut self, cutoff: Option<i64>) {
+        let dir = rolling_dir();
+        if !dir.is_dir() || rolling_dir_conflicts(&self.sh.cfg()) {
+            return;
+        }
+        self.clip_leases.retain(|(lease, _)| lease.strong_count() > 0);
+        let mut protected: HashSet<_> = self.clip_leases.iter().flat_map(|(_, paths)| paths.iter().cloned()).collect();
+        protected.extend(self.sh.live_path.lock().clone());
+        let mut ends = HashMap::new();
+        self.footage.retain(|segment| {
+            if !segment.path.starts_with(&dir) {
+                return true;
+            }
+            ends.insert(segment.path.clone(), segment.end_ms());
+            protected.contains(&segment.path) || !rolling_expired(segment.end_ms(), cutoff)
+        });
+        for path in prune_rolling_files(&dir, cutoff, &protected, &ends) {
+            let _ = std::fs::remove_file(cv_core::waveform::wave_path(&path));
+        }
+    }
+
     fn publish(&self) {
         let cfg = self.sh.cfg();
         let rec = self.rec.as_ref().map(|r| r.status());
-        let paused = !self.wanted || !cfg.recording.enabled;
+        let paused = self.mode != RecordingMode::Archive;
+        let rolling = cfg.recording.rolling_seconds();
+        let now = now_ms();
+        let available_seconds = rolling.map_or(0, |seconds| {
+            let from_ms = now - i64::from(seconds) * 1000;
+            let dir = rolling_dir();
+            let written = rec.as_ref().map_or(now, |rec| rec.written_until_ms);
+            let available_ms: i64 = self.footage.iter()
+                .filter(|segment| segment.path.starts_with(&dir))
+                .map(|segment| (segment.end_ms().min(written) - segment.start_ms.max(from_ms)).max(0))
+                .sum();
+            ((available_ms / 1000) as u32).min(seconds)
+        });
         self.sh.update_status(|s| {
             match &rec {
                 Some(st) => {
@@ -568,7 +732,9 @@ impl Engine {
                 }
             }
             s.recording.paused_by_user = paused;
-            s.replay.seconds = cfg.clips.clip_length_secs;
+            s.replay.seconds = clip_seconds(cfg.clips.clip_length_secs, rolling);
+            s.replay.rolling_minutes = rolling.map(|seconds| seconds / 60);
+            s.replay.available_seconds = available_seconds;
             let (state, device) = match (&self.mic, cfg.audio.record_mic) {
                 (_, false) => ("disabled", String::new()),
                 (Some(MicDecision::Preferred { rank, endpoint }), _) => (if *rank == 0 { "ok" } else { "fallback" }, cv_core::audio_names::clean_display_name(&endpoint.name)),
@@ -583,6 +749,26 @@ impl Engine {
     }
 }
 
+fn prune_rolling_files(dir: &Path, cutoff: Option<i64>, protected: &HashSet<PathBuf>, ends: &HashMap<PathBuf, i64>) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return removed };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if protected.contains(&path) || !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("mp4") {
+            continue;
+        }
+        let Some(start) = cv_core::filenames::parse_timestamp_ms(&path) else { continue };
+        let end = ends.get(&path).copied().unwrap_or_else(|| {
+            entry.metadata().and_then(|m| m.modified()).ok().map(cv_core::util::system_time_ms)
+                .unwrap_or(start + i64::from(ROLLING_SEGMENT_SECS) * 1000)
+        });
+        if rolling_expired(end, cutoff) && std::fs::remove_file(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
 /// Send a command and wait for its reply.
 pub fn send_and_wait(sh: &Shared, make: impl FnOnce(crossbeam_channel::Sender<Result<(), String>>) -> EngineCmd, timeout: Duration) -> Result<(), String> {
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -590,9 +776,79 @@ pub fn send_and_wait(sh: &Shared, make: impl FnOnce(crossbeam_channel::Sender<Re
     rx.recv_timeout(timeout).map_err(|_| "timed out".to_string())?
 }
 
+/// Exercise the same clip-source snapshot and expiry paths after a synthetic
+/// flush. No capture worker is started by this test-only Engine owner.
+#[cfg(test)]
+pub(crate) fn run_rolling_fixture(sh: Arc<Shared>, rx: Receiver<EngineCmd>, footage: Vec<Footage>, written_until_ms: i64) {
+    let mut engine = new_engine(sh, true);
+    engine.footage = footage;
+    while let Ok(command) = rx.recv() {
+        match command {
+            EngineCmd::ConfigChanged { .. } => {
+                let cfg = engine.sh.cfg();
+                engine.mode = recording_mode(&cfg, true);
+                engine.expire_replay(&cfg);
+                engine.publish();
+            }
+            EngineCmd::SaveRecentRolling { seconds, reply: response } => {
+                let result = if engine.mode == RecordingMode::Rolling {
+                    engine.queue_flushed_clip(seconds, true, written_until_ms)
+                } else {
+                    Err("Replay only is not active".into())
+                };
+                reply(response, result);
+            }
+            EngineCmd::Shutdown => break,
+            _ => {}
+        }
+    }
+    engine.clean_rolling(None);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_only_supersedes_archive_pause_and_caps_requested_seconds() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.recording.rolling_seconds(), None);
+        assert!(recording_mode(&cfg, true) == RecordingMode::Archive);
+        assert!(recording_mode(&cfg, false) == RecordingMode::Paused);
+        cfg.recording.history_mode = cv_core::config::HistoryMode::Rolling;
+        cfg.recording.rolling_minutes = 2;
+        assert!(recording_mode(&cfg, false) == RecordingMode::Rolling);
+        assert_eq!(RecordingMode::Rolling.segment_secs(&cfg), 10);
+        assert_eq!(RecordingMode::Archive.segment_secs(&cfg), 1800);
+        assert_eq!(clip_seconds(420, cfg.recording.rolling_seconds()), 120);
+        assert_eq!(clip_seconds(30, cfg.recording.rolling_seconds()), 30);
+    }
+
+    #[test]
+    fn rolling_cleanup_removes_only_expired_unleased_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let rolling = dir.path().join("rolling");
+        std::fs::create_dir(&rolling).unwrap();
+        let old = rolling.join("2026-11-28 09-00-00.mp4");
+        let recent = rolling.join("2026-11-28 09-00-10.mp4");
+        let leased = rolling.join("2026-11-28 09-00-20.mp4");
+        let archive = dir.path().join("2026-11-28 09-00-30.mp4");
+        let saved_clip = dir.path().join("saved clip.mp4");
+        for path in [&old, &recent, &leased, &archive, &saved_clip] {
+            std::fs::write(path, b"synthetic").unwrap();
+        }
+        let ends = HashMap::from([(old.clone(), 10), (recent.clone(), 30), (leased.clone(), 15)]);
+        let pins = HashSet::from([leased.clone()]);
+        assert_eq!(prune_rolling_files(&rolling, Some(20), &pins, &ends), [old.clone()]);
+        assert!(!old.exists());
+        assert!(recent.exists() && leased.exists());
+        // Leaving rolling mode or stopping discards temporary data outside active jobs.
+        assert_eq!(prune_rolling_files(&rolling, None, &pins, &ends), [recent.clone()]);
+        assert!(!recent.exists() && leased.exists());
+        // Once the save job finishes, ordinary cleanup removes the source, not the clip.
+        assert_eq!(prune_rolling_files(&rolling, None, &HashSet::new(), &ends), [leased.clone()]);
+        assert!(!leased.exists() && archive.exists() && saved_clip.exists());
+    }
 
     #[test]
     fn exhausted_watchdog_budget_recovers_when_the_window_expires() {

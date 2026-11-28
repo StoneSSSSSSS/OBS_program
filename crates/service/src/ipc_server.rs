@@ -108,6 +108,9 @@ fn handle(sh: &Arc<Shared>, req: Request) -> Result<Value, String> {
         Request::SaveClip { short } => {
             send_and_wait(sh, |r| EngineCmd::SaveClip { short, reply: Some(r) }, Duration::from_secs(15)).map(|_| Value::Null)
         }
+        Request::SaveRecentRolling { seconds } => {
+            send_and_wait(sh, |reply| EngineCmd::SaveRecentRolling { seconds, reply: Some(reply) }, Duration::from_secs(15)).map(|_| Value::Null)
+        }
         Request::AddMarker { label } => crate::add_marker(sh, &label).map(|id| json!({"id": id})).map_err(e2s),
         Request::SetRecording { enabled } => {
             send_and_wait(sh, |r| EngineCmd::SetRecording { enabled, reply: Some(r) }, Duration::from_secs(30)).map(|_| Value::Null)

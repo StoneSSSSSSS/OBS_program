@@ -24,7 +24,7 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<ClipTask>) {
             break;
         }
         match task {
-            ClipTask::SaveRange { footage, from_ms, to_ms, short } => match save_range(&sh, &footage, from_ms, to_ms, short) {
+            ClipTask::SaveRange { footage, from_ms, to_ms, short, _lease } => match save_range(&sh, &footage, from_ms, to_ms, short) {
                 Ok((id, title, game, dur)) => {
                     sh.log_event("info", format!("Saved clip \"{title}\" ({game}, {})", format_duration(dur)));
                     sh.toast(ToastLevel::Success, format!("Clip saved: {game} · {}", format_duration(dur)));

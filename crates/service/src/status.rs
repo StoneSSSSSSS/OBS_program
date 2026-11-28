@@ -58,6 +58,8 @@ pub fn run(sh: Arc<Shared>) {
         if s.recording.active {
             let secs = (now_ms() - s.recording.started_ms).max(0) / 1000;
             tip.push_str(&format!("recording ({})", format_span_short(secs)));
+        } else if s.replay.rolling_minutes.is_some() {
+            tip.push_str("replay only");
         } else if s.recording.paused_by_user {
             tip.push_str("24/7 recording paused");
         } else {

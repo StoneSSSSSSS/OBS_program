@@ -162,6 +162,9 @@ fn index_recordings(sh: &Shared, db: &Db) -> bool {
 
 fn retention(sh: &Shared, db: &Db) {
     let cfg = sh.cfg();
+    if cfg.recording.rolling_seconds().is_some() {
+        return;
+    }
     let folder = PathBuf::from(&cfg.recording.folder);
     let Some((free, _)) = crate::win::shell::disk_space(&folder) else { return };
     let _lock = sh.library_lock.lock();

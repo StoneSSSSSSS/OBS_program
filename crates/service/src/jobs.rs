@@ -102,9 +102,11 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<JobRequest>) {
         };
         match result {
             Ok((output, clip_id)) => {
+                let output_bytes = output.metadata().ok().map(|file| file.len());
                 update(&sh, id, |j| {
                     j.state = "done".into();
                     j.progress = 1.0;
+                    j.output_bytes = output_bytes;
                     j.output = Some(output.to_string_lossy().to_string());
                     j.clip_id = clip_id;
                 });

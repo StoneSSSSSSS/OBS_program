@@ -590,6 +590,7 @@ impl UiState {
     }
 
     fn tray_menu(&mut self) {
+        let rolling = self.cfg.read().recording.rolling_seconds().is_some();
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let items: [(u32, &str); 9] = [
@@ -597,7 +598,7 @@ impl UiState {
                 (2, "Save clip now"),
                 (3, "Add marker"),
                 (0, ""),
-                (4, if self.recording_paused { "Resume 24/7 recording" } else { "Pause 24/7 recording" }),
+                (4, if rolling { "Replay only is active" } else if self.recording_paused { "Resume 24/7 recording" } else { "Pause 24/7 recording" }),
                 (5, "Restart recording"),
                 (0, ""),
                 (6, "Open clips folder"),
@@ -608,7 +609,8 @@ impl UiState {
                     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 } else {
                     let w = wide(text);
-                    let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(w.as_ptr()));
+                    let flags = if rolling && id == 4 { MF_STRING | MF_GRAYED } else { MF_STRING };
+                    let _ = AppendMenuW(menu, flags, id as usize, PCWSTR(w.as_ptr()));
                 }
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
