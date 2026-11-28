@@ -31,6 +31,8 @@
 - [x] Keep the live row's Play button, LIVE badge, file size and lock readable. Keep Export and Marker fully visible or scrollable after resizing the preview. Native Windows checks passed at 100%, 125% and 150% UI scale.
 - [x] Save and reopen two bindings for the same player action. In native UI tests, typing the primary key into recording search or the alternate into a clip title preserved the paused frame. Each key jumped to the end outside its text field.
 
+- [x] Run ten-minute Full history against real, newly captured footage for 626 seconds. The owned-window WGC run expired two ordinary segments and kept 600.000 seconds of finalized footage plus the current eight-second durable tail. An eight-second recording marked Keep and a saved four-second clip kept their original bytes. This opt-in soak uses eight-second test segments. The ordinary ten-minute configuration uses sixty-second segments.
+
 ## Next verification
 
 - [ ] Run a sustained live replay-only session on a second Windows setup. Check hotkey capture and rebinding, headset and display reconnects, disk pressure, and waveform backfill while entering and leaving a game.

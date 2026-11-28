@@ -1,5 +1,8 @@
 //! Opt-in genuine recorder/IPC smoke test. Only this process's synthetic window is captured.
 
+#[path = "retention_soak.rs"]
+mod retention_soak;
+
 use super::*;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
