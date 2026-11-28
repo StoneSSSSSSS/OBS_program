@@ -139,21 +139,30 @@ impl Workbench {
         let project = &self.history.project;
         let width = ui.available_width().clamp(70.0, 138.0);
         let label = if self.selected.is_some() { "Selected Item" } else { "Select Item" };
+        let mut jump = None;
         egui::ComboBox::from_id_salt("editor-select-item").width(width).selected_text(label).show_ui(ui, |ui| {
             ui.selectable_value(&mut self.selected, None, "None");
             let mut at = 0;
             for (idx, shot) in project.shots.iter().enumerate() {
                 let name = shot_name(project, &shot.source);
                 let label = format!("Video {} · {} · {name}", idx + 1, clock(at));
-                ui.selectable_value(&mut self.selected, Some(Selection::Shot(shot.id)), label);
+                if ui.selectable_value(&mut self.selected, Some(Selection::Shot(shot.id)), label).clicked() { jump = Some(at); }
                 at += shot.range.len();
             }
             for sound in &project.sounds {
                 let name = project.asset(sound.asset).map(|asset| filename(&asset.path)).unwrap_or_default();
                 let label = format!("{} · {} · {name}", role_name(sound.role), clock(sound.at));
-                ui.selectable_value(&mut self.selected, Some(Selection::Sound(sound.id)), label);
+                if ui.selectable_value(&mut self.selected, Some(Selection::Sound(sound.id)), label).clicked() { jump = Some(sound.at); }
             }
         });
+        if let Some(at) = jump {
+            if let Some(window) = self.timeline.window.as_mut() {
+                if at < window.start || at >= window.start.saturating_add(window.span) {
+                    window.start = at.saturating_sub(window.span / 3).min(project.duration().saturating_sub(window.span));
+                }
+            }
+            self.seek(at, ui.ctx());
+        }
     }
 
     fn board(&mut self, ui: &mut Ui, domain: u64, accent: Color32) {

@@ -37,7 +37,7 @@
 
 - [x] Build an editable, multi-source timeline with native audio/video previews and exports, portable project files and offline searchable help. See [Editor features](docs/editor-features.md).
 - [x] Verify full-HD landscape and portrait delivery, audio fades, subtitle visibility at cue boundaries, rotation and mirroring with actual native renders.
-- [x] Exercise the Workbench, expanded preview and Wiki from 360 to 1300 logical points. The integrated Windows resize sweep passed across all 21 screens at 100%, 125% and 150% UI scale, with 1,470 rendered frames per scale in the initial run.
+- [x] Exercise the Workbench, expanded preview and Wiki from 360 to 1300 logical points. The initial 21-screen sweep passed at 100%, 125% and 150% UI scale. The expanded 23-screen sweep also passed at each scale (1,500 rendered frames per scale), including a complete video lane and Inspector actions at short window heights. The 24-screen sweep also checked the selected audio Media Bin with an import banner and passed 1,512 rendered frames per scale.
 - [ ] Finish independent editing challenges and document the outcome of each retest. [Review briefs and rubric](docs/editor-challenges.md)
 
 ## Next verification

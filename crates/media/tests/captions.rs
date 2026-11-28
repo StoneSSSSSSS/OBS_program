@@ -58,3 +58,36 @@ fn caption_panel_and_text_exist_only_during_cue_in_preview_and_export() -> Resul
     ensure!(incorrect.is_empty(), "Unexpected caption coverage: {incorrect:?}");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires the synthetic numbered source and native Windows encoders"]
+fn scrub_before_and_during_a_credit_after_the_last_picture() -> Result<()> {
+    let kit = PathBuf::from(std::env::var_os("CLIPVAULT_EDITOR_TEST_FIXTURES").context("choose the synthetic editor kit")?);
+    let path = kit.join("inputs").join("Frame counter.mp4");
+    let profile = PathBuf::from(std::env::var_os("CLIPVAULT_DATA_DIR").context("choose a test profile")?);
+    let out = tempfile::Builder::new().prefix("end-credit-").tempdir_in(profile)?;
+    for legacy in [false, true] {
+        let mut project = Project::default();
+        project.canvas = Canvas { width: 640, height: 360, fps: 25 };
+        let mut info = probe(&path)?;
+        if legacy { info.duration = 4 * S + S / 100; }
+        let id = project.import(path.clone(), info)?;
+        project.append(id)?;
+        project.caption("End credit".into(), Span { start: 4 * S + S / 25, end: 5 * S })?;
+        let movie = out.path().join(format!("credit-{legacy}.mp4"));
+        render(&project, &movie, &RenderControl::default())?;
+        let reader = Mp4Reader::open(&movie)?;
+        let video = reader.video().context("Missing credit video")?;
+        for (at, expected_text) in [(4 * S, false), (4 * S + S / 25, true), (4 * S + S / 2, true)] {
+            let scrub = thumbnail(&project, at, 640, 360)?;
+            let (decoded, _) = frame_at_time(&reader, video, at as f64 / S as f64 + 0.001)?;
+            let exported = nv12_to_rgb(&decoded, 640);
+            for image in [image::DynamicImage::ImageRgba8(scrub).to_rgb8(), exported] {
+                let ink = image.pixels().filter(|p| p[0] > 130 && p[1] > 130 && p[2] > 130).count();
+                ensure!((ink > 40) == expected_text, "legacy {legacy}, {at} ticks: {ink} bright pixels");
+                ensure!(image.get_pixel(16, 16)[1] < 20, "expected black after the last picture");
+            }
+        }
+    }
+    Ok(())
+}

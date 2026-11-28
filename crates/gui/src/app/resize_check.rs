@@ -26,6 +26,7 @@ const PAGES: &[(&str, &str)] = &[
     ("workbench_wiki", "Editor Wiki"),
     ("workbench_short_timeline", "Video"),
     ("workbench_short_inspector", "Apply Changes"),
+    ("workbench_short_bin", "Add to Timeline"),
     ("settings_general", "Startup"),
     ("settings_recording", "Recording history"),
     ("settings_clips", "Saved clip length"),
@@ -209,6 +210,7 @@ fn inspect(
             "workbench_wiki" => &["All topics", "Clear"],
             "workbench_short_timeline" => &["Edit", "View", "Selected Item"],
             "workbench_short_inspector" => &["Inspector", "Apply Changes"],
+            "workbench_short_bin" => &["Add to Timeline", "Relink Media…"],
             page if page.starts_with("settings_") => &["Save", "Discard"],
             _ => &[],
         };

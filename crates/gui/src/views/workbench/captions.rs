@@ -45,7 +45,8 @@ impl Workbench {
         let project = &self.history.project;
         egui::Window::new("Captions").id(egui::Id::unique("editor-caption-window"))
             .open(&mut open).collapsible(false).default_width(460.0_f32.min(size.x * 0.83))
-            .max_width((size.x - 24.0).max(150.0)).max_height((size.y - 60.0).max(170.0)).vscroll(true)
+            .default_height(495.0_f32.min((size.y - 60.0).max(170.0)))
+            .max_width((size.x - 24.0).max(150.0)).max_height((size.y - 60.0).max(170.0))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("New at Playhead").clicked() { state.new_at(self.playhead); }
@@ -58,6 +59,12 @@ impl Workbench {
                             .set_file_name("Subtitles.srt").add_filter("SubRip subtitles", &["srt"]).save_file()) { action = Some(Action::Export(path)); }
                     }
                 });
+                let valid = !state.text.trim().is_empty() && ticks(state.end) > ticks(state.start);
+                ui.horizontal_wrapped(|ui| {
+                    let label = if state.selected.is_some() { "Save Caption" } else { "Add Caption" };
+                    if ui.add_enabled(valid, egui::Button::new(label)).clicked() { action = Some(Action::Apply); }
+                    if ui.add_enabled(state.selected.is_some(), egui::Button::new("Remove Caption")).clicked() { action = Some(Action::Remove); }
+                });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Caption position");
                     for (position, label) in [(CaptionPosition::Bottom, "Bottom"), (CaptionPosition::Top, "Top")] {
@@ -65,41 +72,38 @@ impl Workbench {
                             && position != project.caption_position { action = Some(Action::Position(position)); }
                     }
                 });
-                if !project.captions.is_empty() {
-                    ui.add_space(4.0);
-                    egui::ScrollArea::vertical().id_salt("editor-caption-list").max_height(130.0).show(ui, |ui| {
-                        let mut cues = project.captions.iter().collect::<Vec<_>>();
-                        cues.sort_by_key(|cue| (cue.range.start, cue.id));
-                        for cue in cues {
-                            let name = format!("{}   {}", clock(cue.range.start), cue.text.lines().next().unwrap_or(""));
-                            if ui.add(egui::Button::selectable(state.selected == Some(cue.id), name).truncate()).clicked() {
-                                state.selected = Some(cue.id);
-                                state.text = cue.text.clone();
-                                state.start = seconds(cue.range.start);
-                                state.end = seconds(cue.range.end);
-                                state.message.clear();
-                                action = Some(Action::Go(cue.range.start));
-                            }
+                egui::ScrollArea::vertical().id_salt("editor-caption-fields")
+                    .auto_shrink([false, true]).show(ui, |ui| {
+                        if !project.captions.is_empty() {
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical().id_salt("editor-caption-list").max_height(130.0).show(ui, |ui| {
+                                let mut cues = project.captions.iter().collect::<Vec<_>>();
+                                cues.sort_by_key(|cue| (cue.range.start, cue.id));
+                                for cue in cues {
+                                    let name = format!("{}   {}", clock(cue.range.start), cue.text.lines().next().unwrap_or(""));
+                                    if ui.add(egui::Button::selectable(state.selected == Some(cue.id), name).truncate()).clicked() {
+                                        state.selected = Some(cue.id);
+                                        state.text = cue.text.clone();
+                                        state.start = seconds(cue.range.start);
+                                        state.end = seconds(cue.range.end);
+                                        state.message.clear();
+                                        action = Some(Action::Go(cue.range.start));
+                                    }
+                                }
+                            });
                         }
+                        ui.separator();
+                        ui.label("Caption text");
+                        ui.add(egui::TextEdit::multiline(&mut state.text).desired_width(f32::INFINITY).desired_rows(2));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Start");
+                            ui.add(egui::DragValue::new(&mut state.start).range(0.0..=i64::MAX as f64 / 1e7).speed(0.04).max_decimals(3).suffix(" s").custom_parser(super::parse_time)).on_hover_text("Click to type. Ctrl+A selects the whole time.");
+                            ui.label("End");
+                            ui.add(egui::DragValue::new(&mut state.end).range(0.0..=i64::MAX as f64 / 1e7).speed(0.04).max_decimals(3).suffix(" s").custom_parser(super::parse_time)).on_hover_text("Click to type. Ctrl+A selects the whole time.");
+                        });
+                        if state.end <= state.start { ui.label("Set the end after the start."); }
+                        if !state.message.is_empty() { ui.add(egui::Label::new(&state.message).wrap()); }
                     });
-                }
-                ui.separator();
-                ui.label("Caption text");
-                ui.add(egui::TextEdit::multiline(&mut state.text).desired_width(f32::INFINITY).desired_rows(2));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Start");
-                    ui.add(egui::DragValue::new(&mut state.start).range(0.0..=i64::MAX as f64 / 1e7).speed(0.04).max_decimals(3).suffix(" s").custom_parser(super::parse_time)).on_hover_text("Click to type. Ctrl+A selects the whole time.");
-                    ui.label("End");
-                    ui.add(egui::DragValue::new(&mut state.end).range(0.0..=i64::MAX as f64 / 1e7).speed(0.04).max_decimals(3).suffix(" s").custom_parser(super::parse_time)).on_hover_text("Click to type. Ctrl+A selects the whole time.");
-                });
-                let valid = !state.text.trim().is_empty() && ticks(state.end) > ticks(state.start);
-                ui.horizontal_wrapped(|ui| {
-                    let label = if state.selected.is_some() { "Save Caption" } else { "Add Caption" };
-                    if ui.add_enabled(valid, egui::Button::new(label)).clicked() { action = Some(Action::Apply); }
-                    if ui.add_enabled(state.selected.is_some(), egui::Button::new("Remove Caption")).clicked() { action = Some(Action::Remove); }
-                });
-                if state.end <= state.start { ui.label("Set the end after the start."); }
-                if !state.message.is_empty() { ui.add(egui::Label::new(&state.message).wrap()); }
             });
         state.open = open;
         match action {

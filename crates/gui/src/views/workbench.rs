@@ -77,6 +77,8 @@ struct Generator {
 enum Notice {
     Info(String),
     Error(String),
+    MissingMedia(Id),
+    ExportError(String),
 }
 
 type Probed = Vec<(PathBuf, Result<AssetInfo>)>;
@@ -94,6 +96,7 @@ pub struct Workbench {
     preview_expanded: bool,
     compact_preview_height: Option<f32>,
     seek_input: Option<(String, bool)>,
+    error_details: Option<String>,
     selected_asset: Option<Id>,
     selected: Option<Selection>,
     audio_role: SoundRole,
@@ -102,6 +105,7 @@ pub struct Workbench {
     playhead: u64,
     preview: preview::Preview,
     export: preview::Export,
+    last_export: Option<PathBuf>,
     imports: Option<Receiver<Probed>>,
     availability: availability::Availability,
     relink_task: Option<(Id, Receiver<Result<(PathBuf, AssetInfo)>>)>,
@@ -128,6 +132,7 @@ impl Default for Workbench {
             preview_expanded: false,
             compact_preview_height: None,
             seek_input: None,
+            error_details: None,
             selected_asset: None,
             selected: None,
             audio_role: SoundRole::Music,
@@ -136,6 +141,7 @@ impl Default for Workbench {
             playhead: 0,
             preview: preview::Preview::default(),
             export: preview::Export::default(),
+            last_export: None,
             imports: None,
             availability: availability::Availability::default(),
             relink_task: None,
@@ -162,7 +168,13 @@ impl Workbench {
         self.history = History::new(project);
         self.selected = Some(Selection::Shot(id));
         self.dock = Dock::Inspector;
-        self.dock_open = page == "workbench_short_inspector";
+        self.dock_open = matches!(page, "workbench_short_inspector" | "workbench_short_bin");
+        if page == "workbench_short_bin" {
+            self.dock = Dock::Media;
+            let info = AssetInfo { kind: AssetKind::Audio, fps_milli: None, duration: TICKS_PER_SECOND, width: 0, height: 0 };
+            self.selected_asset = Some(self.history.project.import(PathBuf::from("Synthetic cue.wav"), info).expect("fixture asset"));
+            self.notice = Some(Notice::Info("Imported 1 file".into()));
+        }
         self.preview_expanded = page == "workbench_preview";
         self.tab = if page == "workbench_wiki" { Tab::Wiki } else { Tab::Workbench };
     }
@@ -212,7 +224,7 @@ impl Workbench {
                 self.dock_button(ui, Dock::Inspector, "Inspector");
             });
         }
-        self.output_status(ui);
+        self.output_status(ui, frame);
         ui.add_space(6.0);
         if ui.available_width() < 600.0 && !self.preview_expanded {
             self.compact_workspace(ui, frame, ctx.accent);
@@ -229,6 +241,7 @@ impl Workbench {
 
         if self.seek_input.is_none() { self.shortcuts(ui, frame); }
         self.seek_dialog(ui.ctx());
+        self.details_window(ui.ctx());
         self.replace_prompt(ui.ctx(), frame);
         self.generator_prompt(ui.ctx());
         self.caption_window(ui.ctx(), frame);
@@ -275,8 +288,9 @@ impl Workbench {
         });
     }
 
-    fn output_status(&mut self, ui: &mut Ui) {
+    fn output_status(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
         let mut row = false;
+        let mut choose_export = false;
         if let Some(status) = self.export.status() {
             row = true;
             ui.horizontal_wrapped(|ui| match status {
@@ -289,6 +303,7 @@ impl Workbench {
                     }
                 }
                 preview::ExportStatus::Saved(path) => {
+                    if ui.small_button("Dismiss").on_hover_text("Hide the export result").clicked() { self.export.clear_result(); }
                     let label = format!("Exported {}", filename(&path));
                     ui.add(egui::Label::new(&label).truncate()).on_hover_text(path.display().to_string());
                     if ui.button("Open Output Folder").clicked() {
@@ -300,8 +315,9 @@ impl Workbench {
                     }
                 }
                 preview::ExportStatus::Failed(error) => {
-                    ui.add(egui::Label::new(RichText::new(&error).color(theme::DANGER)).truncate())
-                        .on_hover_text(error);
+                    choose_export = ui.small_button("Choose new filename…").clicked();
+                    if ui.small_button("Details").clicked() { self.error_details = Some(error.clone()); }
+                    ui.add(egui::Label::new(RichText::new(&error).color(theme::DANGER)).truncate()).on_hover_text(error);
                 }
             });
         }
@@ -313,14 +329,48 @@ impl Workbench {
             ui.label("Relinking media…");
         } else if let Some(notice) = &self.notice {
             row = true;
-            let (message, color) = match notice {
-                Notice::Info(message) => (message, theme::TEXT_DIM),
-                Notice::Error(message) => (message, theme::DANGER),
-            };
-            ui.add(egui::Label::new(RichText::new(message).color(color)).truncate())
-                .on_hover_text(message);
+            match notice {
+                Notice::MissingMedia(id) => {
+                    let id = *id;
+                    if let Some(asset) = self.history.project.asset(id) {
+                        let name = filename(&asset.path);
+                        let path = asset.path.display().to_string();
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Relink Media…").clicked() { self.relink(id, frame, ui.ctx()); }
+                            ui.add(egui::Label::new(format!("Missing for export: {name}")).truncate()).on_hover_text(path);
+                        });
+                    }
+                }
+                Notice::Info(message) => {
+                    ui.add(egui::Label::new(RichText::new(message).color(theme::TEXT_DIM)).truncate()).on_hover_text(message);
+                }
+                Notice::Error(message) | Notice::ExportError(message) => {
+                    let export_problem = matches!(notice, Notice::ExportError(_));
+                    ui.horizontal_wrapped(|ui| {
+                        if export_problem { choose_export = ui.small_button("Choose new filename…").clicked(); }
+                        if ui.small_button("Details").clicked() { self.error_details = Some(message.clone()); }
+                        ui.add(egui::Label::new(RichText::new(message.lines().next().unwrap_or(message)).color(theme::DANGER)).truncate()).on_hover_text(message);
+                    });
+                }
+            }
         }
+        if choose_export { self.export(frame, ui.ctx()); }
         if !row && ui.ctx().viewport_rect().height() >= 590.0 { ui.add_space(17.0); }
+    }
+
+    fn details_window(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.error_details.as_ref() else { return; };
+        let mut open = true;
+        let size = ctx.viewport_rect().size();
+        egui::Window::new("Error details").open(&mut open).collapsible(false)
+            .default_width((size.x - 40.0).clamp(120.0, 500.0))
+            .max_height((size.y - 70.0).max(80.0)).show(ctx, |ui| {
+                if ui.button("Copy details").clicked() { ctx.copy_text(message.clone()); }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add(egui::Label::new(message).selectable(true).wrap());
+                });
+            });
+        if !open { self.error_details = None; }
     }
 
     fn dock_button(&mut self, ui: &mut Ui, dock: Dock, label: &str) {
@@ -335,7 +385,8 @@ impl Workbench {
         let available = ui.available_height();
         if available < 265.0 {
             ui.horizontal(|ui| {
-                let (picture, open) = ui.allocate_exact_size(egui::vec2(70.0, 40.0), Sense::click());
+                let thumbnail = if self.dock_open { egui::vec2(50.0, 28.0) } else { egui::vec2(70.0, 40.0) };
+                let (picture, open) = ui.allocate_exact_size(thumbnail, Sense::click());
                 self.preview.picture(ui, picture, &self.history.project, accent, self.revision, self.playhead);
                 if open.on_hover_text("Expand preview").clicked() { self.preview_expanded = true; }
                 let duration = self.history.project.duration();
@@ -535,12 +586,29 @@ impl Workbench {
         if hovered_file {
             ui.label("Drop files to import");
         }
-        let selected_audio = self.selected_asset.and_then(|id| self.history.project.asset(id))
-            .is_some_and(|asset| asset.info.kind == AssetKind::Audio);
-        let actions_height = if selected_audio { 117.0 } else { 79.0 };
-        let list_height = (ui.available_height() - actions_height).max(48.0);
+        let selected = self.selected_asset.and_then(|id| self.history.project.asset(id));
+        let compact = ui.ctx().viewport_rect().height() < 590.0 && ui.available_width() < 600.0;
+        ui.horizontal_wrapped(|ui| {
+            if let Some(asset) = selected.filter(|asset| asset.info.kind == AssetKind::Audio && compact) {
+                egui::ComboBox::from_id_salt(("editor-bin-role-compact", asset.id)).width(65.0)
+                    .selected_text(role_name(self.audio_role)).show_ui(ui, |ui| {
+                        for role in [SoundRole::Voice, SoundRole::Music, SoundRole::Effect] {
+                            ui.selectable_value(&mut self.audio_role, role, role_name(role));
+                        }
+                    });
+            }
+            let eligible = selected.is_some_and(|asset| !self.availability.missing(asset.id));
+            if ui.add_enabled(eligible, egui::Button::new("Add to Timeline")).clicked() { add = self.selected_asset; }
+            if ui.add_enabled(selected.is_some() && self.relink_task.is_none(), egui::Button::new("Relink Media…")).clicked() {
+                relink = self.selected_asset;
+            }
+        });
+        if selected.is_some_and(|asset| asset.info.kind == AssetKind::Audio) && !compact {
+            role_picker(ui, "editor-bin-role", &mut self.audio_role);
+        }
+        ui.separator();
         let assets = &self.history.project.assets;
-        egui::ScrollArea::vertical().id_salt("editor-media-list").max_height(list_height).show_rows(ui, 35.0, assets.len(), |ui, rows| {
+        egui::ScrollArea::vertical().id_salt("editor-media-list").max_height(ui.available_height().max(1.0)).show_rows(ui, 35.0, assets.len(), |ui, rows| {
             for asset in &assets[rows] {
                 let missing = self.availability.missing(asset.id);
                 let response = media_row(ui, asset, self.selected_asset == Some(asset.id), missing);
@@ -550,18 +618,6 @@ impl Workbench {
             }
         });
 
-        if let Some(asset) = self.selected_asset.and_then(|id| self.history.project.asset(id)) {
-            let id = asset.id;
-            let missing = self.availability.missing(id);
-            ui.separator();
-            if asset.info.kind == AssetKind::Audio {
-                role_picker(ui, "editor-bin-role", &mut self.audio_role);
-            }
-            ui.horizontal_wrapped(|ui| {
-                if ui.add_enabled(!missing, egui::Button::new("Add to Timeline")).clicked() { add = Some(id); }
-                if ui.add_enabled(self.relink_task.is_none(), egui::Button::new("Relink Media…")).clicked() { relink = Some(id); }
-            });
-        }
         if let Some(id) = add { self.place_asset(id, None, None, ui.ctx()); }
         if let Some(id) = relink { self.relink(id, frame, ui.ctx()); }
     }
@@ -639,7 +695,7 @@ impl Workbench {
             if let Some(message) = imported_message { self.notice = Some(Notice::Info(message)); }
         } else {
             let prefix = imported_message.map_or_else(String::new, |message| format!("{message} · "));
-            self.notice = Some(Notice::Error(format!("{prefix}Skipped {} · {}", errors.len(), errors.join("  ·  "))));
+            self.notice = Some(Notice::Error(format!("{prefix}Skipped {} · {}", errors.len(), errors.join("\n"))));
         }
     }
 
@@ -825,8 +881,10 @@ impl Workbench {
         self.inspector = inspector::Inspector::default();
         self.captions = captions::Captions::default();
         self.seek_input = None;
+        self.error_details = None;
         self.generator = None;
         self.export.clear_result();
+        self.last_export = None;
         self.timeline = timeline::Timeline::default();
         self.notice = None;
         self.revision = self.revision.wrapping_add(1);
@@ -896,15 +954,33 @@ impl Workbench {
 
     fn export(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
         self.pause();
+        let project = &self.history.project;
+        let pictures = project.shots.iter().filter_map(|shot| match shot.source {
+            cv_core::editor::Source::Asset(id) => Some(id), _ => None,
+        });
+        if let Some(id) = pictures.chain(project.sounds.iter().map(|sound| sound.asset))
+            .find(|&id| self.availability.missing(id))
+        {
+            self.export.clear_result();
+            self.selected_asset = Some(id);
+            self.dock = Dock::Media;
+            self.dock_open = true;
+            self.notice = Some(Notice::MissingMedia(id));
+            return;
+        }
         let projects = cv_core::paths::data_dir();
+        let folder = self.last_export.as_deref().or(self.file.as_deref()).and_then(Path::parent).unwrap_or(&projects);
+        let preferred = self.last_export.clone().unwrap_or_else(|| folder.join(format!("{}.mp4", safe_name(&self.history.project.name))));
         let Some(path) = qa_driver::save_file(|| {
             rfd::FileDialog::new().set_parent(frame).set_title("Export MP4")
-                .set_directory(self.file.as_deref().and_then(Path::parent).unwrap_or(&projects))
-                .add_filter("MP4 video", &["mp4"])
-                .set_file_name(format!("{}.mp4", safe_name(&self.history.project.name))).save_file()
+                .set_directory(folder).add_filter("MP4 video", &["mp4"])
+                .set_file_name(suggest_output(&preferred, |p| p.exists())).save_file()
         }) else { return; };
-        let result = extension(path, "mp4").and_then(|path| self.export.start(ctx, self.history.project.clone(), path));
-        self.notice = result.err().map(|error| Notice::Error(format!("Could not export: {error:#}")));
+        let result = extension(path, "mp4").and_then(|path| {
+            self.last_export = Some(path.clone());
+            self.export.start(ctx, self.history.project.clone(), path)
+        });
+        self.notice = result.err().map(|error| Notice::ExportError(format!("Could not export: {error:#}")));
     }
 
     fn start_generator(&mut self, kind: Generated) {
@@ -1097,6 +1173,19 @@ fn filename(path: &Path) -> String {
     path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
 }
 
+fn suggest_output(path: &Path, occupied: impl Fn(&Path) -> bool) -> String {
+    if !occupied(path) { return filename(path); }
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let (base, first) = stem.strip_suffix(')').and_then(|text| text.rsplit_once(" ("))
+        .and_then(|(base, number)| Some((base, number.parse::<u32>().ok()?.checked_add(1)?)))
+        .unwrap_or((&stem, 2));
+    for version in first..first.saturating_add(1000) {
+        let name = format!("{base} ({version}).mp4");
+        if !occupied(&path.with_file_name(&name)) { return name; }
+    }
+    format!("{base} {}.mp4", chrono::Local::now().format("%Y%m%d-%H%M%S"))
+}
+
 fn safe_name(name: &str) -> String {
     let name: String = name.chars().take(80).map(|c| {
         if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c }
@@ -1149,6 +1238,14 @@ mod workbench_tests {
         assert_eq!(parse_time("1:00:01.25"), Some(3601.25));
         assert_eq!(parse_time("1:60"), None);
         assert_eq!(parse_time("-3"), None);
+    }
+
+    #[test]
+    fn export_dialog_suggests_an_available_version() {
+        let occupied = |p: &Path| ["Game.mp4", "Game (2).mp4"].iter().any(|name| p.ends_with(name));
+        assert_eq!(suggest_output(Path::new("Game.mp4"), occupied), "Game (3).mp4");
+        assert_eq!(suggest_output(Path::new("Game (2).mp4"), occupied), "Game (3).mp4");
+        assert_eq!(suggest_output(Path::new("Fresh.mp4"), occupied), "Fresh.mp4");
     }
 
     #[test]

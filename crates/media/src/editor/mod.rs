@@ -427,7 +427,7 @@ pub fn render(project: &Project, destination: &Path, control: &RenderControl) ->
     let absolute = std::path::absolute(destination)?;
     ensure!(absolute.extension().and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4")), "Choose an MP4 filename for the export");
-    ensure!(!absolute.try_exists()?, "The export filename already exists");
+    ensure!(!absolute.try_exists()?, "This file already exists. Choose a new filename.");
     let parent = absolute.parent().context("Choose an export folder")?;
     let work = tempfile::Builder::new().prefix(".clipvault-editor-").tempdir_in(parent)?;
     let staged = work.path().join("render.mp4");
@@ -461,10 +461,35 @@ pub fn render(project: &Project, destination: &Path, control: &RenderControl) ->
     let to = HSTRING::from(absolute.as_os_str());
     let _commit = control.commit();
     control.check()?;
-    unsafe { MoveFileW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr())) }
-        .with_context(|| format!("Publish without replacing {}", absolute.display()))?;
+    if let Err(error) = unsafe { MoveFileW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr())) } {
+        if absolute.symlink_metadata().is_ok() { bail!("This file already exists. Choose a new filename."); }
+        return Err(error).with_context(|| format!("Publish without replacing {}", absolute.display()));
+    }
     control.progress.store(1.0f32.to_bits(), Ordering::Relaxed);
     Ok(())
+}
+
+fn black_frame(project: &Project, at: u64, width: u32, height: u32) -> Result<RgbaImage> {
+    let mut frame = RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 255]));
+    captions::draw_at(&mut frame, project, at)?;
+    Ok(frame)
+}
+
+// Older project documents can end a video shot at the longer AAC track boundary.
+fn past_source_picture(project: &Project, at: u64) -> bool {
+    let mut start = 0;
+    for shot in &project.shots {
+        let end = start + shot.range.len();
+        if at < end {
+            let Source::Asset(id) = shot.source else { return false; };
+            let Some(asset) = project.asset(id).filter(|asset| asset.info.kind == AssetKind::Video) else { return false; };
+            let source_time = shot.range.start + (at - start);
+            return crate::mp4::reader::Mp4Reader::open(&asset.path).ok()
+                .and_then(|reader| picture_duration(&reader)).is_some_and(|length| source_time >= length);
+        }
+        start = end;
+    }
+    true
 }
 
 /// Decode the nearest composed frame at the editor playhead on a media worker.
@@ -472,12 +497,13 @@ pub fn thumbnail(project: &Project, at: u64, width: u32, height: u32) -> Result<
     project.validate()?;
     ensure!(project.duration() > 0, "The editor timeline is empty");
     ensure!(width > 0 && height > 0 && width <= 4096 && height <= 4096, "Invalid preview size");
+    let frame_length = TICKS_PER_SECOND.div_ceil(u64::from(project.canvas.fps));
+    let at = at.min(project.duration().saturating_sub(frame_length));
+    if at >= project.visual_duration() { return black_frame(project, at, width, height); }
     let _apartment = Apartment::enter()?;
     let scratch = cv_core::paths::data_dir().join("editor-preview");
     fs::create_dir_all(&scratch)?;
     let work = tempfile::Builder::new().prefix("frame-").tempdir_in(scratch)?;
-    let frame_length = TICKS_PER_SECOND.div_ceil(u64::from(project.canvas.fps));
-    let at = at.min(project.duration().saturating_sub(frame_length));
     let window = Span {
         start: at.saturating_sub(TICKS_PER_SECOND / 2),
         end: at.saturating_add(TICKS_PER_SECOND / 2).min(project.duration()),
@@ -487,12 +513,17 @@ pub fn thumbnail(project: &Project, at: u64, width: u32, height: u32) -> Result<
     nearby.captions.clear();
     for shot in &mut nearby.shots { shot.audio_fade = None; }
     let composition = build(&nearby, work.path(), &RenderControl::default())?;
-    let image = composition.GetThumbnailAsync(
+    let requested = composition.GetThumbnailAsync(
         ticks(at - window.start)?,
         width as i32,
         height as i32,
         VideoFramePrecision::NearestFrame,
-    )?.get().context("Read the composed preview frame")?;
+    )?.get();
+    let image = match requested {
+        Ok(image) => image,
+        Err(_) if past_source_picture(project, at) => return black_frame(project, at, width, height),
+        Err(error) => return Err(error).context("Read the composed preview frame"),
+    };
     let size = u32::try_from(image.Size()?).context("Preview frame is too large")?;
     let reader = DataReader::CreateDataReader(&image.GetInputStreamAt(0)?)?;
     ensure!(reader.LoadAsync(size)?.get()? == size, "The preview frame is incomplete");

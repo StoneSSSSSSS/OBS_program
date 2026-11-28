@@ -17,6 +17,7 @@ pub(super) struct Inspector {
     revision: Option<u64>,
     properties: Option<Properties>,
     original: Option<Properties>,
+    validation_error: Option<String>,
     name: String,
     canvas: Option<Canvas>,
 }
@@ -31,13 +32,16 @@ impl Workbench {
             state.selection = None;
             state.properties = None;
             state.original = None;
+            state.validation_error = None;
         }
         if state.selection != self.selected {
             state.selection = self.selected;
             state.properties = self.selected.and_then(|selection| properties(&self.history.project, selection));
             state.original = state.properties.clone();
+            state.validation_error = None;
         }
 
+        if state.properties == state.original { state.validation_error = None; }
         let apply = ui.horizontal_wrapped(|ui| {
             ui.strong("Inspector");
             let label = if self.selected.is_some() { "Apply Changes" } else { "Apply Project Settings" };
@@ -48,6 +52,9 @@ impl Workbench {
             if pending { ui.label(theme::small("Unapplied edits")); }
             button.clicked()
         }).inner;
+        if let Some(error) = &state.validation_error {
+            ui.add(egui::Label::new(RichText::new(error).color(theme::DANGER)).wrap());
+        }
         egui::ScrollArea::vertical().id_salt("editor-inspector-fields")
             .max_height(ui.available_height()).show(ui, |ui| {
                 if let Some(selection) = self.selected {
@@ -65,7 +72,8 @@ impl Workbench {
             self.notice = None;
             if let (Some(selection), Some(values)) = (self.selected, state.properties.as_ref()) {
                 if state.original.as_ref() != Some(values) {
-                    self.apply_item(ui.ctx(), selection, values.clone());
+                    state.validation_error = self.apply_item(ui.ctx(), selection, values.clone())
+                        .err().map(|error| format!("{error:#}"));
                 }
             } else if self.selected.is_none() {
                 self.apply_project_settings(ui.ctx(), &state);
@@ -143,8 +151,7 @@ impl Workbench {
                 ui.label(RichText::new(format!("Timeline start {}", clock(at))).small().color(theme::TEXT_DIM));
                 let timed_video = matches!(source, Source::Asset(id) if project.asset(*id).is_some_and(|asset| asset.info.kind == AssetKind::Video));
                 if timed_video {
-                    time_field(ui, "Source In", input, limit);
-                    time_field(ui, "Source Out", output, limit);
+                    trim_fields(ui, input, output, limit);
                 } else {
                     let mut duration = *output - *input;
                     if time_field(ui, "Duration", &mut duration, limit - *input).changed() {
@@ -166,10 +173,10 @@ impl Workbench {
                 ui.add(egui::Label::new(filename(&asset.path)).truncate()).on_hover_text(asset.path.display().to_string());
                 time_field(ui, "Start on Timeline", at, seconds(i64::MAX as u64));
                 gain_field(ui, gain);
+                let limit = seconds(asset.info.duration);
+                trim_fields(ui, input, output, limit);
                 ui.label("Audio Lane");
                 role_picker(ui, "editor-sound-role", role);
-                time_field(ui, "Source In", input, seconds(asset.info.duration));
-                time_field(ui, "Source Out", output, seconds(asset.info.duration));
                 fade_fields(ui, fade, *output - *input);
             }
         }
@@ -179,8 +186,8 @@ impl Workbench {
         });
     }
 
-    fn apply_item(&mut self, ctx: &egui::Context, selection: Selection, values: Properties) {
-        self.change(ctx, |project| {
+    fn apply_item(&mut self, ctx: &egui::Context, selection: Selection, values: Properties) -> Result<()> {
+        self.history.edit(|project| {
             match (selection, values) {
                 (Selection::Shot(id), Properties::Shot { source, input, output, gain, fade, visual_transform }) => {
                     let shot = project.shots.iter_mut().find(|shot| shot.id == id).context("Select a video item")?;
@@ -199,7 +206,9 @@ impl Workbench {
                 _ => unreachable!(),
             }
             Ok(())
-        });
+        })?;
+        self.changed(ctx);
+        Ok(())
     }
 
     fn mark_trim(&mut self, selection: Selection, start: bool, ctx: &egui::Context) {
@@ -250,10 +259,23 @@ fn properties(project: &Project, selection: Selection) -> Option<Properties> {
 pub(super) fn time_field(ui: &mut Ui, label: &str, value: &mut f64, limit: f64) -> egui::Response {
     ui.horizontal_wrapped(|ui| {
         let text = ui.label(label);
-        ui.add(egui::DragValue::new(value).range(0.0..=limit).speed(0.02).max_decimals(7)
-            .suffix(" s").custom_parser(super::parse_time).update_while_editing(false)).labelled_by(text.id)
-            .on_hover_text("Click to type seconds or minutes:seconds. Ctrl+A replaces the value. Drag to adjust.")
+        time_value(ui, value, limit).labelled_by(text.id)
     }).inner
+}
+
+fn trim_fields(ui: &mut Ui, input: &mut f64, output: &mut f64, limit: f64) {
+    ui.columns(2, |columns| {
+        let start = columns[0].label("Source In");
+        time_value(&mut columns[0], input, limit).labelled_by(start.id);
+        let end = columns[1].label("Source Out");
+        time_value(&mut columns[1], output, limit).labelled_by(end.id);
+    });
+}
+
+fn time_value(ui: &mut Ui, value: &mut f64, limit: f64) -> egui::Response {
+    ui.add(egui::DragValue::new(value).range(0.0..=limit).speed(0.02).max_decimals(7)
+        .suffix(" s").custom_parser(super::parse_time).update_while_editing(false))
+        .on_hover_text("Click to type seconds or minutes:seconds. Ctrl+A replaces the value. Drag to adjust.")
 }
 
 fn fade_ticks(fade: Option<AudioFade>) -> [u64; 2] {
@@ -328,10 +350,17 @@ fn visual_transform_fields(ui: &mut Ui, transform: &mut VisualTransform) {
         }
     });
     if let Framing::Fill { horizontal, vertical } = &mut transform.framing {
-        ui.add(egui::Slider::new(horizontal, 0..=100).suffix("%").text("Horizontal Focus"))
-            .on_hover_text("0% left · 50% center · 100% right");
-        ui.add(egui::Slider::new(vertical, 0..=100).suffix("%").text("Vertical Focus"))
-            .on_hover_text("0% top · 50% center · 100% bottom");
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = (ui.available_width() - 62.0).clamp(30.0, 180.0);
+            for (label, value, hint) in [
+                ("Horizontal Focus", horizontal, "0% left · 50% center · 100% right"),
+                ("Vertical Focus", vertical, "0% top · 50% center · 100% bottom"),
+            ] {
+                let axis = ui.label(label);
+                ui.add(egui::Slider::new(value, 0..=100).suffix("%"))
+                    .labelled_by(axis.id).on_hover_text(hint);
+            }
+        });
     }
 }
 

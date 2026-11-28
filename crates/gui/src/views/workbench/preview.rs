@@ -422,7 +422,7 @@ impl Export {
         ensure_new(&destination)?;
         self.filename = super::filename(&destination);
         self.task = Some(Worker::spawn(ctx, "clipvault-editor-export", move |control| {
-            create_new(&destination, |staging| editor::render(&project, staging, control))?;
+            editor::render(&project, &destination, control)?;
             Ok(destination)
         }, false)?);
         Ok(())
