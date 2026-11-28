@@ -1,6 +1,9 @@
 //! Capturing the screen and sound.
 
+pub mod audio;
 pub mod display;
+pub mod hub;
+pub mod sessions;
 pub mod wgc;
 
 use crate::d3d::Gpu;
@@ -123,11 +126,58 @@ mod tests {
         let n = seen.iter().filter(|b| **b).count();
         eprintln!("{n} distinct luma values in a {w}x{h} capture");
         assert!(n > 4, "screen capture looks blank");
-        // Save a preview for a human look.
-        let mut img = image::GrayImage::new(w, h);
-        for (i, p) in img.pixels_mut().enumerate() {
-            p.0 = [nv[i]];
+    }
+
+    /// Plays a short quiet tone from a child PowerShell process and records
+    /// that process's audio on its own (per-app capture) plus the default mic.
+    #[test]
+    fn app_audio_capture() {
+        crate::mf::init();
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("tone.wav");
+        // 1.5 s, 440 Hz, quiet.
+        let n = 48_000 * 3 / 2;
+        let mut bytes = Vec::new();
+        let data_len = n * 4;
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for i in 0..n {
+            let v = (0.08 * (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 32767.0) as i16;
+            bytes.extend_from_slice(&v.to_le_bytes());
+            bytes.extend_from_slice(&v.to_le_bytes());
         }
-        let _ = img.save(std::env::temp_dir().join("cv_capture_test.png"));
+        std::fs::write(&wav, bytes).unwrap();
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("Start-Sleep -Milliseconds 700; (New-Object Media.SoundPlayer '{}').PlaySync(); Start-Sleep -Milliseconds 300", wav.display())])
+            .spawn()
+            .unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let app = audio::AudioSource::start(1, audio::SourceKind::App(child.id()), tx.clone());
+        let _mic = audio::AudioSource::start(2, audio::SourceKind::Mic(None), tx.clone());
+        let epoch = crate::clock::now_hns();
+        let mut hub = hub::Hub::new(epoch, 200);
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!app.failed(), "per-app capture failed to start");
+        while let Ok(c) = rx.try_recv() {
+            hub.push(c);
+        }
+        let blocks = hub.pull(crate::clock::now_hns());
+        let peak = |id: u32| blocks.iter().flat_map(|b| b.sources.iter().filter(|(s, _)| *s == id).flat_map(|(_, v)| v.iter())).fold(0.0f32, |m, v| m.max(v.abs()));
+        let loud_blocks = blocks.iter().filter(|b| b.sources.iter().any(|(s, v)| *s == 1 && v.iter().any(|x| x.abs() > 0.03))).count();
+        eprintln!("{} blocks; app peak {:.3} over {} blocks; mic peak {:.3}", blocks.len(), peak(1), loud_blocks, peak(2));
+        assert!(peak(1) > 0.04, "the app's tone was not captured");
+        // ~1.5 s of tone = ~150 blocks.
+        assert!((120..=170).contains(&loud_blocks), "tone length off: {loud_blocks} blocks");
     }
 }

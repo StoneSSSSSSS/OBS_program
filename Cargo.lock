@@ -649,6 +649,7 @@ name = "clipvault-media"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clipvault-core",
  "crossbeam-channel",
  "image",

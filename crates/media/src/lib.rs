@@ -7,7 +7,10 @@
 
 pub mod aac;
 pub mod capture;
+pub mod clock;
 pub mod d3d;
 pub mod h264;
 pub mod mf;
 pub mod mp4;
+pub mod recorder;
+pub mod util;

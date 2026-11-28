@@ -15,6 +15,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+chrono.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 image.workspace = true
@@ -41,6 +42,7 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media",
     "Win32_Media_MediaFoundation",
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
