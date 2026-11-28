@@ -426,7 +426,9 @@ impl Player {
                 self.seek_relative(-(cfg.seek_small_secs as f64));
             }
             let previous = ui.add_enabled(st.loaded, egui::Button::new("‹│")).on_hover_text(hint(cfg, Action::PreviousFrame, "Previous frame"));
-            crate::views::editor_layout::remember_interaction_rect(ui, "previous_frame", previous.rect);
+            if previous.enabled() {
+                crate::views::editor_layout::remember_interaction_rect(ui, "previous_frame", previous.rect);
+            }
             if previous.clicked() {
                 step = Some(false);
             }
@@ -436,7 +438,9 @@ impl Player {
                 self.toggle_pause();
             }
             let next = ui.add_enabled(st.loaded, egui::Button::new("│›")).on_hover_text(hint(cfg, Action::NextFrame, "Next frame"));
-            crate::views::editor_layout::remember_interaction_rect(ui, "next_frame", next.rect);
+            if next.enabled() {
+                crate::views::editor_layout::remember_interaction_rect(ui, "next_frame", next.rect);
+            }
             if next.clicked() {
                 step = Some(true);
             }

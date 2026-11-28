@@ -55,9 +55,16 @@ impl ShortcutCheck {
     }
 
     fn target(ctx: &Context, name: &'static str) -> Option<Pos2> {
-        ctx.data(|data| data.get_temp::<Rect>(Id::unique(("clipvault-interaction-target", name))))
-            .filter(|rect| rect.width() >= 5.0 && rect.height() >= 5.0)
-            .map(|rect| rect.center())
+        // The next pointer press is hit-tested against the widgets from this pass.
+        let pass = ctx.cumulative_pass_nr();
+        ctx.data(|data| {
+            if data.get_temp::<u64>(Id::unique(("clipvault-interaction-pass", name))) != Some(pass) {
+                return None;
+            }
+            data.get_temp::<Rect>(Id::unique(("clipvault-interaction-target", name)))
+        })
+        .filter(|rect| rect.width() >= 5.0 && rect.height() >= 5.0)
+        .map(|rect| rect.center())
     }
 
     fn click(&mut self, ctx: &Context, target: &'static str, next: Step) {
@@ -149,7 +156,6 @@ impl ShortcutCheck {
                 if persisted_latest().as_ref().is_some_and(|keys| keys[0] == "Y" && keys[1] == "X") {
                     ctx.set_zoom_factor(self.scale);
                     app.navigate(Page::Home);
-                    Self::clear_target(ctx, "shortcut_latest_primary");
                     self.next(Step::Reopen);
                 }
             }
@@ -170,7 +176,6 @@ impl ShortcutCheck {
             }
             Step::Recordings => {
                 if self.screenshot.load(Ordering::Acquire) {
-                    Self::clear_target(ctx, "jump_latest");
                     app.navigate(Page::Recordings);
                     self.next(Step::LastFrame);
                 }
@@ -228,8 +233,6 @@ impl ShortcutCheck {
             Step::OpenClip if self.screenshot.load(Ordering::Acquire) => {
                 let clip = app.c.db().and_then(|db| db.list_clips(&Default::default()).ok())
                     .and_then(|clips| clips.into_iter().next()).ok_or("Missing synthetic clip")?;
-                Self::clear_target(ctx, "shortcut_clip_title");
-                Self::clear_target(ctx, "next_frame");
                 app.navigate(Page::Clips);
                 crate::views::clips::request_open(clip.id);
                 self.next(Step::ClipStep);
@@ -279,12 +282,38 @@ impl ShortcutCheck {
         }
         Ok(false)
     }
-
-    fn clear_target(ctx: &Context, name: &'static str) {
-        ctx.data_mut(|data| data.remove::<Rect>(Id::unique(("clipvault-interaction-target", name))));
-    }
 }
 
 fn persisted_latest() -> Option<[String; 2]> {
     Config::load_or_default().player.hotkeys.get("jump_latest").cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{player::Player, views::editor_layout::remember_interaction_rect};
+
+    #[test]
+    fn shortcut_waits_for_an_enabled_frame_step_button_in_the_current_pass() {
+        let ctx = Context::default();
+        ctx.data_mut(|data| data.insert_temp(Id::unique("clipvault-interaction-check"), true));
+        let cfg = Config::default();
+        let mut player = Player::new(ctx.clone(), &cfg);
+        let mut check = ShortcutCheck { step: Step::ClipStep, ..Default::default() };
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let previous_target = ui.button("Next frame");
+            remember_interaction_rect(ui, "next_frame", previous_target.rect);
+            assert!(ShortcutCheck::target(&ctx, "next_frame").is_some());
+        });
+        output.textures_delta.clear();
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            player.transport(ui, "Opening clip", &cfg.player);
+            check.click(&ctx, "next_frame", Step::ClipFocus);
+            assert!(check.pending.is_empty());
+            assert!(matches!(check.step, Step::ClipStep));
+        });
+        output.textures_delta.clear();
+    }
 }
