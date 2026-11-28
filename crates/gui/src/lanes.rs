@@ -341,7 +341,7 @@ pub fn lanes(
         }
         let undo_clicked = ui.add_enabled(can_undo, egui::Button::new("Undo audio change")).clicked();
         let undo_shortcut = can_undo && !ui.ctx().egui_wants_keyboard_input()
-            && ui.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z));
+            && ui.input(|i| i.modifiers.command && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(egui::Key::Z));
         if undo_clicked || undo_shortcut {
             st.sel = None;
             actions.push(LaneAction::Undo);

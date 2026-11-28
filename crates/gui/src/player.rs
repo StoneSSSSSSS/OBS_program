@@ -1,4 +1,6 @@
 //! Playback surface shared by the recording timeline and clip editor.
+pub(crate) mod shortcuts;
+
 use crate::native_player::{NativePlayer, PreviewMix};
 use crate::theme::{self, icon};
 use cv_core::config::{Config, PlayerConfig};
@@ -7,17 +9,21 @@ use cv_core::mixer::{self, LaneGain, MixSettings, TrackSource};
 use cv_core::model::AudioEdit;
 use cv_core::util::format_duration;
 use cv_media::probe::{self, MediaInfo, TrackRole};
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Key, Rect, RichText, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[derive(Default)]
 pub struct PlayState {
     pub time_pos: f64,
     pub duration: f64,
     pub speed: f64,
     pub paused: bool,
     pub eof: bool,
+    pub first_frame: bool,
+    pub last_frame: bool,
+    pub next_frame_pos: Option<f64>,
     pub loaded: bool,
 }
 
@@ -85,6 +91,9 @@ impl Player {
             speed: self.speed,
             paused: s.paused,
             eof: s.ended,
+            first_frame: s.first_frame,
+            last_frame: s.last_frame,
+            next_frame_pos: s.next_frame_pos,
             loaded: s.loaded,
         }
     }
@@ -284,9 +293,13 @@ impl Player {
         self.seek((s.time_pos + delta).clamp(0.0, s.duration.max(0.0)), true);
     }
     pub fn frame_step(&mut self, forward: bool) {
-        self.set_paused(true);
-        let fps = self.info.as_ref().map_or(30.0, |i| i.fps.max(1.0));
-        self.seek_relative(if forward { 1.0 / fps } else { -1.0 / fps });
+        self.native.step(forward);
+        self.last_seek = Instant::now();
+    }
+
+    pub fn seek_latest(&mut self) {
+        self.native.seek_latest();
+        self.last_seek = Instant::now();
     }
     pub fn video(&mut self, ui: &mut Ui, size: Vec2) -> egui::Response {
         let size = size.max(Vec2::ZERO).min(ui.available_size().max(Vec2::ZERO));
@@ -300,7 +313,7 @@ impl Player {
         if self.path.is_some() {
             if let Some(frame) = self.native.frame() {
                 if self.serial != Some(frame.serial) {
-                    let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
+                    let image = egui::ColorImage::from_rgba_premultiplied([frame.width, frame.height], &frame.rgba);
                     if let Some(tex) = &mut self.texture {
                         tex.set(image, egui::TextureOptions::LINEAR);
                     } else {
@@ -314,6 +327,7 @@ impl Player {
             let size = tex.size_vec2();
             let scale = (rect.width() / size.x).min(rect.height() / size.y);
             let dest = Rect::from_center_size(rect.center(), size * scale);
+            crate::views::editor_layout::remember_interaction_rect(ui, "preview_picture", dest);
             painter.image(tex.id(), dest, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
         let message = if self.path.is_none() {
@@ -348,58 +362,36 @@ impl Player {
     }
     /// Keyboard shortcuts (only when no text field has focus).
     pub fn shortcuts(&mut self, ui: &Ui, cfg: &PlayerConfig) -> ShortcutHits {
+        use shortcuts::Action;
+
         let mut hits = ShortcutHits::default();
-        if ui.ctx().egui_wants_keyboard_input() || self.path.is_none() {
-            return hits;
+        let small = f64::from(cfg.seek_small_secs);
+        let large = f64::from(cfg.seek_large_secs);
+        for action in shortcuts::actions(ui, cfg) {
+            match action {
+                Action::JumpLatest => hits.jump_latest = true,
+                Action::BackOrExit => hits.escape = true,
+                _ if self.path.is_none() => continue,
+                Action::Play => hits.toggle = true,
+                Action::Back => hits.seek = Some(-small),
+                Action::Forward => hits.seek = Some(small),
+                Action::BackLong => hits.seek = Some(-large),
+                Action::ForwardLong => hits.seek = Some(large),
+                Action::PreviousFrame => hits.frame_step = Some(false),
+                Action::NextFrame => hits.frame_step = Some(true),
+                Action::MarkStart => hits.mark_in = true,
+                Action::MarkEnd => hits.mark_out = true,
+                Action::VolumeUp => hits.volume = Some(0.05),
+                Action::VolumeDown => hits.volume = Some(-0.05),
+                Action::Mute => hits.mute = true,
+                Action::Fullscreen => hits.fullscreen = true,
+            }
         }
-        let (small, large) = (cfg.seek_small_secs as f64, cfg.seek_large_secs as f64);
-        ui.input(|i| {
-            let shift = i.modifiers.shift;
-            if i.key_pressed(Key::Space) || i.key_pressed(Key::K) {
-                hits.toggle = true;
-            }
-            if i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::J) {
-                hits.seek = Some(-(if shift { large } else { small }));
-            }
-            if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::L) {
-                hits.seek = Some(if shift { large } else { small });
-            }
-            if i.key_pressed(Key::Comma) {
-                hits.frame = Some(false);
-            }
-            if i.key_pressed(Key::Period) {
-                hits.frame = Some(true);
-            }
-            if i.key_pressed(Key::I) {
-                hits.mark_in = true;
-            }
-            if i.key_pressed(Key::O) {
-                hits.mark_out = true;
-            }
-            if i.key_pressed(Key::M) {
-                hits.mute = true;
-            }
-            if i.key_pressed(Key::F) {
-                hits.fullscreen = true;
-            }
-            if i.key_pressed(Key::Escape) {
-                hits.escape = true;
-            }
-            if i.key_pressed(Key::ArrowUp) {
-                hits.volume = Some(0.05);
-            }
-            if i.key_pressed(Key::ArrowDown) {
-                hits.volume = Some(-0.05);
-            }
-        });
         if hits.toggle {
             self.toggle_pause();
         }
         if let Some(d) = hits.seek {
             self.seek_relative(d);
-        }
-        if let Some(f) = hits.frame {
-            self.frame_step(f);
         }
         if hits.mute {
             self.muted = !self.muted;
@@ -417,26 +409,41 @@ impl Player {
     }
 
     /// Play/pause, skip buttons, time, speed, volume, mixer toggle.
-    pub fn transport(&mut self, ui: &mut Ui, time_label: &str, cfg: &PlayerConfig) -> egui::Response {
+    pub fn transport(
+        &mut self, ui: &mut Ui, time_label: &str, cfg: &PlayerConfig,
+    ) -> (egui::Response, Option<bool>) {
+        use shortcuts::{hint, Action};
+
+        let mut step = None;
         let st = self.state();
         let compact = ui.available_width() < crate::views::editor_layout::SINGLE_TRANSPORT_ROW_WIDTH;
         let play = ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if theme::icon_button(ui, icon::REWIND, 16.0, &format!("Back {}s (Shift+←)", cfg.seek_large_secs)).clicked() {
+            if theme::icon_button(ui, icon::REWIND, 16.0, &hint(cfg, Action::BackLong, &format!("Back {}s", cfg.seek_large_secs))).clicked() {
                 self.seek_relative(-(cfg.seek_large_secs as f64));
             }
-            if theme::icon_button(ui, icon::SKIP_BACK, 16.0, &format!("Back {}s (←)", cfg.seek_small_secs)).clicked() {
+            if theme::icon_button(ui, icon::SKIP_BACK, 16.0, &hint(cfg, Action::Back, &format!("Back {}s", cfg.seek_small_secs))).clicked() {
                 self.seek_relative(-(cfg.seek_small_secs as f64));
             }
+            let previous = ui.add_enabled(st.loaded, egui::Button::new("‹│")).on_hover_text(hint(cfg, Action::PreviousFrame, "Previous frame"));
+            crate::views::editor_layout::remember_interaction_rect(ui, "previous_frame", previous.rect);
+            if previous.clicked() {
+                step = Some(false);
+            }
             let play_glyph = if st.paused || !st.loaded { icon::PLAY } else { icon::PAUSE };
-            let play = theme::icon_button(ui, play_glyph, 20.0, "Play/pause (Space)");
+            let play = theme::icon_button(ui, play_glyph, 20.0, &hint(cfg, Action::Play, "Play / pause"));
             if play.clicked() {
                 self.toggle_pause();
             }
-            if theme::icon_button(ui, icon::SKIP_FWD, 16.0, &format!("Forward {}s (→)", cfg.seek_small_secs)).clicked() {
+            let next = ui.add_enabled(st.loaded, egui::Button::new("│›")).on_hover_text(hint(cfg, Action::NextFrame, "Next frame"));
+            crate::views::editor_layout::remember_interaction_rect(ui, "next_frame", next.rect);
+            if next.clicked() {
+                step = Some(true);
+            }
+            if theme::icon_button(ui, icon::SKIP_FWD, 16.0, &hint(cfg, Action::Forward, &format!("Forward {}s", cfg.seek_small_secs))).clicked() {
                 self.seek_relative(cfg.seek_small_secs as f64);
             }
-            if theme::icon_button(ui, icon::FAST_FWD, 16.0, &format!("Forward {}s (Shift+→)", cfg.seek_large_secs)).clicked() {
+            if theme::icon_button(ui, icon::FAST_FWD, 16.0, &hint(cfg, Action::ForwardLong, &format!("Forward {}s", cfg.seek_large_secs))).clicked() {
                 self.seek_relative(cfg.seek_large_secs as f64);
             }
             ui.add_space(8.0);
@@ -444,20 +451,21 @@ impl Player {
                 .on_hover_text(time_label);
 
             if !compact {
-                self.transport_options(ui, st.speed);
+                self.transport_options(ui, st.speed, cfg);
             }
             play
         }).inner;
         if compact {
-            ui.horizontal_wrapped(|ui| self.transport_options(ui, st.speed));
+            ui.horizontal_wrapped(|ui| self.transport_options(ui, st.speed, cfg));
         }
-        play
+        (play, step)
     }
 
-    fn transport_options(&mut self, ui: &mut Ui, speed: f64) {
+    fn transport_options(&mut self, ui: &mut Ui, speed: f64, cfg: &PlayerConfig) {
+        use shortcuts::{hint, Action};
         ui.spacing_mut().item_spacing.x = 6.0;
         let fs_glyph = if self.fullscreen { icon::EXIT_FULLSCREEN } else { icon::FULLSCREEN };
-        if theme::icon_button(ui, fs_glyph, 15.0, "Fullscreen (F)").clicked() {
+        if theme::icon_button(ui, fs_glyph, 15.0, &hint(cfg, Action::Fullscreen, "Fullscreen")).clicked() {
             self.fullscreen = !self.fullscreen;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
@@ -500,7 +508,7 @@ impl Player {
             self.apply_volume();
         }
         let vglyph = if self.muted || self.volume == 0.0 { icon::MUTE } else { icon::VOLUME };
-        if theme::icon_button(ui, vglyph, 15.0, "Mute (M)").clicked() {
+        if theme::icon_button(ui, vglyph, 15.0, &hint(cfg, Action::Mute, "Mute")).clicked() {
             self.muted = !self.muted;
             self.apply_volume();
         }
@@ -511,7 +519,8 @@ impl Player {
 pub struct ShortcutHits {
     pub toggle: bool,
     pub seek: Option<f64>,
-    pub frame: Option<bool>,
+    pub frame_step: Option<bool>,
+    pub jump_latest: bool,
     pub mark_in: bool,
     pub mark_out: bool,
     pub mute: bool,

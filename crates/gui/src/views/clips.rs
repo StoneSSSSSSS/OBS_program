@@ -68,6 +68,7 @@ struct Detail {
 
 #[derive(Default)]
 pub struct ClipsView {
+    preview_size: editor_layout::PreviewSize,
     filter: Filter,
     search: String,
     sort: ClipSort,
@@ -88,6 +89,17 @@ pub struct ClipsView {
 }
 
 impl ClipsView {
+    pub(crate) fn qa_open_library(&mut self, c: &mut Ctx) {
+        if self.open.is_some() {
+            self.close_clip(c);
+        }
+        self.mark_dirty();
+    }
+
+    pub(crate) fn qa_category_selected(&self, id: i64) -> bool {
+        self.filter == Filter::Category(id) && !self.dirty
+    }
+
     pub(crate) fn show_compact_inspector(&mut self) {
         self.detail.compact_inspector = true;
     }
@@ -248,26 +260,28 @@ impl ClipsView {
             ui.menu_button("Filters", |ui| self.filters_ui(ui, c));
         }
 
+        library_title(ui, &self.filter_title(), self.clips.len());
         ui.horizontal_wrapped(|ui| {
-            ui.add(egui::Label::new(theme::heading(self.filter_title())).truncate());
-            ui.label(theme::label_dim(format!("{} clip{}", self.clips.len(), if self.clips.len() == 1 { "" } else { "s" })));
             let before = self.sort;
-            egui::ComboBox::from_id_salt("sort").selected_text(self.sort.label()).show_ui(ui, |ui| {
+            let sort = egui::ComboBox::from_id_salt("sort").selected_text(self.sort.label()).width(134.0).show_ui(ui, |ui| {
                 for s in ClipSort::ALL {
                     ui.selectable_value(&mut self.sort, s, s.label());
                 }
             });
+            record_category_anchor(ui, "sort", sort.response.rect);
             if self.sort != before {
                 self.dirty = true;
             }
-            ui.add(egui::Slider::new(&mut self.card_w, 180.0..=420.0).show_value(false)).on_hover_text("Card size");
+            let size = ui.add(egui::Slider::new(&mut self.card_w, 180.0..=420.0).show_value(false)).on_hover_text("Card size");
+            record_category_anchor(ui, "card-size", size.rect);
         });
         ui.horizontal(|ui| {
             ui.label(theme::icon_text(icon::SEARCH, 14.0).color(theme::TEXT_FAINT));
-            ui.add(egui::TextEdit::singleline(&mut self.search)
+            let search = ui.add(egui::TextEdit::singleline(&mut self.search)
                 .hint_text("Search clips, games, categories…")
                 .desired_width(ui.available_width().min(330.0).max(1.0))
                 .clip_text(true));
+            record_category_anchor(ui, "search", search.rect);
         });
         ui.add_space(8.0);
 
@@ -392,6 +406,7 @@ impl ClipsView {
                 }
                 let f = Filter::Category(cat.id);
                 let resp = filter_row(ui, self.filter == f, icon::TAG, &cat.name, Some(cat.clip_count), c.accent);
+                record_category_anchor(ui, cat.id, resp.rect.intersect(ui.clip_rect()));
                 if resp.clicked() {
                     self.filter = f.clone();
                     self.dirty = true;
@@ -671,6 +686,14 @@ impl ClipsView {
             return;
         };
         let hits = c.player.shortcuts(ui, &c.cfg.player);
+        if let Some(forward) = hits.frame_step {
+            self.stop_preview(c);
+            c.player.frame_step(forward);
+        }
+        if hits.jump_latest {
+            self.stop_preview(c);
+            c.player.seek_latest();
+        }
         let st = c.player.state();
         let duration = self.media_duration(c, &clip);
         if hits.mark_in {
@@ -737,7 +760,7 @@ impl ClipsView {
             return;
         }
 
-        let compact = ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
+        let compact = self.preview_size.watching() || ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
         if compact {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.detail.compact_inspector, false, "Player");
@@ -753,7 +776,10 @@ impl ClipsView {
         let width = ui.available_width();
         let side_width = (!compact).then(|| (width * 0.31).clamp(265.0, 340.0));
         let controls_height = if c.player.show_mixer { 330.0 } else { 42.0 };
-        let layout = EditorLayout::new(ui, side_width, controls_height, false);
+        let layout = EditorLayout::with_preview(ui, side_width, controls_height, false, Some(&self.preview_size));
+        if self.preview_size.handle(ui, "clip_preview_handle", &layout) {
+            self.detail.compact_inspector = false;
+        }
         if let Some(mut inspector) = layout.inspector {
             inspector.min.x += 18.0;
             editor_layout::region(ui, "clip_side", inspector, |ui| self.clip_inspector(ui, c, &clip));
@@ -761,7 +787,10 @@ impl ClipsView {
         editor_layout::region(ui, "clip_transport", layout.transport, |ui| {
             editor_layout::controls(ui, "clip_transport_scroll", |ui| {
                 let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
-                c.player.transport(ui, &label, &c.cfg.player);
+                if let (_, Some(forward)) = c.player.transport(ui, &label, &c.cfg.player) {
+                    self.stop_preview(c);
+                    c.player.frame_step(forward);
+                }
             });
         });
         editor_layout::region(ui, "clip_controls", layout.timeline, |ui| {
@@ -924,7 +953,10 @@ impl ClipsView {
         editor_layout::region(ui, "clip_fs_transport", layout.transport, |ui| {
             editor_layout::controls(ui, "clip_fs_transport_scroll", |ui| {
                 let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
-                c.player.transport(ui, &label, &c.cfg.player);
+                if let (_, Some(forward)) = c.player.transport(ui, &label, &c.cfg.player) {
+                    self.stop_preview(c);
+                    c.player.frame_step(forward);
+                }
             });
         });
         editor_layout::region(ui, "clip_fs_seek", layout.timeline, |ui| {
@@ -945,11 +977,11 @@ impl ClipsView {
             let pos = c.player.state().time_pos;
             let duration = self.media_duration(c, clip);
             ui.horizontal_wrapped(|ui| {
-                if ui.button(format!("Set start  {}", self.detail.in_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text("Start here (I)").clicked() {
+                if ui.button(format!("Set start  {}", self.detail.in_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text(crate::player::shortcuts::hint(&c.cfg.player, crate::player::shortcuts::Action::MarkStart, "Start here")).clicked() {
                     self.stop_preview(c);
                     c.report_mark(self.mark_in(pos, duration));
                 }
-                if ui.button(format!("Set end  {}", self.detail.out_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text("End here (O)").clicked() {
+                if ui.button(format!("Set end  {}", self.detail.out_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text(crate::player::shortcuts::hint(&c.cfg.player, crate::player::shortcuts::Action::MarkEnd, "End here")).clicked() {
                     self.stop_preview(c);
                     c.report_mark(self.mark_out(pos, duration));
                 }
@@ -1202,6 +1234,52 @@ enum CardAction {
     Toggle,
 }
 
+pub(crate) const QA_CATEGORY_CHECK: &str = "clipvault-qa-category-check";
+
+pub(crate) fn qa_category_anchor(name: impl std::hash::Hash + std::fmt::Debug) -> egui::Id {
+    egui::Id::unique((QA_CATEGORY_CHECK, name))
+}
+
+fn record_category_anchor(ui: &Ui, name: impl std::hash::Hash + std::fmt::Debug, rect: Rect) {
+    if ui.ctx().data(|data| data.get_temp::<bool>(egui::Id::unique(QA_CATEGORY_CHECK))).unwrap_or(false) {
+        ui.ctx().data_mut(|data| data.insert_temp(qa_category_anchor(name), rect));
+    }
+}
+
+fn library_title(ui: &mut Ui, title: &str, count: usize) {
+    let width = ui.available_width();
+    let font = FontId::new(28.0, theme::bold());
+    let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+    let rows = if width < 650.0 { 2 } else { 1 };
+    let height = row_height * rows as f32;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    record_category_anchor(ui, "title", rect);
+    let count_width = 96.0_f32.min(width * 0.3);
+    let title_width = (width - count_width - 10.0).max(1.0);
+    let mut job = egui::text::LayoutJob::simple(title.to_owned(), font, theme::TEXT, title_width);
+    job.wrap.max_rows = rows;
+    let painter = ui.painter();
+    let title_galley = painter.layout_job(job);
+    let title_rect = Rect::from_min_size(rect.min, Vec2::new(title_width, height));
+    painter.with_clip_rect(title_rect).galley(
+        rect.left_top(),
+        title_galley,
+        theme::TEXT,
+    );
+    painter.text(
+        egui::pos2(rect.right(), rect.top() + row_height / 2.0),
+        Align2::RIGHT_CENTER,
+        format!("{count} clip{}", if count == 1 { "" } else { "s" }),
+        FontId::proportional(13.5),
+        theme::TEXT_DIM,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, ui.is_enabled(), title));
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(420.0);
+        ui.add(egui::Label::new(title).wrap());
+    });
+}
+
 fn filter_row(ui: &mut Ui, selected: bool, glyph: &str, label: &str, count: Option<i64>, accent: Color32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
     let bg = if selected {
@@ -1212,14 +1290,31 @@ fn filter_row(ui: &mut Ui, selected: bool, glyph: &str, label: &str, count: Opti
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, label));
+    if resp.has_focus() {
+        ui.painter().rect_stroke(rect, 8.0, Stroke::new(1.5, theme::TEXT), egui::StrokeKind::Inside);
+    }
     let fg = if selected { theme::TEXT } else { theme::TEXT_DIM };
     let gcolor = if selected { accent } else { theme::TEXT_FAINT };
     ui.painter().text(rect.left_center() + egui::vec2(16.0, 0.0), Align2::CENTER_CENTER, glyph, FontId::new(13.0, theme::icons_family()), gcolor);
-    ui.painter().text(rect.left_center() + egui::vec2(34.0, 0.0), Align2::LEFT_CENTER, truncate(label, 24), FontId::proportional(13.5), fg);
+    let count_font = FontId::proportional(12.0);
+    let right = rect.right() - 10.0;
+    let label_left = rect.left() + 34.0;
+    let mut label_right = right;
     if let Some(n) = count {
-        ui.painter().text(rect.right_center() - egui::vec2(10.0, 0.0), Align2::RIGHT_CENTER, n.to_string(), FontId::proportional(12.0), theme::TEXT_FAINT);
+        let count = ui.painter().layout_no_wrap(n.to_string(), count_font, theme::TEXT_FAINT);
+        label_right -= count.size().x + 7.0;
+        ui.painter().galley(egui::pos2(right - count.size().x, rect.center().y - count.size().y / 2.0), count, theme::TEXT_FAINT);
     }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    let width = (label_right - label_left).max(1.0);
+    let mut job = egui::text::LayoutJob::simple(label.to_owned(), FontId::proportional(13.5), fg, width);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(egui::pos2(label_left, rect.center().y - galley.size().y / 2.0), galley, fg);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_ui(|ui| {
+        ui.set_max_width(420.0);
+        ui.add(egui::Label::new(label).wrap());
+    })
 }
 
 pub fn jobs_list(ui: &mut Ui, c: &mut Ctx) {
@@ -1346,6 +1441,44 @@ pub fn set_repaint_ctx(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_category_changes_keep_neighboring_geometry_fixed() {
+        for width in [360.0, 620.0, 900.0] {
+            let ctx = egui::Context::default();
+            let mut background = None;
+            for (caption, count) in [
+                ("All clips", 98),
+                ("Favorites", 1),
+                ("A long category assigned to multiple recordings in the shared team library", 14_376),
+                ("AnUnbrokenCategoryNameWithManyWideLettersAndNoSpacesAtAll", 0),
+                ("All clips", 98),
+            ] {
+                let mut bounds = None;
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 420.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        library_title(ui, caption, count);
+                        let sort = egui::ComboBox::from_id_salt("sort")
+                            .selected_text(ClipSort::Newest.label())
+                            .width(134.0)
+                            .show_ui(ui, |_| {});
+                        let mut search = String::new();
+                        let search = ui.add(egui::TextEdit::singleline(&mut search));
+                        let row = filter_row(ui, true, icon::TAG, caption, Some(count as i64), theme::TEXT);
+                        bounds = Some((sort.response.rect, search.rect, row.rect));
+                    },
+                );
+                let bounds = bounds.unwrap();
+                assert!(bounds.2.right() <= width, "{caption}: {:?}", bounds.2);
+                assert_eq!(bounds, *background.get_or_insert(bounds), "{caption} shifted layout at {width}");
+                assert!(!output.shapes.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn clip_export_results_require_an_explicit_matching_source() {

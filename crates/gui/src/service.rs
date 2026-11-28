@@ -35,6 +35,17 @@ pub struct Service {
 }
 
 impl Service {
+    #[cfg(test)]
+    pub(crate) fn disconnected_for_test() -> Self {
+        let (toast_tx, events) = crossbeam_channel::unbounded();
+        Self {
+            toast_tx,
+            shared: Arc::new(Mutex::new(Shared::default())),
+            client: Arc::new(Mutex::new(None)),
+            events,
+        }
+    }
+
     pub fn start(ctx: egui::Context) -> Service {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let client: Arc<Mutex<Option<Arc<IpcClient>>>> = Arc::new(Mutex::new(None));

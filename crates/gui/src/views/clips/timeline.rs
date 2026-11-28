@@ -114,6 +114,7 @@ impl ClipsView {
             let align = if i == 0 { Align2::LEFT_TOP } else if i == intervals { Align2::RIGHT_TOP } else { Align2::CENTER_TOP };
             p.text(Pos2::new(x, rect.top() + 2.0), align, format_duration_precise(at), FontId::monospace(10.0), theme::TEXT_DIM);
         }
+        let mut hover_handle = false;
         for (mark, label) in [(self.detail.in_pt, "Start"), (self.detail.out_pt, "End")] {
             if let Some(at) = mark.filter(|at| (start..=end).contains(at)) {
                 let x = x_of(at);
@@ -121,7 +122,9 @@ impl ClipsView {
                     [Pos2::new(x, rect.top() + 13.0), Pos2::new(x, rect.bottom())],
                     Stroke::new(2.0, c.accent),
                 );
-                p.text(Pos2::new(x + 3.0, rect.bottom()), Align2::LEFT_BOTTOM, label,
+                p.circle_filled(Pos2::new(x, rect.top() + 19.0), 4.0, c.accent);
+                hover_handle |= response.hover_pos().is_some_and(|pos| (pos.x - x).abs() <= 6.0);
+                p.text(Pos2::new(x + 5.0, rect.bottom()), Align2::LEFT_BOTTOM, label,
                     FontId::monospace(10.0), theme::TEXT);
             }
         }
@@ -188,6 +191,9 @@ impl ClipsView {
                     self.detail.timeline.drag = None;
                 }
             }
+        }
+        if hover_handle {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
         let view = &mut self.detail.timeline.view;
         if response.double_clicked() {

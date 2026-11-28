@@ -290,6 +290,86 @@ fn wait_for(player: &NativePlayer, condition: impl Fn(&NativeState, Option<&Vide
     }
 }
 
+pub(super) static WORKER_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[test]
+#[ignore = "Measures native player resources with a project-local synthetic file"]
+fn measure_player_resources() -> Result<()> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    fn sample() -> Result<(f64, usize, u64)> {
+        let (mut created, mut exit, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let mut mem = PROCESS_MEMORY_COUNTERS::default();
+        let size = std::mem::size_of_val(&mem) as u32;
+        unsafe {
+            let process = GetCurrentProcess();
+            GetProcessTimes(process, &mut created, &mut exit, &mut kernel, &mut user)?;
+            GetProcessMemoryInfo(process, &mut mem, size)?;
+        }
+        let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        Ok(((ticks(kernel) + ticks(user)) as f64 / 10_000_000.0, mem.WorkingSetSize, WORKER_TICKS.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+    let path = PathBuf::from(std::env::var_os("CLIPVAULT_TEST_FIXTURE").context("synthetic fixture required")?);
+    let player = NativePlayer::new(egui::Context::default());
+    player.set_volume(0.0);
+    player.load(path, 0.0, false, true);
+    wait_for(&player, |s, f| s.loaded && f.is_some());
+    for (name, playing) in [("paused", false), ("playing", true), ("paused after playback", false)] {
+        player.set_paused(!playing);
+        wait_for(&player, |s, _| s.paused != playing);
+        let before_frame = player.frame().unwrap().serial;
+        let before = sample()?;
+        let then = Instant::now();
+        std::thread::sleep(Duration::from_secs(5));
+        let after = sample()?;
+        let seconds = then.elapsed().as_secs_f64();
+        let frames = player.frame().unwrap().serial - before_frame;
+        println!("{name}: {:.2}% of one CPU core, {:.1} MiB resident, {} worker ticks, {frames} new frames in {seconds:.2}s",
+            (after.0 - before.0) * 100.0 / seconds, after.1 as f64 / 1048576.0, after.2 - before.2);
+        if playing { assert!(frames > 90 && player.state().position > 4.5); } else { assert_eq!(frames, 0); }
+    }
+    Ok(())
+}
+
+#[test]
+fn frame_steps_follow_visible_variable_rate_frames_and_clamp_at_trim() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("variable-rate.mp4");
+    let fixture = Fixture::make()?;
+    let mut file = FlatWriter::new(&path, &fixture.tracks[..1], 0)?;
+    for (i, frame) in fixture.video.iter().take(12).enumerate() {
+        // Pausing at any time inside the long frame must step to its neighbor.
+        file.add(0, &SampleRef { data: &frame.data, duration: if i == 4 { 14_400 } else { 3600 }, sync: frame.idr, cts: 0 })?;
+    }
+    // Frame 1 is partially visible at time zero. Frames 0 and 11 are outside the edit.
+    file.set_edit(0, 4_500, 45_900);
+    file.finish(&path, None)?;
+    let player = NativePlayer::new(egui::Context::default());
+    player.load(path, 0.20, false, true);
+    let shown = |index: usize| wait_for(&player, |s, f| s.paused && f.is_some_and(|f| displayed_frame(f) == index));
+    shown(4);
+    player.step(true);
+    let stepped = shown(5);
+    assert!((stepped.position - 0.27).abs() < 0.0001);
+    for _ in 0..4 { player.step(false); }
+    assert!(shown(1).first_frame);
+    player.step(false);
+    player.step(true);
+    shown(2);
+    player.seek_latest();
+    assert!(shown(10).last_frame);
+    player.seek(0.509, true);
+    player.step(false);
+    shown(9);
+    player.seek_latest();
+    assert!(shown(10).last_frame);
+    player.step(true);
+    player.step(false);
+    shown(9);
+    Ok(())
+}
+
 #[test]
 fn converts_nv12_directly_to_rgba() {
     let frame = DecodedFrame { pts_hns: 0, width: 4, height: 2,

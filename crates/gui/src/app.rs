@@ -417,6 +417,12 @@ pub fn status_block(ui: &mut Ui, connected: bool, status: Option<&cv_core::ipc::
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        if let Some(sweep) = &mut self.resize_check {
+            sweep.inject_input(input);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.titlebar_done < 3 {

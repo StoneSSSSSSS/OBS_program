@@ -5,12 +5,13 @@
 use super::editor_layout::{self, EditorLayout};
 use crate::app::Ctx;
 use crate::lanes::{self, LaneAction, LaneState, PreviewProgress, RangePreview, WaveSource};
+use crate::player::shortcuts::{hint, Action};
 use crate::theme::{self, icon};
 use chrono::{Local, TimeZone};
 use cv_core::ipc::{ExportSource, Request};
 use cv_core::mixer::MixSettings;
 use cv_core::model::{apply_edit, rebase_edits, ActivitySpan, AudioEdit, Category, Clip, Game, Marker, Recording};
-use cv_core::timeline::{locate, plan_cut, plan_duration_s, Segment};
+use cv_core::timeline::{coverage, locate, plan_cut, plan_duration_s, Segment};
 use cv_core::util::{format_duration, format_duration_precise, human_bytes, now_ms};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::path::PathBuf;
@@ -70,6 +71,8 @@ struct CutDialog {
 
 #[derive(Clone, Copy, PartialEq)]
 enum DragMode {
+    TrimStart,
+    TrimEnd,
     Scrub,
     Pan,
 }
@@ -87,6 +90,7 @@ pub struct RecordingsView {
     view_end: i64,
     view_span: i64,
     follow_live: bool,
+    live_playback: Option<(String, i64)>,
     cur: Option<usize>,
     cur_path: Option<String>,
     in_ms: Option<i64>,
@@ -115,12 +119,13 @@ pub struct RecordingsView {
     /// Playhead when the player was last showing our file.
     resume_ms: Option<i64>,
     compact_files: bool,
+    preview_size: editor_layout::PreviewSize,
 }
 
 pub(super) fn timeline_help(ui: &mut Ui) -> egui::Response {
     ui.add(
         egui::Label::new(theme::label_dim(
-            "Click to seek. Use I and O to mark start and end.",
+            "Click to seek. Drag the trim handles to adjust the range.",
         ))
         .wrap(),
     )
@@ -135,6 +140,10 @@ fn edits_file() -> PathBuf {
 }
 
 impl RecordingsView {
+    pub(crate) fn qa_shortcut_query(&self) -> &str {
+        &self.footage_search
+    }
+
     pub(crate) fn qa_mark_trim(&mut self) -> bool {
         if self.selection().is_some() {
             return true;
@@ -149,6 +158,14 @@ impl RecordingsView {
         self.selection().is_some()
     }
 
+    pub(crate) fn qa_live_ready(&self) -> bool {
+        self.playable_live().is_some()
+    }
+
+    pub(crate) fn qa_trim_marks(&self) -> Option<(i64, i64)> {
+        self.selection()
+    }
+
     pub(crate) fn show_compact_files(&mut self) {
         self.compact_files = true;
     }
@@ -158,16 +175,20 @@ impl RecordingsView {
     }
 
     fn refresh(&mut self, c: &mut Ctx) {
-        self.written_live = c.service.status().and_then(|s| {
+        let written_live = c.service.status().and_then(|s| {
             (s.recording.active && s.recording.written_until_ms > 0)
                 .then_some((s.recording.path, s.recording.written_until_ms))
         });
+        self.dirty |= self.written_live.as_ref().map(|(path, _)| path)
+            != written_live.as_ref().map(|(path, _)| path);
+        self.written_live = written_live;
         let stale = self.loaded.map(|t| t.elapsed() > Duration::from_secs(10)).unwrap_or(true);
         if !(self.dirty || stale) {
             return;
         }
         if let Some(db) = c.db() {
             self.recs = db.list_recordings().unwrap_or_default();
+            self.recs.retain(|r| r.is_live() || (r.probed && r.duration > 0.0));
             let (from, to) = self.extent();
             self.spans = merge_spans(db.activity_between(from - HOUR, to + HOUR).unwrap_or_default());
             self.markers = db.markers_between(from - HOUR, to + HOUR).unwrap_or_default();
@@ -187,6 +208,7 @@ impl RecordingsView {
             if let Some((_, end)) = self.written_live.as_ref().filter(|(path, _)| path == &r.path) {
                 return (*end).max(r.start_ms);
             }
+            return r.start_ms;
         }
         r.start_ms + (r.duration.max(0.0) * 1000.0) as i64
     }
@@ -202,6 +224,15 @@ impl RecordingsView {
             .iter()
             .map(|r| Segment { path: PathBuf::from(&r.path), start_ms: r.start_ms, duration_ms: self.seg_end(r) - r.start_ms, live: r.is_live() })
             .collect()
+    }
+
+    fn next_start(&self, current: usize) -> Option<i64> {
+        let current = self.recs.get(current)?;
+        let end = self.seg_end(current);
+        // Database order is chronological. Contained copies cannot extend playback.
+        self.recs.iter().skip_while(|r| r.start_ms <= current.start_ms)
+            .find(|r| self.seg_end(r) > end && self.seg_end(r) > r.start_ms)
+            .map(|r| r.start_ms)
     }
 
     fn playhead(&self, c: &Ctx) -> Option<i64> {
@@ -232,6 +263,7 @@ impl RecordingsView {
 
     /// Start playing at wall-clock time `t`.
     fn play_at(&mut self, c: &mut Ctx, t: i64, autoplay: bool) {
+        self.live_playback = None;
         let segs = self.segments();
         let Some(loc) = locate(&segs, t) else {
             c.toast("info", "Nothing was recorded at that time");
@@ -275,17 +307,148 @@ impl RecordingsView {
         }
     }
 
-    fn go_live(&mut self, c: &mut Ctx) {
+    fn playable_bounds(&self) -> Option<(i64, i64)> {
+        let playable = self.recs.iter().filter(|r| self.seg_end(r) > r.start_ms);
+        let first = playable.clone().map(|r| r.start_ms).min()?;
+        let last = playable.map(|r| self.seg_end(r)).max()?;
+        Some((first, last))
+    }
+
+    fn move_trim_handle(&mut self, handle: DragMode, at: i64) {
+        let Some((first, last)) = self.playable_bounds() else { return };
+        match handle {
+            DragMode::TrimStart => {
+                let max = self.out_ms.map_or(last, |out| out.saturating_sub(101)).clamp(first, last);
+                let _ = self.set_start(at.clamp(first, max));
+            }
+            DragMode::TrimEnd => {
+                let min = self.in_ms.map_or(first, |start| start.saturating_add(101)).clamp(first, last);
+                let _ = self.set_end(at.clamp(min, last));
+            }
+            _ => {}
+        }
+    }
+
+    fn latest_playable(&self) -> Option<(i64, bool)> {
+        self.recs.iter()
+            .filter_map(|r| {
+                let end = self.seg_end(r);
+                (end > r.start_ms).then_some((end - 1, r.is_live()))
+            })
+            .max()
+    }
+
+    fn jump_latest(&mut self, c: &mut Ctx) {
+        self.dirty = true;
         self.refresh(c);
-        let Some(rec) = self.recs.iter().rev().find(|r| r.is_live() && self.seg_end(r) > r.start_ms) else {
+        let Some((at, live)) = self.latest_playable() else {
+            c.toast("info", "No playable footage is available yet");
+            return;
+        };
+        self.follow_live = live;
+        self.view_end = at + self.view_span / 20;
+        self.play_at(c, at, live);
+        self.hold_at_eof = !live;
+        if live {
+            self.live_playback = self.written_live.clone();
+        }
+    }
+
+    fn adjacent_frame_time(&self, current: usize, forward: bool) -> Option<i64> {
+        let segments = self.segments();
+        let ordered = coverage(&segments);
+        let position = ordered.iter().position(|(i, _)| *i == current)?;
+        if forward {
+            let (next, _) = ordered.get(position + 1)?;
+            Some(segments[*next].start_ms)
+        } else {
+            let (_, end) = ordered.get(position.checked_sub(1)?)?;
+            Some(end - 1)
+        }
+    }
+
+    fn frame_step_handoff(
+        &self,
+        current: usize,
+        state: &crate::player::PlayState,
+        forward: bool,
+    ) -> Option<i64> {
+        let adjacent = self.adjacent_frame_time(current, forward)?;
+        if forward {
+            let start_ms = self.recs.get(current)?.start_ms;
+            let crosses_join = state.next_frame_pos.is_some_and(|next| {
+                next * 1_000.0 >= adjacent.saturating_sub(start_ms) as f64
+            });
+            (state.last_frame || crosses_join).then_some(adjacent)
+        } else {
+            state.first_frame.then_some(adjacent)
+        }
+    }
+
+    fn step_recording_frame(&mut self, c: &mut Ctx, forward: bool) {
+        self.stop_preview(c);
+        self.live_playback = None;
+        let state = c.player.state();
+        let adjacent = self.cur.filter(|_| state.loaded)
+            .and_then(|current| self.frame_step_handoff(current, &state, forward));
+        if let Some(at) = adjacent {
+            self.follow_live = false;
+            self.play_at(c, at, false);
+            self.hold_at_eof = true;
+        } else {
+            c.player.frame_step(forward);
+        }
+    }
+
+    fn playable_live(&self) -> Option<&Recording> {
+        self.recs.iter().rev().find(|r| r.is_live() && self.seg_end(r) > r.start_ms)
+    }
+
+    fn go_live(&mut self, c: &mut Ctx) {
+        self.dirty = true;
+        self.refresh(c);
+        let Some(rec) = self.playable_live() else {
             c.toast("info", "No live footage is ready");
             return;
         };
+        let end = self.seg_end(rec);
+        let path = rec.path.clone();
         let offset = i64::from(c.cfg.player.live_offset_secs) * 1000;
-        let t = (now_ms() - offset).min(self.seg_end(rec) - 1).max(rec.start_ms);
+        let t = (now_ms() - offset).min(end - 1).max(rec.start_ms);
         self.follow_live = true;
-        self.view_end = now_ms() + self.view_span / 20;
+        self.view_end = end + self.view_span / 20;
         self.play_at(c, t, true);
+        self.live_playback = Some((path, end));
+    }
+
+    fn next_live_segment(&self, paused: bool, reached_edge: bool) -> Option<Recording> {
+        let (old, _) = self.live_playback.as_ref()?;
+        if paused || !reached_edge {
+            return None;
+        }
+        self.playable_live().filter(|r| &r.path != old).cloned()
+    }
+
+    fn follow_live_playback(&mut self, c: &mut Ctx, state: &crate::player::PlayState) -> bool {
+        let Some((old, end)) = &mut self.live_playback else { return false };
+        if self.cur_path.as_ref() != Some(old) {
+            self.live_playback = None;
+            return false;
+        }
+        if let Some((path, next_end)) = &self.written_live {
+            if path == old {
+                *end = (*end).max(*next_end);
+                return false;
+            }
+        }
+        let edge = *end;
+        let at = self.playhead(c).unwrap_or(i64::MIN);
+        let reached_edge = state.last_frame && at >= edge.saturating_sub(1_000);
+        let Some(next) = self.next_live_segment(state.paused || !state.loaded, reached_edge) else { return false };
+        let end = self.seg_end(&next);
+        self.play_at(c, next.start_ms, true);
+        self.live_playback = Some((next.path, end));
+        true
     }
 
     fn load_edits(&mut self) {
@@ -444,15 +607,23 @@ impl RecordingsView {
             }
         }
         let st = c.player.state();
+        let followed_rotation = self.follow_live_playback(c, &st);
         let playhead = self.playhead(c).map(|at| at as f64 / 1000.0);
-        if let Some(preview) = &mut self.preview {
+        let next_start = self.cur.and_then(|i| self.next_start(i));
+        let crossed_overlap = next_start.filter(|&next| !st.paused && !st.eof && self.drag_mode.is_none()
+            && self.playhead(c).is_some_and(|at| at >= next)
+            && self.preview.as_ref().is_none_or(|p| (next as f64 / 1000.0) < p.end));
+        if followed_rotation || self.live_playback.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        } else if let Some(next) = crossed_overlap {
+            self.play_at(c, self.playhead(c).unwrap_or(next), true);
+        } else if let Some(preview) = &mut self.preview {
             match preview.progress(playhead, st.paused, st.eof) {
                 PreviewProgress::Playing => ui.ctx().request_repaint_after(Duration::from_millis(30)),
                 PreviewProgress::Finished => self.stop_preview(c),
                 PreviewProgress::EndOfFile => {
                     let end = preview.end;
-                    let next = self.cur.and_then(|i| self.recs.get(i + 1))
-                        .map(|r| r.start_ms).filter(|next| (*next as f64 / 1000.0) < end);
+                    let next = next_start.filter(|next| (*next as f64 / 1000.0) < end);
                     if let Some(next) = next {
                         self.play_at(c, next, true);
                         self.preview = Some(RangePreview::new(next as f64 / 1000.0, end));
@@ -461,13 +632,12 @@ impl RecordingsView {
                     }
                 }
             }
-        } else if let Some(i) = self.cur {
+        } else if self.cur.is_some() {
             if !st.eof && !st.paused {
                 self.hold_at_eof = false;
             }
-            if st.eof && st.loaded && !self.hold_at_eof && i + 1 < self.recs.len() && c.player.path.is_some() && self.drag_mode.is_none() {
-                let next = self.recs[i + 1].start_ms;
-                self.play_at(c, next, true);
+            if st.eof && st.loaded && !self.hold_at_eof && c.player.path.is_some() && self.drag_mode.is_none() {
+                if let Some(next) = next_start { self.play_at(c, next, true); }
             }
         }
         // Keep the player's edits in sync with the timeline's.
@@ -476,7 +646,7 @@ impl RecordingsView {
             c.player.set_edits(e);
         }
         if self.follow_live {
-            let target = now_ms() + self.view_span / 20;
+            let target = self.latest_playable().map_or(self.view_end, |(at, _)| at + self.view_span / 20);
             if (target - self.view_end).abs() > 500 {
                 self.view_end = target;
             }
@@ -484,6 +654,13 @@ impl RecordingsView {
         }
 
         let hits = c.player.shortcuts(ui, &c.cfg.player);
+        if let Some(forward) = hits.frame_step {
+            self.step_recording_frame(c, forward);
+        }
+        if hits.jump_latest {
+            self.stop_preview(c);
+            self.jump_latest(c);
+        }
         if hits.mark_in {
             self.stop_preview(c);
             if let Some(at) = self.playhead(c) { c.report_mark(self.set_start(at)); }
@@ -494,7 +671,7 @@ impl RecordingsView {
         }
 
         let fullscreen = c.player.fullscreen;
-        let compact = ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
+        let compact = self.preview_size.watching() || ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
         if !fullscreen {
             if compact {
                 ui.horizontal_wrapped(|ui| {
@@ -542,7 +719,12 @@ impl RecordingsView {
         let side_width = (!compact && !fullscreen).then(|| (ui.available_width() * 0.30).clamp(245.0, 330.0));
         let show_lanes = c.player.show_mixer && !fullscreen;
         let controls_height = if show_lanes { 398.0 } else { 102.0 };
-        let layout = EditorLayout::new(ui, side_width, controls_height, !fullscreen);
+        let layout = EditorLayout::with_preview(
+            ui, side_width, controls_height, !fullscreen, (!fullscreen).then_some(&self.preview_size),
+        );
+        if self.preview_size.handle(ui, "recording_preview_handle", &layout) {
+            self.compact_files = false;
+        }
         if let Some(mut inspector) = layout.inspector {
             inspector.min.x += 18.0;
             editor_layout::region(ui, "rec_side", inspector, |ui| self.files_inspector(ui, c));
@@ -550,7 +732,9 @@ impl RecordingsView {
         editor_layout::region(ui, "rec_transport", layout.transport, |ui| {
             editor_layout::controls(ui, "rec_transport_scroll", |ui| {
                 let label = self.time_label(c);
-                c.player.transport(ui, &label, &c.cfg.player);
+                if let (_, Some(forward)) = c.player.transport(ui, &label, &c.cfg.player) {
+                    self.step_recording_frame(c, forward);
+                }
                 if !fullscreen {
                     self.cut_bar(ui, c);
                 }
@@ -589,7 +773,7 @@ impl RecordingsView {
         let history = if c.cfg.recording.rolling_seconds().is_some() {
             format!("{stored} archived · Replay only is on")
         } else {
-            format!("{stored} stored · keeps {} h", c.cfg.recording.retention_hours)
+            format!("{stored} stored · keeps {}", c.cfg.recording.history_label())
         };
         let compact = ui.available_width() < 920.0;
         if compact {
@@ -608,13 +792,22 @@ impl RecordingsView {
     }
 
     fn header_controls(&mut self, ui: &mut Ui, c: &mut Ctx, right_aligned: bool) {
-        let live = self.written_live.is_some();
-        if ui.add_enabled_ui(live, |ui| theme::accent_button(ui, Some(icon::LIVE), "Go live", theme::LIVE))
+        let latest = self.latest_playable();
+        let jump = ui.add_enabled(latest.is_some(), egui::Button::new("Jump to latest"))
+            .on_hover_text(hint(&c.cfg.player, Action::JumpLatest, "Jump to the latest playable footage and follow when recording"))
+            .on_disabled_hover_text("No playable footage is available yet");
+        editor_layout::remember_interaction_rect(ui, "jump_latest", jump.rect);
+        if jump.clicked() {
+            self.stop_preview(c);
+            self.jump_latest(c);
+        }
+        let live = self.playable_live().is_some();
+        let live_button = ui.add_enabled_ui(live, |ui| theme::accent_button(ui, Some(icon::LIVE), "Go live", theme::LIVE))
             .inner
             .on_hover_text("Jump to the current recording")
-            .on_disabled_hover_text("Available while recording full history.")
-            .clicked()
-        {
+            .on_disabled_hover_text("Available while recording full history.");
+        editor_layout::remember_interaction_rect(ui, "go_live", live_button.rect);
+        if live_button.clicked() {
             self.stop_preview(c);
             self.go_live(c);
         }
@@ -755,6 +948,12 @@ impl RecordingsView {
             if let Some(t) = pt {
                 let x = x_of(t);
                 p.line_segment([Pos2::new(x, seg_band.top() - 4.0), Pos2::new(x, act_band.bottom() + 4.0)], Stroke::new(2.0, c.accent));
+                let grip = Pos2::new(x, act_band.bottom() + 4.0);
+                p.circle_filled(grip, 5.0, c.accent);
+                if rect.x_range().contains(x) {
+                    let id = if label == "START" { "trim_start" } else { "trim_end" };
+                    editor_layout::remember_interaction_rect(ui, id, Rect::from_center_size(grip, Vec2::splat(10.0)));
+                }
                 let align = if label == "START" { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM };
                 let offset = if label == "START" { -4.0 } else { 4.0 };
                 p.text(Pos2::new(x + offset, row.bottom() - 2.0), align, label, FontId::new(10.0, theme::semibold()), c.accent);
@@ -783,7 +982,47 @@ impl RecordingsView {
         // Interaction: drag = scrub (drag the ruler or right-drag = pan),
         // wheel = zoom, Shift+wheel = pan, Shift+click = select.
         let resp = ui.interact(Rect::from_x_y_ranges(rect.x_range(), row.y_range()), ui.scope_id().with("timeline"), Sense::click_and_drag());
-        if resp.drag_started() {
+        let trim_handle = |pos: Pos2| {
+            if pos.y < seg_band.top() {
+                return None;
+            }
+            [(self.in_ms, DragMode::TrimStart), (self.out_ms, DragMode::TrimEnd)]
+                .into_iter()
+                .filter_map(|(time, mode)| {
+                    let x = x_of(time?);
+                    let distance = (x - pos.x).abs();
+                    (rect.x_range().contains(x) && distance <= 8.0).then_some((distance, mode))
+                })
+                .min_by(|(a, _), (b, _)| a.total_cmp(b))
+                .map(|(_, mode)| mode)
+        };
+        let hover_trim = resp.hover_pos().and_then(&trim_handle).is_some();
+        let (pressed, released) = ui.input(|input| {
+            let mut pressed = None;
+            let mut released = None;
+            for event in &input.events {
+                if let egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: down, .. } = event {
+                    if *down { pressed = Some(*pos); } else { released = Some(*pos); }
+                }
+            }
+            (pressed, released)
+        });
+        if let Some(handle) = pressed.filter(|pos| resp.interact_rect.contains(*pos)).and_then(trim_handle) {
+            self.stop_preview(c);
+            self.follow_live = false;
+            self.drag_mode = Some(handle);
+        }
+        let dragging_trim = self.drag_mode.filter(|m| matches!(m, DragMode::TrimStart | DragMode::TrimEnd));
+        if let Some(handle) = dragging_trim {
+            let position = released.or_else(|| resp.interact_pointer_pos().filter(|_| resp.dragged()));
+            if let Some(pos) = position {
+                self.move_trim_handle(handle, t_of(pos.x.clamp(rect.left(), rect.right())));
+            }
+            if released.is_some() || !ui.input(|i| i.pointer.primary_down()) {
+                self.drag_mode = None;
+            }
+        }
+        if dragging_trim.is_none() && resp.drag_started() {
             let on_ruler = resp.interact_pointer_pos().map(|p| p.y <= ruler.bottom()).unwrap_or(false);
             let secondary = ui.input(|i| i.pointer.secondary_down() || i.pointer.middle_down());
             self.drag_mode = Some(if on_ruler || secondary { DragMode::Pan } else { DragMode::Scrub });
@@ -795,7 +1034,7 @@ impl RecordingsView {
                 self.follow_live = false;
             }
         }
-        if resp.dragged() {
+        if dragging_trim.is_none() && resp.dragged() {
             match self.drag_mode {
                 Some(DragMode::Pan) => {
                     self.view_end -= (resp.drag_delta().x as f64 / px_per_ms) as i64;
@@ -813,10 +1052,10 @@ impl RecordingsView {
                         self.scrub_to(c, t);
                     }
                 }
-                None => {}
+                _ => {}
             }
         }
-        if resp.drag_stopped() {
+        if dragging_trim.is_none() && resp.drag_stopped() {
             if self.drag_mode == Some(DragMode::Scrub) {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let t = t_of(pos.x.clamp(rect.left(), rect.right()));
@@ -840,7 +1079,7 @@ impl RecordingsView {
                 tip.push_str("\nNot recorded");
             }
             if self.drag_mode.is_none() {
-                tip.push_str("\nClick to seek. Scroll to zoom or drag the ruler to pan. Press I or O to mark start or end.");
+                tip.push_str("\nClick to seek. Scroll to zoom or drag the ruler to pan. Drag a trim handle to adjust the selection.");
                 egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::unique("tl_tip"), egui::PopupAnchor::Pointer).show(|ui| ui.label(tip));
             }
             let (dx, dy) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y));
@@ -861,7 +1100,7 @@ impl RecordingsView {
                 }
             }
         }
-        if resp.clicked() {
+        if dragging_trim.is_none() && resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 self.stop_preview(c);
                 let t = t_of(pos.x);
@@ -875,7 +1114,12 @@ impl RecordingsView {
                 }
             }
         }
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let cursor = if hover_trim || matches!(self.drag_mode, Some(DragMode::TrimStart | DragMode::TrimEnd)) {
+            egui::CursorIcon::ResizeHorizontal
+        } else {
+            egui::CursorIcon::PointingHand
+        };
+        let resp = resp.on_hover_cursor(cursor);
         resp.context_menu(|ui| {
             if ui.button("Add marker at playhead").clicked() {
                 if let (Some(t), Some(db)) = (self.playhead(c), c.db()) {
@@ -985,11 +1229,11 @@ impl RecordingsView {
             let ph = self.playhead(c);
             let fmt = |t: Option<i64>| t.and_then(|t| Local.timestamp_millis_opt(t).single()).map(|d| d.format("%H:%M:%S%.3f").to_string()).unwrap_or("—".into());
             ui.add_enabled_ui(ph.is_some(), |ui| {
-                if ui.button(format!("Set start  {}", fmt(self.in_ms))).on_hover_text("Use the current frame as the start (I)").clicked() {
+                if ui.button(format!("Set start  {}", fmt(self.in_ms))).on_hover_text(hint(&c.cfg.player, Action::MarkStart, "Use the current frame as the start")).clicked() {
                     self.stop_preview(c);
                     if let Some(at) = ph { c.report_mark(self.set_start(at)); }
                 }
-                if ui.button(format!("Set end  {}", fmt(self.out_ms))).on_hover_text("Use the current frame as the end (O)").clicked() {
+                if ui.button(format!("Set end  {}", fmt(self.out_ms))).on_hover_text(hint(&c.cfg.player, Action::MarkEnd, "Use the current frame as the end")).clicked() {
                     self.stop_preview(c);
                     if let Some(at) = ph { c.report_mark(self.set_end(at)); }
                 }
@@ -1242,8 +1486,13 @@ impl RecordingsView {
         }
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(theme::title("Recording files"));
-            ui.add(egui::TextEdit::singleline(&mut self.footage_search).hint_text("Search file name or date"));
+            let heading = ui.label(theme::title("Recording files"));
+            editor_layout::remember_interaction_rect(ui, "shortcut_recording_search_heading", heading.rect);
+            let input = ui.add(egui::TextEdit::singleline(&mut self.footage_search).hint_text("Search file name or date"));
+            editor_layout::remember_interaction_rect(ui, "shortcut_recording_search", input.rect);
+            if ui.ctx().data_mut(|data| data.remove_temp::<bool>(egui::Id::unique("clipvault-qa-scroll-recording-search"))).unwrap_or(false) {
+                input.scroll_to_me_animation(Some(egui::Align::Center), egui::style::ScrollAnimation::none());
+            }
             let query = self.footage_search.trim().to_lowercase();
             let mut last_day = String::new();
             for (i, r) in self.recs.clone().iter().enumerate().rev() {
@@ -1311,6 +1560,9 @@ fn merge_spans(mut spans: Vec<ActivitySpan>) -> Vec<ActivitySpan> {
 }
 
 #[cfg(test)]
+mod overlap_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1339,9 +1591,8 @@ mod tests {
         assert_eq!(v[2].start_ms, 60_000);
     }
 
-    #[test]
-    fn selection_clamps_to_written_footage_and_rejects_gaps() {
-        let recording = |path: &str, start_ms: i64, duration: f64, status: &str| Recording {
+    fn recording(path: &str, start_ms: i64, duration: f64, status: &str) -> Recording {
+        Recording {
             id: 0,
             path: path.into(),
             start_ms,
@@ -1352,7 +1603,91 @@ mod tests {
             kept: false,
             probed: true,
             probe_filetime: None,
+        }
+    }
+
+    #[test]
+    fn latest_uses_committed_edge_and_falls_back_to_the_latest_archive() {
+        let mut view = RecordingsView {
+            recs: vec![recording("archive.mp4", 1_000, 2.0, "complete"),
+                       recording("active.mp4", 6_000, 900.0, "recording")],
+            ..Default::default()
         };
+        assert_eq!(view.latest_playable(), Some((2_999, false)));
+        view.written_live = Some(("another.mp4".into(), 8_000));
+        assert_eq!(view.latest_playable(), Some((2_999, false)));
+        view.written_live = Some(("active.mp4".into(), 6_500));
+        assert_eq!(view.latest_playable(), Some((6_499, true)));
+    }
+
+    #[test]
+    fn live_rollover_waits_for_playable_bytes_and_respects_pause() {
+        let mut view = RecordingsView {
+            recs: vec![recording("old.mp4", 1_000, 2.0, "complete"),
+                       recording("new.mp4", 3_000, 30.0, "recording")],
+            live_playback: Some(("old.mp4".into(), 3_000)),
+            ..Default::default()
+        };
+        assert!(view.next_live_segment(false, true).is_none());
+        view.written_live = Some(("new.mp4".into(), 3_000));
+        assert!(view.next_live_segment(false, true).is_none());
+        view.written_live = Some(("new.mp4".into(), 3_500));
+        assert!(view.next_live_segment(true, true).is_none());
+        assert!(view.next_live_segment(false, false).is_none());
+        assert_eq!(view.next_live_segment(false, true).unwrap().path, "new.mp4");
+        view.live_playback = None;
+        assert!(view.next_live_segment(false, true).is_none());
+    }
+
+    #[test]
+    fn recording_frame_navigation_skips_gaps_and_contained_copies() {
+        let view = RecordingsView {
+            recs: vec![recording("first.mp4", 1_000, 4.0, "complete"),
+                       recording("contained.mp4", 2_000, 1.0, "complete"),
+                       recording("overlap.mp4", 4_000, 2.0, "complete"),
+                       recording("after gap.mp4", 9_000, 2.0, "complete")],
+            ..Default::default()
+        };
+        assert_eq!(view.adjacent_frame_time(0, true), Some(4_000));
+        assert_eq!(view.adjacent_frame_time(2, false), Some(3_999));
+        assert_eq!(view.adjacent_frame_time(2, true), Some(9_000));
+        assert_eq!(view.adjacent_frame_time(3, false), Some(5_999));
+        assert_eq!(view.adjacent_frame_time(3, true), None);
+
+        let state = crate::player::PlayState {
+            first_frame: true,
+            ..Default::default()
+        };
+        assert_eq!(view.frame_step_handoff(2, &state, false), Some(3_999));
+        let state = crate::player::PlayState {
+            next_frame_pos: Some(3.0),
+            last_frame: false,
+            ..Default::default()
+        };
+        assert_eq!(view.frame_step_handoff(0, &state, true), Some(4_000));
+        let state = crate::player::PlayState { next_frame_pos: Some(2.96), ..state };
+        assert_eq!(view.frame_step_handoff(0, &state, true), None);
+    }
+
+    #[test]
+    fn dragging_trim_handles_clamps_to_footage_and_preserves_endpoint_order() {
+        let mut view = RecordingsView {
+            recs: vec![recording("archive.mp4", 1_000, 2.0, "complete")],
+            in_ms: Some(1_500),
+            out_ms: Some(2_000),
+            ..Default::default()
+        };
+        view.move_trim_handle(DragMode::TrimStart, 2_999);
+        assert_eq!(view.selection(), Some((1_899, 2_000)));
+        view.move_trim_handle(DragMode::TrimStart, 10);
+        view.move_trim_handle(DragMode::TrimEnd, 10_000);
+        assert_eq!(view.selection(), Some((1_000, 3_000)));
+        view.move_trim_handle(DragMode::TrimEnd, 100);
+        assert_eq!(view.selection(), Some((1_000, 1_101)));
+    }
+
+    #[test]
+    fn selection_clamps_to_written_footage_and_rejects_gaps() {
         let mut view = RecordingsView {
             recs: vec![recording("closed.mp4", 1_000, 2.0, "complete"),
                        recording("live.mp4", 5_000, 1.0, "recording")],

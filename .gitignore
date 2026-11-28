@@ -3,6 +3,7 @@
 
 # Local recordings, exports, portable builds and visual test evidence
 /.clipvault-local/
+/ClipVault Release/
 
 # Locally downloaded tools from older versions
 /third_party/

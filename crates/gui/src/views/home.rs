@@ -440,9 +440,9 @@ fn recording_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, footage_s: f64) 
         ui.label(theme::label_dim("ClipVault will restart it automatically."));
     }
     ui.label(theme::small(format!(
-        "{:.1} h stored · keeps {} h",
-        footage_s / 3600.0,
-        c.cfg.recording.retention_hours
+        "{} stored · keeps {}",
+        cv_core::util::format_span_short(footage_s.max(0.0) as i64),
+        c.cfg.recording.history_label()
     )));
     ui.add_space(6.0);
     let paused = s.recording.paused_by_user;

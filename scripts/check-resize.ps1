@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)][string]$FixtureService,
     [Parameter(Mandatory)][string]$Media,
     [ValidateRange(0.75, 2.0)][double]$Scale = 1,
+    [switch]$Interactions,
     [string]$OutputRoot = (Join-Path $PSScriptRoot '..\.clipvault-local\qa')
 )
 $ErrorActionPreference = 'Stop'
@@ -21,10 +22,11 @@ Copy-Item -LiteralPath $guiFile -Destination $app
 $service = $null
 $window = $null
 $environment = @{}
-foreach ($name in 'CLIPVAULT_TEST_FIXTURE','CLIPVAULT_DATA_DIR','CLIPVAULT_RESIZE_CHECK','CLIPVAULT_RESIZE_SCALE','TEMP','TMP') {
+foreach ($name in 'CLIPVAULT_TEST_FIXTURE','CLIPVAULT_DATA_DIR','CLIPVAULT_RESIZE_CHECK','CLIPVAULT_RESIZE_SCALE','CLIPVAULT_INTERACTION_CHECK','TEMP','TMP') {
     $environment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 try {
+    if ($Interactions) { $env:CLIPVAULT_INTERACTION_CHECK = '1' }
     $env:CLIPVAULT_TEST_FIXTURE = $mediaFile
     $env:CLIPVAULT_DATA_DIR = $profile
     $env:TEMP = [IO.Directory]::CreateDirectory((Join-Path $round 'tmp')).FullName

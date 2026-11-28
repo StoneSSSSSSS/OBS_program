@@ -1,6 +1,11 @@
 //! Opt-in native-window regression. Inspect each rendered layout as the window
 //! shrinks and grows. The fixture deliberately uses a separate profile and GUI.
 use super::{App, Page};
+mod category;
+mod interaction;
+mod shortcut;
+use category::CategoryCheck;
+use interaction::Interaction;
 use eframe::egui::{self, epaint::Shape, Context, Rect, Vec2, ViewportCommand};
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -211,6 +216,9 @@ pub(super) struct Sweep {
     frames: usize,
     scale: f32,
     initialized: bool,
+    category: Option<CategoryCheck>,
+    interaction: Option<Interaction>,
+    shortcut: Option<shortcut::ShortcutCheck>,
     setup_started: Option<Instant>,
     scroll_passes_remaining: u8,
     screenshot: Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, Instant)>,
@@ -239,6 +247,11 @@ impl Sweep {
             frames: 0,
             scale,
             initialized: false,
+            category: Some(CategoryCheck::default()),
+            interaction: std::env::var_os("CLIPVAULT_INTERACTION_CHECK")
+                .map(|_| Interaction::new(profile)),
+            shortcut: std::env::var_os("CLIPVAULT_INTERACTION_CHECK")
+                .map(|_| shortcut::ShortcutCheck::default()),
             setup_started: None,
             scroll_passes_remaining: 0,
             screenshot: None,
@@ -281,11 +294,65 @@ impl Sweep {
         }
     }
 
+    pub(super) fn inject_input(&mut self, input: &mut egui::RawInput) {
+        if let Some(category) = &mut self.category {
+            category.inject(input);
+        }
+        if let Some(shortcut) = &mut self.shortcut {
+            shortcut.inject(input);
+        }
+        if let Some(interaction) = &mut self.interaction {
+            interaction.inject(input);
+        }
+    }
+
+    fn finish(&self, ctx: &Context) {
+        let status = if self.issues.is_empty() { "PASS" } else { "FAIL" };
+        let report = format!(
+            "{status}: {} rendered frames\n{}\n",
+            self.frames,
+            self.issues.iter().cloned().collect::<Vec<_>>().join("\n")
+        );
+        let _ = std::fs::write(self.dir.join("result.txt"), report);
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
     pub(super) fn after_frame(&mut self, app: &mut App, ctx: &Context) {
-        if ctx.will_discard() || self.page >= PAGES.len() {
+        if ctx.will_discard() {
             return;
         }
         ctx.request_repaint();
+        if self.page >= PAGES.len() {
+            if let Some(category) = &mut self.category {
+                match category.advance(app, ctx, &self.dir) {
+                    Ok(false) => return,
+                    Ok(true) => {}
+                    Err(error) => {
+                        self.issues.insert(format!("library categories: {error}"));
+                    }
+                }
+                category::stop(ctx);
+                self.category = None;
+            }
+            if let Some(shortcut) = &mut self.shortcut {
+                match shortcut.advance(app, ctx, &self.dir) {
+                    Ok(false) => return,
+                    Ok(true) => {}
+                    Err(error) => { self.issues.insert(format!("player shortcuts: {error}")); }
+                }
+                self.shortcut = None;
+            }
+            if let Some(interaction) = &mut self.interaction {
+                match interaction.advance(app, ctx, &self.dir) {
+                    Ok(false) => return,
+                    Ok(true) => {},
+                    Err(error) => { self.issues.insert(format!("interactions: {error}")); }
+                }
+                self.interaction = None;
+            }
+            self.finish(ctx);
+            return;
+        }
         // Winit converts the size using the previous pass's pixels-per-point.
         // Apply the zoom before issuing the first native size command.
         if !self.initialized {
@@ -404,18 +471,6 @@ impl Sweep {
                 self.page += 1;
                 self.step = 0;
                 if self.page == PAGES.len() {
-                    let status = if self.issues.is_empty() {
-                        "PASS"
-                    } else {
-                        "FAIL"
-                    };
-                    let report = format!(
-                        "{status}: {} rendered frames\n{}\n",
-                        self.frames,
-                        self.issues.iter().cloned().collect::<Vec<_>>().join("\n")
-                    );
-                    let _ = std::fs::write(self.dir.join("result.txt"), report);
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
                     return;
                 }
                 self.setup_started = None;

@@ -579,7 +579,7 @@ impl Mp4Reader {
         // scan time; restore those times.
         for (tid, list) in parsed.iter_mut() {
             let Some(ti) = self.tracks.iter().position(|t| t.id == *tid) else { continue };
-            if let (Some(fr), Some(first)) = (self.track_frags[ti].iter().find(|x| x.frag == frag), list.first()) {
+            if let (Some(fr), Some(first)) = (self.track_frags[ti].binary_search_by_key(&frag, |x| x.frag).ok().map(|i| &self.track_frags[ti][i]), list.first()) {
                 let shift = fr.start as i64 - first.dts as i64;
                 if shift != 0 {
                     for s in list.iter_mut() {
@@ -639,6 +639,35 @@ impl Mp4Reader {
                 }
             })
             .fold(0.0, f64::max)
+    }
+
+    /// Visible frame starts in presentation order, in track ticks relative to the edit.
+    /// Flat files already have an in-memory sample table. For a growing archive
+    /// only inspect the fragment around the cursor and its two neighbors.
+    pub fn frame_starts_near(&self, idx: usize, position: i64) -> Result<Vec<i64>> {
+        let track = &self.tracks[idx];
+        let (edit, length) = track.edit.unwrap_or((0, 0));
+        let edit = edit.max(0);
+        let end = if length > 0 { edit.saturating_add_unsigned(length) } else { i64::MAX };
+        let mut starts = Vec::new();
+        let mut collect = |samples: &[Sample]| {
+            starts.extend(samples.iter().filter_map(|s| {
+                let t = s.pts();
+                (t < end && t.saturating_add(i64::from(s.duration)) > edit).then(|| t.saturating_sub(edit).max(0))
+            }));
+        };
+        if let Some(flat) = self.flat.get(idx).filter(|flat| !flat.is_empty()) {
+            collect(flat);
+        } else if let Some(list) = self.track_frags.get(idx).filter(|list| !list.is_empty()) {
+            let at = position.max(0).saturating_add(edit) as u64;
+            let index = list.partition_point(|f| f.end <= at).min(list.len() - 1);
+            for f in &list[index.saturating_sub(1)..(index + 2).min(list.len())] {
+                collect(&self.fragment_samples(f.frag, track.id)?);
+            }
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        Ok(starts)
     }
 
     /// Samples of track `idx` overlapping `[from, to)` ticks, in order.

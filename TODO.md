@@ -17,6 +17,14 @@
 - [x] Complete an independent hands-on review of recent footage, range/preview, save/reopen, child-track mute/undo and size-limited export. All five tasks passed the review rubric. The reviewer verified the formerly failing widths during active Windows sizing and measured the 1 MB export at 770,655 bytes.
 - [x] Scope the completed export shown in the inspector to the open clip. The complete export queue remains available in Jobs.
 
+- [x] Verify ten-minute Full history through the service. Six hundred seconds of ordinary footage remained after rotation, with kept recordings and saved clips intact after reopening.
+- [x] Verify a native elapsed-hour rollover using timestamped synthetic video and AAC. Across-file cuts matched continuous-source packet bytes and timing, including audio crossing the file boundary.
+- [x] Reproduce and repair overlapping archive cuts and incomplete-copy indexing. The old service doubled a 10-second overlap selection and interpreted a 96-byte partial as nearly 88 days. Both cases now have independent fixture verification.
+
+- [x] In the Windows app, switch between short and wrapping category names at 900 logical pixels and verify identical heading, sort, thumbnail-size, and search rectangles. Click the frame buttons, move both trim handles, enlarge and restore the preview, and persist a custom player shortcut.
+- [x] Compare 10,080 one-minute archive segments against the previous retention algorithm. All 10,070 expiry decisions matched. Three release-mode runs of the in-memory planner took 0.5–0.6 ms, compared with 7.97–8.11 s previously. These timings exclude file operations.
+- [x] Benchmark the native player on the same 25 fps synthetic file. Each paired five-second playing interval presented 125 frames. The paused static player eliminated all 24 periodic worker wakeups seen in the prior five-second samples. Active CPU varied and resident memory during playback stayed near 32 MiB.
+
 ## Next verification
 
 - [ ] Run a sustained live replay-only session on a second Windows setup. Check hotkey capture and rebinding, headset and display reconnects, disk pressure, and waveform backfill while entering and leaving a game.

@@ -6,6 +6,14 @@ ClipVault records your Windows screen and app audio, saves highlights and export
 
 Extract the whole Windows app folder somewhere you can write and open **clipvault.exe**. Keep it beside `clipvault-service.exe`, the bundled Microsoft C++ runtime, and the assets folder. The window starts the background recorder. Closing the window lets the recorder continue. Use **Quit ClipVault service** in the tray when you want to stop capturing.
 
+## Keep ten minutes on the 24/7 timeline
+
+1. Open **Settings → Recording & storage** and choose **Full history**.
+2. Under **Keep this much footage**, choose **10 min** or enter a custom number of minutes. The minimum is **1 min**.
+3. Click **Save**. If the recorder needs a new file length, choose **Save & restart recording**.
+
+Ten-minute history targets one-minute files. The recorder rotates at the next video keyframe. Cleanup removes whole files, so a little extra footage may remain. Saved clips and recordings marked **Keep** are protected. Time the PC is off does not count.
+
 ## Keep just the last two minutes
 
 1. Open **Settings → Recording & storage → Replay only**.
@@ -17,10 +25,13 @@ Replay only continually replaces temporary footage. Both clip hotkeys are limite
 ## Select, edit and share a highlight
 
 1. With **Full history** recording enabled, open **Home → Open latest recording** or choose a recorded section in **24/7 Recordings**.
-2. Pause and click the timeline where the highlight starts. Choose **Set start** (I), seek to the finish and choose **Set end** (O). **Preview** plays the selection. **Save selected clip → Create** saves it. Choose **Open saved clip** in Jobs to edit it.
-3. In the clip, choose **Separate tracks** to balance **Game**, **Voice chat**, **Music & media**, **Desktop** and **Microphone**. Expand **Apps** for individual recorded apps. Each browser appears as one app. **Full mix** plays the combined track on its own.
-4. Drag across a waveform or choose **Edit audio range** to mute or change volume for part of a track. Use **Undo audio change** to reverse it. **Track names & visibility** customizes the lanes for this clip. **Settings → Player → Smooth audio edits** controls fades.
-5. Preview the result. Choose **Export full quality** or set a limit and choose **Export to size limit**. Export uses the current mix and optional trim selection. The source clip retains its original audio tracks.
+2. Drag the divider under the preview, or click **Larger preview** to watch. The frame buttons beside Play step backward and forward. **Go live** follows the newest playable footage. **Jump to latest** also works when recording has stopped.
+3. Pause and click the timeline where the highlight starts. Choose **Set start** (I), seek to the finish and choose **Set end** (O). Drag either timeline handle to fine-tune it. **Preview** plays the selection. **Save selected clip → Create** saves it. Choose **Open saved clip** in Jobs to edit it.
+4. In the clip, choose **Separate tracks** to balance **Game**, **Voice chat**, **Music & media**, **Desktop** and **Microphone**. Expand **Apps** for individual recorded apps. Each browser appears as one app. **Full mix** plays the combined track on its own.
+5. Drag across a waveform or choose **Edit audio range** to mute or change volume for part of a track. Use **Undo audio change** to reverse it. **Track names & visibility** customizes the lanes for this clip. **Settings → Player → Smooth audio edits** controls fades.
+6. Preview the result. Choose **Export full quality** or set a limit and choose **Export to size limit**. Export uses the current mix and optional trim selection. The source clip retains its original audio tracks.
+
+Change player shortcuts under **Settings → Hotkeys → In the player**. The default previous and next frame keys are comma and period. **End** goes to the latest footage or the final frame of a saved clip.
 
 In a narrow window, use **Timeline** to play or select footage in **24/7 Recordings**, then **Files & jobs** to see recording files or open a finished clip. In a clip, use **Player** for preview, seeking, and audio lanes. Switch to **Trim & export** for the clip details and export controls. Widen the window to see both views at once.
 
@@ -31,7 +42,7 @@ Long clip titles stay in the library, including punctuation and emoji. ClipVault
 - The portable app keeps recordings, clips, exports, settings, thumbnails, logs and its SQLite library in `.clipvault-local\profile`. In a source checkout that folder is at the project root and Git ignores it. Choose **Settings → About → Open data folder** to find it. The portable app starts when opened and keeps discarded clips in its own trash folder when that option is enabled.
 - The optional per-user installation keeps its existing Windows layout. Settings and the library live in `%LOCALAPPDATA%\ClipVault`. Default recording and clip folders are under `%USERPROFILE%\Videos\ClipVault`.
 - The recorder uses Windows desktop capture, WASAPI sound capture and Media Foundation H.264/AAC codecs. It writes fragmented MP4 and can use a GPU encoder when available.
-- **Full history** defaults to 30-minute files and 48 hours of retained footage. It also supports age, disk usage and free-space limits. Use the tray's exit action to stop the service completely.
+- New **Full history** profiles use one-hour files and retain 48 hours of recorded time. Existing file-length preferences are preserved. Mark one start and one end on the 24/7 timeline to save a single clip across consecutive files. It also supports age, disk usage and free-space limits. Use the tray's exit action to stop the service completely.
 - Keep Recordings separate from Clips, Exports and internal storage. Exports can use their own subfolder under Clips. The service leaves saved clips, exports and legacy media alone during automatic recording cleanup.
 - The default clip hotkey is **Ctrl + Shift + backtick**. Find saved clips in **Clips**, organized by game.
 - Audio includes a full mix, microphone and a configurable number of simultaneous app tracks (eight by default). Apps can share a category. A browser is one app. Capture capabilities depend on Windows version and audio endpoints.

@@ -3,7 +3,104 @@
 use eframe::egui::{self, Align, Layout, Rect, Sense, Ui, UiBuilder};
 
 pub(super) const TWO_COLUMN_WIDTH: f32 = 840.0;
-pub(crate) const SINGLE_TRANSPORT_ROW_WIDTH: f32 = 770.0;
+pub(crate) const SINGLE_TRANSPORT_ROW_WIDTH: f32 = 830.0;
+const PREVIEW_HANDLE_HEIGHT: f32 = 24.0;
+const MIN_TIMELINE_HEIGHT: f32 = 45.0;
+
+#[derive(Default)]
+pub(super) struct PreviewSize {
+    extra_height: f32,
+    watching: bool,
+}
+
+pub(crate) fn remember_interaction_rect(ui: &Ui, name: &'static str, rect: Rect) {
+    let ctx = ui.ctx();
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| {
+        if data.get_temp::<bool>(egui::Id::unique("clipvault-interaction-check")) == Some(true) {
+            let clipped = rect.intersect(ui.clip_rect());
+            data.insert_temp(egui::Id::unique(("clipvault-interaction-target", name)), clipped);
+            data.insert_temp(egui::Id::unique(("clipvault-interaction-pass", name)), pass);
+        }
+    });
+}
+
+impl PreviewSize {
+    pub fn watching(&self) -> bool {
+        self.watching
+    }
+
+    fn timeline_height(&self, default: f32) -> f32 {
+        if self.watching {
+            MIN_TIMELINE_HEIGHT.min(default)
+        } else {
+            (default - self.extra_height).max(MIN_TIMELINE_HEIGHT.min(default))
+        }
+    }
+
+    /// Return true when this interaction enters the larger watching layout.
+    pub fn handle(&mut self, ui: &mut Ui, id: &'static str, layout: &EditorLayout) -> bool {
+        let Some(rect) = layout.preview_handle else { return false };
+        let was_watching = self.watching;
+        region(ui, id, rect, |ui| {
+            ui.horizontal_centered(|ui| {
+                let width = (ui.available_width() - 136.0).max(1.0);
+                let (grip, response) = ui.allocate_exact_size(
+                    egui::vec2(width, PREVIEW_HANDLE_HEIGHT),
+                    Sense::drag(),
+                );
+                remember_interaction_rect(ui, "preview_drag", grip);
+                let response = response
+                    .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                    .on_hover_text("Drag vertically to resize preview");
+                let color = if response.hovered() || response.dragged() {
+                    crate::theme::TEXT
+                } else {
+                    crate::theme::TEXT_DIM
+                };
+                let center = grip.center();
+                let painter = ui.painter_at(grip);
+                for y in [-2.0, 2.0] {
+                    painter.line_segment(
+                        [center + egui::vec2(-14.0, y), center + egui::vec2(14.0, y)],
+                        egui::Stroke::new(1.0, color),
+                    );
+                }
+                if width >= 175.0 {
+                    painter.text(
+                        center + egui::vec2(22.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "Drag to resize",
+                        egui::FontId::proportional(11.0),
+                        color,
+                    );
+                }
+                if response.dragged() {
+                    self.watching = false;
+                    // Work from the currently visible pane size so a drag can
+                    // reverse immediately after hitting a limit.
+                    self.extra_height = (layout.default_timeline_height
+                        - layout.timeline.height() + response.drag_delta().y)
+                        .clamp(
+                            -layout.video.height(),
+                            (layout.default_timeline_height - MIN_TIMELINE_HEIGHT).max(0.0),
+                        );
+                }
+                let (label, target) = if self.watching {
+                    ("Restore layout", "preview_restore")
+                } else {
+                    ("Larger preview", "preview_larger")
+                };
+                let toggle = ui.small_button(label);
+                remember_interaction_rect(ui, target, toggle.rect);
+                if toggle.clicked() {
+                    self.watching = !self.watching;
+                }
+            });
+        });
+        !was_watching && self.watching
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct EditorLayout {
@@ -11,6 +108,8 @@ pub(super) struct EditorLayout {
     pub inspector: Option<Rect>,
     pub timeline: Rect,
     pub transport: Rect,
+    preview_handle: Option<Rect>,
+    default_timeline_height: f32,
 }
 
 impl EditorLayout {
@@ -19,6 +118,16 @@ impl EditorLayout {
         inspector_width: Option<f32>,
         timeline_height: f32,
         cut_controls: bool,
+    ) -> Self {
+        Self::with_preview(ui, inspector_width, timeline_height, cut_controls, None)
+    }
+
+    pub fn with_preview(
+        ui: &mut Ui,
+        inspector_width: Option<f32>,
+        timeline_height: f32,
+        cut_controls: bool,
+        preview: Option<&PreviewSize>,
     ) -> Self {
         let rect = ui.available_rect_before_wrap();
         let row_height = ui.spacing().interact_size.y.max(30.0) + ui.spacing().item_spacing.y;
@@ -29,6 +138,7 @@ impl EditorLayout {
             timeline_height,
             row_height,
             cut_controls,
+            preview,
         )
     }
 
@@ -38,6 +148,7 @@ impl EditorLayout {
         timeline_height: f32,
         row_height: f32,
         cut_controls: bool,
+        preview: Option<&PreviewSize>,
     ) -> Self {
         let mut player = rect;
         let inspector = inspector_width
@@ -67,20 +178,27 @@ impl EditorLayout {
         let height = player.height().max(0.0);
         let transport_height = ((transport_rows + cut_rows) * row_height).min(height * 0.52);
         let video_minimum = (height * 0.21).min(110.0);
-        let timeline_height =
-            timeline_height.min((height - transport_height - video_minimum).max(0.0));
+        let handle_height = if preview.is_some() { PREVIEW_HANDLE_HEIGHT.min(height * 0.1) } else { 0.0 };
+        let default_timeline_height = timeline_height;
+        let desired = preview.map_or(timeline_height, |size| size.timeline_height(timeline_height));
+        let timeline_height = desired.min((height - transport_height - video_minimum - handle_height).max(0.0));
         let mut transport = player;
         transport.min.y = player.bottom() - transport_height;
         let mut timeline = player;
         timeline.max.y = transport.top();
         timeline.min.y = timeline.bottom() - timeline_height;
         let mut video = player;
-        video.max.y = timeline.top();
+        video.max.y = timeline.top() - handle_height;
+        let preview_handle = preview.map(|_| Rect::from_min_max(
+            egui::pos2(video.left(), video.bottom()), egui::pos2(video.right(), timeline.top()),
+        ));
         Self {
             video,
             inspector,
             timeline,
             transport,
+            preview_handle,
+            default_timeline_height,
         }
     }
 }
@@ -196,7 +314,7 @@ mod tests {
                             }
                             region(ui, "test_editor_transport", editor.transport, |ui| {
                                 controls(ui, "test_editor_toolbar_scroll", |ui| {
-                                    let play = player.transport(ui, "Thu 15 Jul 23:59:32 · 23h 31m ago", &cfg.player);
+                                    let (play, _) = player.transport(ui, "Thu 15 Jul 23:59:32 · 23h 31m ago", &cfg.player);
                                     if pass == 0 {
                                         play.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
                                     }
@@ -284,6 +402,22 @@ mod tests {
     }
 
     #[test]
+    fn expanded_preview_leaves_the_timeline_and_transport_reachable() {
+        let preview = PreviewSize { watching: true, ..Default::default() };
+        for size in [vec2(1100.0, 600.0), vec2(405.0, 340.0)] {
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), size);
+            let normal = EditorLayout::split(rect, None, 398.0, 36.0, true, Some(&PreviewSize::default()));
+            let watching = EditorLayout::split(rect, None, 398.0, 36.0, true, Some(&preview));
+            let handle = watching.preview_handle.unwrap();
+            assert!(watching.video.height() > normal.video.height());
+            assert!(watching.timeline.height() >= MIN_TIMELINE_HEIGHT);
+            assert_eq!(watching.transport, normal.transport);
+            assert_eq!(handle.top(), watching.video.bottom());
+            assert_eq!(handle.bottom(), watching.timeline.top());
+        }
+    }
+
+    #[test]
     fn editor_regions_never_overlap_during_resize_in_either_direction() {
         let widths = [
             320.0, 419.0, 420.0, 669.0, 670.0, 769.0, 770.0, 839.0, 840.0, 841.0, 1100.0, 1500.0,
@@ -292,7 +426,7 @@ mod tests {
             for height in [180.0, 330.0, 620.0, 980.0] {
                 let rect = Rect::from_min_size(pos2(18.0, 48.0), vec2(width, height));
                 for cut_controls in [false, true] {
-                    let editor = EditorLayout::split(rect, Some(300.0), 320.0, 36.0, cut_controls);
+                    let editor = EditorLayout::split(rect, Some(300.0), 320.0, 36.0, cut_controls, None);
                     assert_eq!(editor.inspector.is_some(), width >= TWO_COLUMN_WIDTH);
                     assert_eq!(editor.video.bottom(), editor.timeline.top());
                     assert_eq!(editor.timeline.bottom(), editor.transport.top());

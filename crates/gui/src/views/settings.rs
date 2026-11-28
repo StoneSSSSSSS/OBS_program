@@ -2,6 +2,7 @@
 //! save bar that warns when recording needs to restart.
 
 use crate::app::Ctx;
+use crate::player::shortcuts;
 use crate::theme::{self, icon};
 use cv_core::audio_names::Endpoint;
 use cv_core::config::{Accent, Config, HistoryMode, HEIGHTS, MAX_ROLLING_MINUTES, QUALITIES, ROLLING_SEGMENT_SECS};
@@ -74,6 +75,19 @@ impl Default for SettingsView {
 }
 
 impl SettingsView {
+    pub(crate) fn qa_reopen_player_hotkeys(&mut self) {
+        self.draft = None;
+        self.saved = None;
+        self.tab = Tab::Hotkeys;
+    }
+
+    pub(crate) fn qa_latest_binding(&self) -> Option<String> {
+        let cfg = &self.draft.as_ref()?.player;
+        shortcuts::SHORTCUTS.iter()
+            .find(|binding| binding.action == shortcuts::Action::JumpLatest)
+            .map(|binding| binding.bindings(cfg)[0].to_owned())
+    }
+
     /// Change only the staged QA draft so the sweep exercises the pinned save bar.
     pub(crate) fn qa_seed_dirty(&mut self, c: &Ctx) {
         let saved = self.saved.get_or_insert_with(|| c.cfg.clone());
@@ -146,12 +160,7 @@ impl SettingsView {
     fn settings_body(&mut self, ui: &mut Ui, c: &mut Ctx) {
         if ui.available_width() < 740.0 {
             let mut selected = self.tab;
-            let label = TABS.iter().find(|(tab, _, _)| *tab == selected).map(|(_, _, label)| *label).unwrap_or("General");
-            egui::ComboBox::from_id_salt("settings_section").selected_text(label).show_ui(ui, |ui| {
-                for (tab, _, label) in TABS {
-                    ui.selectable_value(&mut selected, tab, label);
-                }
-            });
+            settings_section_selector(ui, &mut selected);
             if selected != self.tab {
                 self.leave(c);
                 self.tab = selected;
@@ -222,7 +231,9 @@ impl SettingsView {
                     ui.label(theme::icon_text(icon::INFO, 14.0).color(theme::TEXT_DIM));
                     ui.label(RichText::new(status).color(theme::TEXT));
                 }
-                if theme::primary_button(ui, Some(icon::CHECK), "Save").clicked() {
+                let save = theme::primary_button(ui, Some(icon::CHECK), "Save");
+                super::editor_layout::remember_interaction_rect(ui, "shortcut_settings_save", save.rect);
+                if save.clicked() {
                     if restart {
                         self.confirm_restart = true;
                     } else {
@@ -263,6 +274,15 @@ impl SettingsView {
 
     fn save(&mut self, ctx: &egui::Context, c: &mut Ctx, restart_recorder: bool) {
         let Some(mut d) = self.draft.clone() else { return };
+        let shortcuts_changed = self.saved.as_ref().is_none_or(|saved| {
+            saved.player.hotkeys != d.player.hotkeys || saved.hotkeys != d.hotkeys
+        });
+        if shortcuts_changed {
+            if let Some(problem) = shortcuts::problem(&d.player, &d.hotkeys) {
+                c.toast("error", format!("Check player shortcuts: {problem}"));
+                return;
+            }
+        }
         d.sanitize();
         if let Err(error) = d.validate_media_folders() {
             c.toast("error", format!("Check your storage folders: {error}"));
@@ -328,7 +348,7 @@ impl SettingsView {
         group(ui, "Saved clip length", |ui| {
             let policy = match d.recording.rolling_seconds() {
                 Some(seconds) => format!("Replay only keeps the last {} min of unsaved footage.", seconds / 60),
-                None if d.recording.enabled => format!("Full history keeps up to {} h of footage.", d.recording.retention_hours),
+                None if d.recording.enabled => format!("Full history keeps {} of footage.", d.recording.history_label()),
                 None => "Full-history recording is turned off.".to_owned(),
             };
             ui.horizontal_wrapped(|ui| {
@@ -388,18 +408,38 @@ impl SettingsView {
             self.hotkey_row(ui, c, "open_gui", "Open ClipVault", "", &mut d.hotkeys.open_gui);
         });
         group(ui, "In the player", |ui| {
-            for (k, v) in [
-                ("Space / K", "Play / pause"),
-                ("← / →", "Back / forward (Shift for bigger jumps)"),
-                (", / .", "Previous / next frame"),
-                ("I / O", "Mark in / out"),
-                ("↑ / ↓", "Volume"),
-                ("M", "Mute"),
-                ("F / double-click", "Fullscreen"),
-                ("Esc", "Leave fullscreen / back to library"),
-            ] {
-                row(ui, k, "", |ui| {
-                    ui.add(egui::Label::new(theme::label_dim(v)).wrap());
+            ui.add(egui::Label::new(theme::small(
+                "Use a key name such as K, Left, F8 or Shift+K. Leave a box empty to disable that binding. Primary and alternate shortcuts work only in the player.",
+            )).wrap());
+            ui.label(theme::small("Esc closes fullscreen or returns to the library. Ctrl+Z undoes audio changes."));
+            if ui.button("Restore player defaults").clicked() {
+                d.player.hotkeys.retain(|id, _| !shortcuts::SHORTCUTS.iter().any(|def| def.id == id));
+            }
+            if let Some(problem) = shortcuts::problem(&d.player, &d.hotkeys) {
+                ui.add(egui::Label::new(RichText::new(problem).color(theme::DANGER)).wrap());
+            }
+            for def in shortcuts::SHORTCUTS {
+                ui.push_id(def.id, |ui| {
+                    let mut bindings = def.bindings(&d.player).map(str::to_owned);
+                    row(ui, def.label, "", |ui| {
+                        for (slot, hint) in bindings.iter_mut().zip(["Primary", "Alternate"]) {
+                            let input = ui.add(egui::TextEdit::singleline(slot).hint_text(hint).desired_width(120.0))
+                                .on_hover_text(format!("{hint} shortcut for {}", def.label));
+                            if def.action == shortcuts::Action::JumpLatest && hint == "Primary" {
+                                super::editor_layout::remember_interaction_rect(ui, "shortcut_latest_primary", input.rect);
+                                if ui.ctx().data_mut(|data| data.remove_temp::<bool>(egui::Id::unique("clipvault-qa-scroll-shortcut"))).unwrap_or(false) {
+                                    input.scroll_to_me_animation(Some(egui::Align::Center), egui::style::ScrollAnimation::none());
+                                }
+                            }
+                        }
+                    });
+                    if def.bindings(&d.player) != bindings.each_ref().map(String::as_str) {
+                        if bindings.each_ref().map(String::as_str) == def.defaults {
+                            d.player.hotkeys.remove(def.id);
+                        } else {
+                            d.player.hotkeys.insert(def.id.to_string(), bindings);
+                        }
+                    }
                 });
             }
         });
@@ -659,8 +699,20 @@ fn recording(ui: &mut Ui, c: &mut Ctx, d: &mut Config, monitors: &mut Option<Vec
             toggle_row(ui, c, "Record 24/7", "Keep a searchable timeline. Turning this off keeps a temporary buffer for clip hotkeys.", &mut d.recording.enabled);
             folder_row(ui, "Recordings folder", "Where ClipVault saves continuous recordings.", &mut d.recording.folder);
             row(ui, "Keep this much footage", "Oldest footage is deleted beyond this. Time the PC is off doesn't count.", |ui| {
-                ui.add(egui::DragValue::new(&mut d.recording.retention_hours).range(1..=1440).suffix(" h"));
-                ui.label(theme::small(format!("≈ {:.1} days of recording", d.recording.retention_hours as f32 / 24.0)));
+                let current = d.recording.history_minutes();
+                egui::ComboBox::from_id_salt("archive_history_duration")
+                    .selected_text(d.recording.history_label()).show_ui(ui, |ui| {
+                        for (minutes, label) in [(1, "1 min"), (5, "5 min"), (10, "10 min"), (30, "30 min"), (60, "1 h"), (360, "6 h"), (1440, "24 h"), (2880, "48 h"), (10080, "7 days")] {
+                            if ui.selectable_label(minutes == current, label).clicked() {
+                                d.recording.set_history_minutes(minutes);
+                            }
+                        }
+                    });
+                let mut minutes = d.recording.history_minutes();
+                if ui.add(egui::DragValue::new(&mut minutes).range(1..=86400)
+                    .prefix("Custom: ").suffix(" min")).changed() {
+                    d.recording.set_history_minutes(minutes);
+                }
             });
             row(ui, "Also delete footage older than", "0 = never delete by age.", |ui| {
                 ui.add(egui::DragValue::new(&mut d.recording.max_age_days).range(0..=3650).suffix(" days"));
@@ -673,6 +725,10 @@ fn recording(ui: &mut Ui, c: &mut Ctx, d: &mut Config, monitors: &mut Option<Vec
             });
             row(ui, "File length", "Shorter segments give retention finer control.", |ui| {
                 ui.add(egui::DragValue::new(&mut d.recording.segment_minutes).range(1..=240).suffix(" min"));
+                let actual = d.recording.archive_segment_seconds();
+                if actual < d.recording.segment_minutes * 60 {
+                    ui.label(theme::small(format!("Using {actual} s files for this history window.")));
+                }
             });
         }
     });
@@ -934,6 +990,25 @@ fn about(ui: &mut Ui, c: &mut Ctx) {
 
 // ------------------------------------------------------------ helpers
 
+fn settings_section_selector(ui: &mut Ui, selected: &mut Tab) -> egui::Response {
+    let label = TABS
+        .iter()
+        .find(|(tab, _, _)| *tab == *selected)
+        .map(|(_, _, label)| *label)
+        .unwrap_or("General");
+    egui::ComboBox::from_id_salt("settings_section")
+        .selected_text(label)
+        .width(ui.available_width().min(220.0))
+        .truncate()
+        .show_ui(ui, |ui| {
+            for (tab, _, label) in TABS {
+                ui.selectable_value(selected, tab, label);
+            }
+        })
+        .response
+        .on_hover_text(label)
+}
+
 fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -955,6 +1030,30 @@ fn field_width(available: f32, preferred: f32, trailing: f32) -> f32 {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn compact_section_switches_keep_selector_and_next_row_anchored() {
+        for width in [180.0, 310.0, 620.0] {
+            let ctx = egui::Context::default();
+            let mut expected = None;
+            for (mut selected, _, label) in TABS {
+                let mut bounds = None;
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 400.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let selector = settings_section_selector(ui, &mut selected);
+                        let next = ui.label("Section content");
+                        bounds = Some((selector.rect, next.rect));
+                    },
+                );
+                let bounds = bounds.unwrap();
+                assert_eq!(bounds, *expected.get_or_insert(bounds), "{label} shifted layout at {width}");
+            }
+        }
+    }
 
     #[test]
     fn control_rows_and_long_paths_fit_across_the_reflow_boundary() {

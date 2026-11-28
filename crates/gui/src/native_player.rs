@@ -54,6 +54,9 @@ pub struct NativeState {
     pub position: f64,
     pub duration: f64,
     pub ended: bool,
+    pub first_frame: bool,
+    pub last_frame: bool,
+    pub next_frame_pos: Option<f64>,
     pub error: Option<String>,
     pub audio_tracks: usize,
     pub info: Option<Arc<MediaInfo>>,
@@ -69,6 +72,8 @@ pub struct VideoFrame {
 enum Command {
     Load(PathBuf, f64, bool, bool),
     Seek(f64, bool),
+    Step(bool),
+    Latest,
     Pause(bool),
     Speed(f64),
     Volume(f64),
@@ -106,6 +111,14 @@ impl NativePlayer {
 
     pub fn seek(&self, t: f64, exact: bool) {
         let _ = self.tx.send(Command::Seek(t, exact));
+    }
+
+    pub fn step(&self, forward: bool) {
+        let _ = self.tx.send(Command::Step(forward));
+    }
+
+    pub fn seek_latest(&self) {
+        let _ = self.tx.send(Command::Latest);
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -239,6 +252,13 @@ struct Media {
     live: bool,
     refreshed: Instant,
     seek_picture: bool,
+    frame_starts: Vec<i64>,
+    first_frame: i64,
+    last_frame: i64,
+    shown_frame: Option<i64>,
+    mixed: Vec<f32>,
+    input: Vec<f32>,
+    gains: Vec<f32>,
 }
 
 impl Media {
@@ -260,10 +280,19 @@ impl Media {
         }).collect();
         let duration = reader.duration_secs();
         let info = Arc::new(probe_reader(&reader));
+        let frame_starts = reader.frame_starts_near(video, 0)?;
+        let first_frame = frame_starts.first().copied().unwrap_or(0);
+        let last_frame = if reader.is_fragmented() {
+            reader.frame_starts_near(video, i64::MAX)?.last().copied()
+        } else {
+            frame_starts.last().copied()
+        }.unwrap_or(first_frame);
         let mut media = Self {
             reader, video, decoder, next_dts: 0, audio, curves: Vec::new(), info, duration, live,
             samples: VecDeque::new(), pictures: VecDeque::new(), drained: false,
             refreshed: Instant::now(), seek_picture: true,
+            frame_starts, first_frame, last_frame, shown_frame: None,
+            mixed: Vec::new(), input: Vec::new(), gains: Vec::new(),
         };
         media.update_curves(mix);
         Ok(media)
@@ -279,6 +308,14 @@ impl Media {
             self.refreshed = Instant::now();
             if self.reader.refresh()? {
                 self.duration = self.reader.duration_secs();
+                let latest = self.reader.frame_starts_near(self.video, i64::MAX)?;
+                if let Some(&last) = latest.last() {
+                    self.last_frame = last;
+                }
+                if self.frame_starts.is_empty() {
+                    self.first_frame = latest.first().copied().unwrap_or(0);
+                    self.frame_starts = latest;
+                }
                 self.info = Arc::new(probe_reader(&self.reader));
                 self.drained = false;
                 self.update_curves(mix);
@@ -291,10 +328,59 @@ impl Media {
         Ok(())
     }
 
+    fn frame_seconds(&self, ticks: i64) -> f64 {
+        ticks as f64 / f64::from(self.reader.tracks[self.video].timescale)
+    }
+
+    fn load_frame_window(&mut self, at: i64) -> Result<()> {
+        if self.frame_starts.first().is_none_or(|&t| at <= t) || self.frame_starts.last().is_none_or(|&t| at >= t) {
+            if self.reader.is_fragmented() {
+                self.frame_starts = self.reader.frame_starts_near(self.video, at)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn neighbor(&mut self, at: i64, forward: bool) -> Result<i64> {
+        self.load_frame_window(at)?;
+        let before = self.frame_starts.partition_point(|&t| t < at);
+        let after = self.frame_starts.partition_point(|&t| t <= at);
+        let target = if forward {
+            self.frame_starts.get(after).copied().unwrap_or(self.last_frame)
+        } else {
+            before.checked_sub(1).and_then(|i| self.frame_starts.get(i).copied()).unwrap_or(self.first_frame)
+        };
+        Ok(target)
+    }
+
+    fn step(&mut self, position: f64, forward: bool) -> Result<f64> {
+        let scale = f64::from(self.reader.tracks[self.video].timescale);
+        let at = if let Some(shown) = self.shown_frame {
+            shown
+        } else {
+            // A seek and a frame shortcut can arrive in the same input batch.
+            // Resolve the image under the seek cursor before advancing from it.
+            let ticks = (position * scale).round() as i64;
+            self.load_frame_window(ticks)?;
+            let after = self.frame_starts.partition_point(|&t| t <= ticks);
+            after.checked_sub(1).and_then(|i| self.frame_starts.get(i).copied()).unwrap_or(self.first_frame)
+        };
+        let target = self.neighbor(at, forward)?;
+        let seconds = self.frame_seconds(target);
+        if forward && !self.seek_picture && target > at {
+            // The decoder is already positioned after the displayed image.
+            // Consume its next picture without replaying from the previous keyframe.
+            self.seek_picture = true;
+            self.shown_frame = None;
+            return Ok(seconds);
+        }
+        self.seek(seconds, true)
+    }
+
     fn seek(&mut self, t: f64, exact: bool) -> Result<f64> {
         let target = if t.is_finite() { t.clamp(0.0, self.duration) } else { 0.0 };
         let track = &self.reader.tracks[self.video];
-        let ticks = ((target + track.edit_start_s()) * track.timescale as f64) as u64;
+        let ticks = ((target + track.edit_start_s()) * track.timescale as f64).round() as u64;
         let key = self.reader.sync_at_or_before(self.video, ticks)?;
         self.next_dts = key.map_or(0, |s| s.dts);
         let position = match (exact, key) {
@@ -304,6 +390,7 @@ impl Media {
         };
         self.samples.clear();
         self.pictures.clear();
+        self.shown_frame = None;
         self.decoder.flush();
         self.drained = false;
         self.seek_picture = true;
@@ -337,7 +424,7 @@ impl Media {
         let track = &self.reader.tracks[self.video];
         let timescale = track.timescale as f64;
         let edit = track.edit_start_s();
-        let target = (position.min((self.duration - 0.00001).max(0.0)) * VIDEO_CLOCK) as i64;
+        let target = (position.min((self.duration - 0.00001).max(0.0)) * VIDEO_CLOCK).round() as i64;
         let mut frame = None;
         // Decode a bounded batch so rapid scrubbing can supersede an expensive seek.
         for _ in 0..12 {
@@ -382,9 +469,11 @@ impl Media {
     fn pcm(&mut self, first: f64, speed: f64, frames: usize, volume: f32) -> Result<Vec<f32>> {
         let from = first.floor() as i64;
         let count = (first - from as f64 + frames as f64 * speed).ceil() as usize + 2;
-        let mut mixed = vec![0.0; count * 2];
-        let mut input = vec![0.0; count * 2];
-        let mut gains = vec![0.0; count];
+        let (mixed, input, gains) = (&mut self.mixed, &mut self.input, &mut self.gains);
+        mixed.resize(count * 2, 0.0);
+        mixed.fill(0.0);
+        input.resize(count * 2, 0.0);
+        gains.resize(count, 0.0);
         for (track, curve) in self.audio.iter_mut().zip(&self.curves) {
             if track.broken || curve.is_silent() {
                 continue;
@@ -410,8 +499,8 @@ impl Media {
             let keep = input.len().min(track.tail.len());
             track.tail[8 - keep..].copy_from_slice(&input[input.len() - keep..]);
             track.read_until = pos + count as i64;
-            curve.fill(from as f64 / RATE, 1.0 / RATE, &mut gains);
-            for ((dst, src), g) in mixed.chunks_exact_mut(2).zip(input.chunks_exact(2)).zip(&gains) {
+            curve.fill(from as f64 / RATE, 1.0 / RATE, gains);
+            for ((dst, src), g) in mixed.chunks_exact_mut(2).zip(input.chunks_exact(2)).zip(gains.iter()) {
                 dst[0] += src[0] * g;
                 dst[1] += src[1] * g;
             }
@@ -470,6 +559,7 @@ impl Playback {
                 view.lock().frame = None;
                 self.reset_audio();
                 let mut media = Media::open(path, live, &self.mix)?;
+                let start = if start == f64::MAX { media.frame_seconds(media.last_frame) } else { start };
                 self.state.position = media.seek(start, true)?;
                 self.state.duration = media.duration;
                 self.state.audio_tracks = media.audio.len();
@@ -485,6 +575,25 @@ impl Playback {
                     self.reset_audio();
                 }
             }
+            Command::Step(forward) => {
+                if let Some(media) = &mut self.media {
+                    self.state.position = media.step(self.state.position, forward)?;
+                    self.state.ended = false;
+                    self.state.paused = true;
+                    self.reset_audio();
+                }
+            }
+            Command::Latest => {
+                if let Some(media) = &mut self.media {
+                    if media.live {
+                        media.refreshed = Instant::now() - REFRESH;
+                        media.refresh(&self.mix)?;
+                    }
+                    self.state.position = media.seek(media.frame_seconds(media.last_frame), true)?;
+                    self.state.ended = false;
+                    self.reset_audio();
+                }
+            }
             Command::Pause(paused) => {
                 if self.state.paused != paused {
                     if !paused && self.state.ended {
@@ -494,6 +603,14 @@ impl Playback {
                         self.state.ended = false;
                     }
                     self.state.paused = paused;
+                    if paused {
+                        if let Some(media) = &mut self.media {
+                            if let Some(shown) = media.shown_frame {
+                                let next = media.neighbor(shown, true)?;
+                                self.state.next_frame_pos = (next > shown).then(|| media.frame_seconds(next));
+                            }
+                        }
+                    }
                     self.reset_audio();
                 }
             }
@@ -532,6 +649,9 @@ impl Playback {
         media.refresh(&self.mix)?;
         self.state.duration = media.duration;
         self.state.info = Some(media.info.clone());
+        if let Some(shown) = media.shown_frame {
+            self.state.last_frame = shown >= media.last_frame;
+        }
         let playing = !self.state.paused && !media.seek_picture;
         if playing && !media.audio.is_empty() && self.output.is_none() && now >= self.output_retry {
             self.output_retry = now + Duration::from_secs(2);
@@ -592,6 +712,16 @@ impl Playback {
             return Ok(None);
         }
         let Some(frame) = media.picture(self.state.position)? else { return Ok(None) };
+        let pts = ((frame.pts_hns as f64 / VIDEO_CLOCK) * f64::from(media.reader.tracks[media.video].timescale)).round() as i64;
+        media.shown_frame = Some(pts.max(0));
+        self.state.next_frame_pos = if self.state.paused {
+            let next = media.neighbor(pts.max(0), true)?;
+            (next > pts).then(|| media.frame_seconds(next))
+        } else {
+            None
+        };
+        self.state.first_frame = pts <= media.first_frame;
+        self.state.last_frame = pts >= media.last_frame;
         let width = frame.width as usize;
         let height = frame.height as usize;
         let rgba = rgba_from_nv12(&frame);
@@ -626,13 +756,20 @@ fn rgba_from_nv12(frame: &DecodedFrame) -> Vec<u8> {
 fn run(rx: Receiver<Command>, view: Arc<Mutex<View>>, ctx: egui::Context) {
     cv_media::mf::init();
     let mut playback = Playback::new();
+    let mut last_paint = Instant::now();
     loop {
         let active = playback.media.as_ref().is_some_and(|media| {
             !playback.state.paused || media.seek_picture
         });
-        let wait = if active { TICK } else { REFRESH };
+        let received = if active {
+            rx.recv_timeout(TICK)
+        } else if playback.media.as_ref().is_some_and(|m| m.live) {
+            rx.recv_timeout(REFRESH)
+        } else {
+            rx.recv().map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)
+        };
         let mut changed = false;
-        match rx.recv_timeout(wait) {
+        match received {
             Ok(cmd) => {
                 let mut pending = Some(cmd);
                 // Coalesce rapid drag seeks while respecting the order of other operations.
@@ -657,6 +794,8 @@ fn run(rx: Receiver<Command>, view: Arc<Mutex<View>>, ctx: egui::Context) {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
         }
+        #[cfg(test)]
+        tests::WORKER_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let previous_info = playback.state.info.clone();
         let frame = match playback.tick() {
             Ok(frame) => frame,
@@ -675,6 +814,7 @@ fn run(rx: Receiver<Command>, view: Arc<Mutex<View>>, ctx: egui::Context) {
             (None, None) => false,
             _ => true,
         };
+        let repaint = changed || refreshed || frame.is_some() || (active && last_paint.elapsed() >= REFRESH);
         if changed || active || frame.is_some() || refreshed {
             let mut data = view.lock();
             data.state = playback.state.clone();
@@ -682,7 +822,10 @@ fn run(rx: Receiver<Command>, view: Arc<Mutex<View>>, ctx: egui::Context) {
                 data.frame = Some(Arc::new(frame));
             }
             drop(data);
-            ctx.request_repaint();
+            if repaint {
+                last_paint = Instant::now();
+                ctx.request_repaint();
+            }
         }
     }
 }
