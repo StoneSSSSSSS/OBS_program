@@ -89,7 +89,7 @@ pub fn cut(sources: &[CutSource], dest: &Path, start_ms: Option<i64>, progress: 
     for r in &readers[1..] {
         let vi = r.video().context("a source has no video")?;
         if r.tracks[vi].codec != vt.codec {
-            bail!("that range spans recordings with different video settings; clip each part separately");
+            bail!("This selection includes recordings made with different video settings. Shorten the range so it stays on one side of the settings change, or save each part as a separate clip.");
         }
     }
     let vts = vt.timescale as f64;

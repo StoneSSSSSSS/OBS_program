@@ -7,7 +7,7 @@ use cv_core::config::Config;
 use cv_core::db::Db;
 use cv_core::ipc::{AudioDevices, Event, JobInfo, ServerMsg, Status};
 use parking_lot::{Mutex, RwLock};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -18,6 +18,7 @@ pub enum EngineCmd {
     SaveClip { short: bool, reply: Reply },
     SaveRecentRolling { seconds: u32, reply: Reply },
     SetRecording { enabled: bool, reply: Reply },
+    ToggleRecording,
     Restart { reply: Reply },
     ConfigChanged { restart: bool },
     Mic { decision: MicDecision },
@@ -147,6 +148,15 @@ pub fn norm_path(p: &str) -> String {
 
 pub fn same_path(a: &str, b: &str) -> bool {
     norm_path(a).eq_ignore_ascii_case(&norm_path(b))
+}
+
+pub fn media_path_allowed(path: &Path) -> bool {
+    !cv_core::paths::uses_local_storage() || cv_core::paths::owns_local_path(path)
+}
+
+pub fn require_media_path(path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(media_path_allowed(path), "Media path is outside this project profile: {}", path.display());
+    Ok(())
 }
 
 #[cfg(test)]

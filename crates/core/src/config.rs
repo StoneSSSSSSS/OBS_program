@@ -1,4 +1,4 @@
-//! User configuration (`%LOCALAPPDATA%\ClipVault\config.toml`).
+//! Settings stored in the selected ClipVault profile.
 //!
 //! Every field has a default so that old config files keep loading after new
 //! settings are added, and unknown keys (like the old `[obs]` section) are
@@ -24,11 +24,9 @@ pub struct Config {
     pub advanced: AdvancedConfig,
 }
 
-/// `%USERPROFILE%\Videos\ClipVault\<sub>`: where recordings and clips go
-/// unless the user picks somewhere else.
+/// Default media storage for the selected ClipVault profile.
 pub fn default_media_folder(sub: &str) -> String {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\"));
-    home.join("Videos").join(crate::APP_NAME).join(sub).to_string_lossy().to_string()
+    crate::paths::default_media_folder(sub).to_string_lossy().into_owned()
 }
 
 // ---------------------------------------------------------------- general
@@ -36,8 +34,8 @@ pub fn default_media_folder(sub: &str) -> String {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Accent {
-    Mono,
     #[default]
+    Mono,
     Red,
     Blue,
     Green,
@@ -82,7 +80,7 @@ pub struct GeneralConfig {
 
 impl Default for GeneralConfig {
     fn default() -> Self {
-        Self { start_with_windows: true, show_tray_icon: true, notifications: true, accent: Accent::Red, ui_scale: 1.0, confirm_deletes: true, start_page: "home".into(), reduce_motion: false }
+        Self { start_with_windows: !crate::paths::uses_local_storage(), show_tray_icon: true, notifications: true, accent: Accent::default(), ui_scale: 1.0, confirm_deletes: true, start_page: "home".into(), reduce_motion: false }
     }
 }
 
@@ -466,7 +464,7 @@ impl PlayerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ExportConfig {
-    /// Empty = `<clips folder>\_Exports`.
+    /// Empty = profile exports on portable installs, or `<clips folder>\_Exports` on conventional installs.
     pub folder: String,
     pub audio_bitrate_kbps: u32,
     /// Default size target for "Share" exports, in MB.
@@ -694,11 +692,43 @@ impl Config {
     }
 
     pub fn exports_dir(&self) -> PathBuf {
-        if self.export.folder.trim().is_empty() {
-            PathBuf::from(&self.clips.folder).join("_Exports")
-        } else {
+        if !self.export.folder.trim().is_empty() {
             PathBuf::from(self.export.folder.trim())
+        } else if crate::paths::uses_local_storage() {
+            crate::paths::data_dir().join("exports")
+        } else {
+            PathBuf::from(&self.clips.folder).join("_Exports")
         }
+    }
+
+    /// Ensure capture and retention cannot see clips, exports or temporary
+    /// recorder media as part of the continuous archive.
+    pub fn validate_media_folders(&self) -> anyhow::Result<()> {
+        let profile = crate::paths::data_dir();
+        let exports = self.exports_dir();
+        if crate::paths::uses_local_storage() {
+            for (label, path) in [
+                ("Recordings", Path::new(&self.recording.folder)),
+                ("Clips", Path::new(&self.clips.folder)),
+                ("Exports", exports.as_path()),
+            ] {
+                anyhow::ensure!(crate::paths::owns_local_path(path),
+                    "Choose a {label} folder inside this portable profile: {}", profile.display());
+            }
+        }
+        let scratch = ["buffer", "rolling", "tmp", "waves", "thumbs", "trash", "trim-recovery", "logs"]
+            .map(|name| profile.join(name));
+        check_media_folders(Path::new(&self.recording.folder), Path::new(&self.clips.folder), &exports, &scratch)
+    }
+
+    pub fn validate_clip_destination(&self, directory: &Path) -> anyhow::Result<()> {
+        self.validate_media_folders()?;
+        let destination = crate::paths::media_path_key(directory)?;
+        let clips = crate::paths::media_path_key(Path::new(&self.clips.folder))?;
+        let exports = crate::paths::media_path_key(&self.exports_dir())?;
+        anyhow::ensure!(destination.starts_with(&clips) && !destination.starts_with(&exports),
+            "Clip folder {} redirects outside Clips or into Exports. Choose a different clip folder.", directory.display());
+        Ok(())
     }
 
     /// Settings that need the recorder restarted to take effect.
@@ -752,6 +782,32 @@ impl Config {
         }
         changed
     }
+}
+
+fn check_media_folders(recordings: &Path, clips: &Path, exports: &Path, scratch: &[PathBuf]) -> anyhow::Result<()> {
+    let key = |label: &str, path: &Path| {
+        crate::paths::media_path_key(path).map_err(|error| {
+            anyhow::anyhow!("Cannot verify the {label} folder {}: {error}", path.display())
+        })
+    };
+    let archive = key("Recordings", recordings)?;
+    let kept = key("Kept recordings", &recordings.join("Kept"))?;
+    let clips = key("Clips", clips)?;
+    let exports = key("Exports", exports)?;
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+
+    anyhow::ensure!(!overlaps(&archive, &clips) && !overlaps(&kept, &clips),
+        "Recordings and Clips overlap. Choose separate folders so saved clips stay outside archive cleanup.");
+    anyhow::ensure!(!overlaps(&archive, &exports) && !overlaps(&kept, &exports),
+        "Recordings and Exports overlap. Choose separate folders so export files stay outside archive cleanup.");
+    anyhow::ensure!(!clips.starts_with(&exports),
+        "Exports must be separate from Clips or inside its own Clips subfolder.");
+    for folder in scratch {
+        let internal = key("temporary or internal storage", folder)?;
+        anyhow::ensure!([&archive, &kept, &clips, &exports].iter().all(|media| !overlaps(media, &internal)),
+            "A media folder overlaps internal ClipVault storage at {}. Choose separate media folders.", folder.display());
+    }
+    Ok(())
 }
 
 fn dedup_case_insensitive(v: &mut Vec<String>) {
@@ -836,6 +892,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn media_folders_allow_nested_exports_but_reject_archive_and_scratch_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let archive = root.join("Recordings");
+        let clips = root.join("Clips");
+        let exports = clips.join("_Exports");
+        let scratch = [root.join("buffer"), root.join("rolling")];
+        assert!(check_media_folders(&archive, &clips, &exports, &scratch).is_ok());
+        assert!(check_media_folders(&archive, &clips, &root.join("Exports"), &scratch).is_ok());
+        assert!(check_media_folders(&archive, &root.join("recordings"), &exports, &scratch).is_err());
+        assert!(check_media_folders(&archive, &archive.join("Clips"), &exports, &scratch).is_err());
+        assert!(check_media_folders(&clips.join("Recordings"), &clips, &exports, &scratch).is_err());
+        assert!(check_media_folders(&archive, &clips, &clips, &scratch).is_err());
+        assert!(check_media_folders(&archive, &clips, &archive.join("Exports"), &scratch).is_err());
+        assert!(check_media_folders(&scratch[0].join("archive"), &clips, &exports, &scratch).is_err());
+        assert!(check_media_folders(&archive, &scratch[1], &exports, &scratch).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires permission to create a Windows junction in an isolated temporary folder"]
+    fn media_folders_resolve_a_kept_junction_before_allowing_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let archive = root.join("Recordings");
+        let kept = archive.join("Kept");
+        let clips = root.join("Clips");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::create_dir(&clips).unwrap();
+        let junction = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&kept).arg(&clips).output().unwrap();
+        assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
+        let result = check_media_folders(&archive, &clips, &clips.join("_Exports"), &[]);
+        std::fs::remove_dir(kept).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn replay_mode_is_opt_in_and_window_updates_without_restarting() {
         let archive: Config = toml::from_str("[recording]\nenabled = true").unwrap();
         assert_eq!(archive.recording.history_mode, HistoryMode::Archive);
@@ -917,6 +1012,31 @@ mod tests {
         assert!((10_000..16_000).contains(&k), "{k}");
         let c = RecordingConfig { quality: "custom".into(), bitrate_kbps: 7000, ..Default::default() };
         assert_eq!(c.video_kbps(1920, 1080), 7000);
+    }
+
+    #[test]
+    fn explicit_legacy_storage_and_accent_survive_deserialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, r#"
+            [general]
+            accent = "purple"
+            start_with_windows = true
+            [recording]
+            folder = 'X:\old recordings'
+            [clips]
+            folder = 'Y:\old clips'
+            [export]
+            folder = 'Z:\my exports'
+        "#).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.general.accent, Accent::Purple);
+        assert!(config.general.start_with_windows);
+        assert_eq!(config.recording.folder, r"X:\old recordings");
+        assert_eq!(config.clips.folder, r"Y:\old clips");
+        assert_eq!(config.exports_dir(), PathBuf::from(r"Z:\my exports"));
+        assert_eq!(Config::default().general.accent, Accent::Mono);
+        assert!(Config::default().recording.enabled);
     }
 
     #[test]

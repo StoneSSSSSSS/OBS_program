@@ -2,14 +2,15 @@
 //! Run one at a time on their own thread with progress reported to the GUI.
 
 use crate::clips::{attribute_game, clip_dir, move_file, plan, probe_and_thumb, temp_beside};
-use crate::shared::{Footage, Shared};
+use crate::shared::{media_path_allowed, require_media_path, Footage, Shared};
+use crate::trim_recovery::{self, Intent, PendingTrim};
 use crate::win::ui::{ToastLevel, UiCmd};
 use anyhow::{Context, Result};
 use cv_core::db::{ClipWrite, Db};
 use cv_core::ipc::{Event, ExportSource, JobInfo};
 use cv_core::mixer::MixSettings;
 use cv_core::model::{rebase_edits, AudioEdit, NewClip};
-use cv_core::naming::{render_template, sanitize_component, unique_path};
+use cv_core::naming::{clean_display_title, render_title, unique_path, unique_path_with_suffix};
 use cv_core::util::now_ms;
 use cv_media::cut::{cut, CutSource, CutSpan};
 use cv_media::export::{bitrate_for_size, export as run_export, ExportJob, VideoOut};
@@ -103,12 +104,18 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<JobRequest>) {
         match result {
             Ok((output, clip_id)) => {
                 let output_bytes = output.metadata().ok().map(|file| file.len());
+                let display_title = clip_id
+                    .and_then(|id| Db::open_default().ok()?.clip(id).ok().flatten())
+                    .map(|clip| clip.title);
                 update(&sh, id, |j| {
                     j.state = "done".into();
                     j.progress = 1.0;
                     j.output_bytes = output_bytes;
                     j.output = Some(output.to_string_lossy().to_string());
                     j.clip_id = clip_id;
+                    if let Some(title) = display_title {
+                        j.title = title;
+                    }
                 });
                 if let Some(c) = clip_id {
                     sh.emit(Event::ClipAdded { clip_id: c });
@@ -156,6 +163,7 @@ fn footage_for(sh: &Shared, from_ms: i64, to_ms: i64) -> Result<Vec<Footage>> {
     Ok(db
         .list_recordings()?
         .into_iter()
+        .filter(|recording| media_path_allowed(Path::new(&recording.path)))
         .filter(|r| r.start_ms < to_ms && (r.end_ms() > from_ms || r.is_live()))
         .filter(|r| !r.is_live() || crate::shared::same_path(&r.path, &live_path))
         .map(|r| Footage {
@@ -232,10 +240,13 @@ fn cut_range(
         None => attribute_game(&db, from_ms, to_ms, &cfg.clips.unknown_game_name)?,
     };
     let local = chrono::DateTime::from_timestamp_millis(from_ms).unwrap_or_default().with_timezone(&chrono::Local);
-    let title = if title.trim().is_empty() { render_template(&cfg.clips.name_template, &game_name, &exe, local) } else { sanitize_component(title) };
+    let title = clean_display_title(title);
+    let title = if title.is_empty() { render_title(&cfg.clips.name_template, &game_name, &exe, local) } else { title };
     let dir = clip_dir(&cfg, &game_name);
+    cfg.validate_clip_destination(&dir)?;
+    require_media_path(&dir)?;
     std::fs::create_dir_all(&dir)?;
-    let tmp = TemporaryClip(temp_beside(&dir));
+    let tmp = TemporaryClip(temp_beside(&dir), None);
     let (dur, start_ms, clip_edits) = cut_recording(sh, from_ms, to_ms, &tmp.0, edits, progress, cancel)?;
     let info = cv_media::probe::probe(&tmp.0)?;
     let _lock = sh.library_lock.lock();
@@ -243,7 +254,7 @@ fn cut_range(
         let dest = unique_path(&dir, &title, "mp4", None);
         let id = write.insert(&NewClip {
             path: dest.to_string_lossy().into_owned(),
-            title: dest.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(title),
+            title: title.clone(),
             game_id: Some(gid),
             created_at: to_ms,
             source_start_ms: Some(start_ms),
@@ -259,28 +270,35 @@ fn cut_range(
     if let Ok(w) = cv_media::wave::generate(&dest, 0.0, None, cancel) {
         let _ = w.save(&cv_core::waveform::wave_path(&dest));
     }
-    sh.toast(ToastLevel::Success, format!("Clip created: {}", dest.file_stem().unwrap_or_default().to_string_lossy()));
+    sh.toast(ToastLevel::Success, "Clip created");
     sh.log_event("info", format!("Clipped {} from the 24/7 recording", cv_core::util::format_duration(dur)));
     Ok((dest, Some(id)))
 }
 
 fn trim(sh: &Shared, clip_id: i64, start_s: f64, end_s: f64, replace: bool, progress: &mut dyn FnMut(f32), cancel: &AtomicBool) -> Result<(PathBuf, Option<i64>)> {
     let cfg = sh.cfg();
+    cfg.validate_media_folders()?;
     anyhow::ensure!(start_s.is_finite() && end_s.is_finite(), "the trim range is invalid");
     let start_s = start_s.max(0.0);
     anyhow::ensure!(end_s > start_s + 0.1, "the trim range is empty");
     let db = Db::open_default()?;
     let clip = db.clip(clip_id)?.context("clip not found")?;
     let src = PathBuf::from(&clip.path);
+    require_media_path(&src)?;
     let original = file_version(&src).context("Could not read the source clip")?;
     let dir = src.parent().map(Path::to_path_buf).unwrap_or_default();
-    let tmp = TemporaryClip(temp_beside(&dir));
+    let mut tmp = TemporaryClip(temp_beside(&dir), None);
     let start_ms = clip.source_start_ms.map(|s| s.saturating_add((start_s * 1000.0) as i64));
     let cut = cut(&[CutSource { path: src.clone(), from_s: start_s, to_s: Some(end_s) }], &tmp.0, start_ms, progress, cancel)?;
+    if replace {
+        tmp.1 = Some(file_version(&tmp.0)?);
+    }
     let span = cut.spans.first().context("the trim range is empty")?;
     let info = cv_media::probe::probe(&tmp.0)?;
     let _lock = sh.library_lock.lock();
-    let (id, dest, backup) = commit_clip_output(&db, &tmp.0, cancel, |write| {
+    let recovery_dir = trim_recovery::recovery_dir();
+    let intent = replace.then_some(Intent { dir: &recovery_dir, clip: &clip, recycle: cfg.clips.delete_to_recycle_bin });
+    let (id, dest, backup) = commit_clip_output_inner(&db, &tmp.0, cancel, intent, |write| {
         let current = write.clip(clip_id)?.context("clip not found")?;
         anyhow::ensure!(
             !current.missing && current.path == clip.path && current.created_at == clip.created_at
@@ -293,10 +311,10 @@ fn trim(sh: &Shared, clip_id: i64, start_s: f64, end_s: f64, replace: bool, prog
             write.trim(clip_id, start_ms, &edits)?;
             (clip_id, src.clone())
         } else {
-            let dest = unique_path(&dir, &format!("{} (trim)", current.title), "mp4", None);
+            let dest = unique_path_with_suffix(&dir, &current.title, Some("trim"), "mp4", None);
             let id = write.insert(&NewClip {
                 path: dest.to_string_lossy().into_owned(),
-                title: dest.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+                title: format!("{} (trim)", current.title),
                 game_id: current.game_id,
                 created_at: now_ms(),
                 source_start_ms: start_ms,
@@ -324,10 +342,13 @@ fn trim(sh: &Shared, clip_id: i64, start_s: f64, end_s: f64, replace: bool, prog
     Ok((dest, Some(id)))
 }
 
-struct TemporaryClip(PathBuf);
+struct TemporaryClip(PathBuf, Option<[u32; 7]>);
 
 impl Drop for TemporaryClip {
     fn drop(&mut self) {
+        if self.1.is_some_and(|version| file_version(&self.0).ok() != Some(version)) {
+            return;
+        }
         remove_job_file(&self.0).unwrap_or_else(|error| {
             tracing::warn!("Temporary clip retained at {}: {error:#}", self.0.display());
         });
@@ -341,7 +362,7 @@ fn remove_job_file(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn file_version(path: &Path) -> Result<[u32; 7]> {
+pub(crate) fn file_version(path: &Path) -> Result<[u32; 7]> {
     let file = std::fs::File::open(path)?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info)? };
@@ -376,12 +397,34 @@ fn commit_clip_output<T>(
     cancel: &AtomicBool,
     prepare: impl FnOnce(&ClipWrite<'_>) -> Result<(T, PathBuf, bool)>,
 ) -> Result<(T, PathBuf, Option<PathBuf>)> {
+    commit_clip_output_inner(db, temp, cancel, None, prepare)
+}
+
+pub(crate) fn commit_clip_output_inner<T>(
+    db: &Db,
+    temp: &Path,
+    cancel: &AtomicBool,
+    mut intent: Option<Intent<'_>>,
+    prepare: impl FnOnce(&ClipWrite<'_>) -> Result<(T, PathBuf, bool)>,
+) -> Result<(T, PathBuf, Option<PathBuf>)> {
     let mut published = None;
+    let mut pending = None;
     let result = db.clip_write(|write| {
         anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
+        let previous = if let Some(intent) = &intent { write.clip(intent.clip.id)? } else { None };
         let (value, dest, replace) = prepare(write)?;
         anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
-        let backup = if replace {
+        let backup = if let Some(intent) = intent.take() {
+            anyhow::ensure!(replace, "Recovery is only for in-place trims");
+            let intent = Intent { clip: previous.as_ref().context("Missing original clip metadata")?, ..intent };
+            pending = Some(PendingTrim::create(intent, temp, &dest)?);
+            let recovery = pending.as_ref().expect("recovery record was created");
+            write.mark_trim_committed(&recovery.key())?;
+            recovery.publish()?;
+            #[cfg(test)]
+            trim_recovery::test_crash(&dest, "before-commit");
+            None
+        } else if replace {
             let backup = dest.with_file_name(format!(
                 ".cv_{}_{}", cv_core::util::random_token(12),
                 dest.file_name().unwrap_or_default().to_string_lossy(),
@@ -412,6 +455,16 @@ fn commit_clip_output<T>(
         published = Some((dest.clone(), backup.clone()));
         Ok((value, dest, backup))
     });
+    if let Some(recovery) = pending {
+        #[cfg(test)]
+        if let Ok((_, destination, _)) = &result {
+            trim_recovery::test_crash(destination, "after-commit");
+        }
+        if let Err(error) = recovery.resolve(db) {
+            tracing::warn!("Interrupted trim needs attention: {error:#}");
+        }
+        return result;
+    }
     if let Err(error) = &result {
         if let Some((dest, backup)) = published {
             if let Some(backup) = backup {
@@ -454,6 +507,8 @@ fn export(
 ) -> Result<(PathBuf, Option<i64>)> {
     let cfg = sh.cfg();
     let out_dir = cfg.exports_dir();
+    cfg.validate_media_folders()?;
+    require_media_path(&out_dir)?;
     std::fs::create_dir_all(&out_dir)?;
     // Where the picture and sound come from.
     let (src, edits, start_ms, name, temp): (PathBuf, Vec<AudioEdit>, Option<i64>, String, Option<PathBuf>) = match source {
@@ -471,6 +526,7 @@ fn export(
             (tmp.clone(), e, Some(start), format!("24-7 {}", local.format("%Y-%m-%d %H-%M-%S")), Some(tmp))
         }
     };
+    require_media_path(&src)?;
     anyhow::ensure!(src.is_file(), "the source file is missing");
     let result = (|| -> Result<PathBuf> {
         let gains = gains_for(&src, mix, &edits, 0.0, cfg.player.fade_s(), &cfg.audio.app_categories)?;
@@ -487,12 +543,13 @@ fn export(
             },
             None => VideoOut::Copy,
         };
-        let label = if title.trim().is_empty() { name.clone() } else { sanitize_component(title) };
+        let label = clean_display_title(title);
+        let label = if label.is_empty() { &name } else { &label };
         let suffix = match target_size_mb {
             Some(mb) => format!("{mb} MB"),
             None => "export".into(),
         };
-        let out = unique_path(&out_dir, &format!("{label} ({suffix})"), "mp4", None);
+        let out = unique_path_with_suffix(&out_dir, label, Some(&suffix), "mp4", None);
         let tmp = temp_beside(&out_dir);
         let base = if temp.is_some() { 0.2 } else { 0.0 };
         let result = (|| -> Result<()> {

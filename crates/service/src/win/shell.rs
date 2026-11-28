@@ -24,6 +24,24 @@ pub fn recycle(paths: &[&Path]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
+    if cv_core::paths::uses_local_storage() {
+        for path in paths {
+            crate::shared::require_media_path(path)?;
+        }
+        let root = cv_core::paths::data_dir().join("trash");
+        crate::shared::require_media_path(&root)?;
+        std::fs::create_dir_all(&root)?;
+        let batch = root.join(cv_core::util::random_token(12));
+        std::fs::create_dir(&batch)?;
+        for path in paths {
+            let name = path.file_name().ok_or_else(|| anyhow::anyhow!("Missing media filename"))?;
+            let dest = batch.join(name);
+            crate::shared::require_media_path(&dest)?;
+            anyhow::ensure!(!dest.exists(), "A file with that name is already in project Trash");
+            crate::clips::move_file(path, &dest, std::time::Duration::from_secs(2))?;
+        }
+        return Ok(());
+    }
     // Double-NUL-terminated list of NUL-terminated paths.
     let mut list: Vec<u16> = Vec::new();
     for p in paths {
@@ -72,6 +90,7 @@ pub fn create_shortcut(link: &Path, target: &Path, args: &str, workdir: &Path, d
 
 /// Put a file on the clipboard as a file drop (paste into Discord/Explorer).
 pub fn copy_file_to_clipboard(path: &Path) -> Result<()> {
+    crate::shared::require_media_path(path)?;
     let abs = std::path::absolute(path)?;
     let mut files = wide_path(&abs);
     files.push(0); // double NUL
@@ -121,6 +140,9 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
 }
 
 pub fn open_in_explorer(path: &Path) {
+    if !crate::shared::media_path_allowed(path) {
+        return;
+    }
     let op = wide("open");
     let p = WStr::path(path);
     unsafe {

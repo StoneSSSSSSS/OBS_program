@@ -3,7 +3,7 @@
 //! old program created.
 
 use crate::clips::{move_file, probe_and_thumb, remove_dir_if_empty};
-use crate::shared::{LibCmd, Shared};
+use crate::shared::{media_path_allowed, require_media_path, LibCmd, Shared};
 use cv_core::db::Db;
 use cv_core::ipc::Event;
 use cv_core::model::NewClip;
@@ -29,8 +29,10 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<LibCmd>) {
             return;
         }
     };
-    if let Err(e) = legacy_reorganize(&sh, &db) {
-        tracing::warn!("folder tidy-up failed: {e:#}");
+    if !cv_core::paths::uses_local_storage() && sh.cfg.read().validate_media_folders().is_ok() {
+        if let Err(e) = legacy_reorganize(&sh, &db) {
+            tracing::warn!("folder tidy-up failed: {e:#}");
+        }
     }
     let mut last_clip_scan: Option<Instant> = None;
     let mut force_scan = true;
@@ -67,10 +69,13 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<LibCmd>) {
 }
 
 fn list_videos(dir: &Path) -> Vec<PathBuf> {
+    if !media_path_allowed(dir) {
+        return Vec::new();
+    }
     std::fs::read_dir(dir)
         .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| {
             let name = p.file_name().unwrap_or_default().to_string_lossy();
-            p.is_file() && is_video_file(p)
+            media_path_allowed(p) && p.is_file() && is_video_file(p)
                 && !name.starts_with(".cv_")
         }).collect())
         .unwrap_or_default()
@@ -79,8 +84,11 @@ fn list_videos(dir: &Path) -> Vec<PathBuf> {
 /// Sync the recordings table with the folder. Returns true if anything changed.
 fn index_recordings(sh: &Shared, db: &Db) -> bool {
     let cfg = sh.cfg();
+    if cfg.validate_media_folders().is_err() {
+        return false;
+    }
     let folder = PathBuf::from(&cfg.recording.folder);
-    if !folder.is_dir() {
+    if !media_path_allowed(&folder) || !folder.is_dir() {
         return false;
     }
     let _lock = sh.library_lock.lock();
@@ -122,8 +130,7 @@ fn index_recordings(sh: &Shared, db: &Db) -> bool {
         }
         // Marked "keep" while it was still being written: move it now.
         if !kept && !is_live && prev.map(|r| r.kept).unwrap_or(false) {
-            if let Some(name) = p.file_name() {
-                let dest = folder.join(KEPT_DIR).join(name);
+            if let Ok(dest) = kept_destination(&p, &folder.join(KEPT_DIR)) {
                 if move_file(&p, &dest, Duration::from_secs(5)).is_ok() {
                     let _ = db.set_recording_kept(id, true, &dest.to_string_lossy());
                     changed = true;
@@ -152,7 +159,8 @@ fn index_recordings(sh: &Shared, db: &Db) -> bool {
     }
     // Forget files that are gone.
     for (k, r) in &existing {
-        if !present.contains(k) {
+        if Path::new(&r.path).starts_with(&folder) && !present.contains(k)
+            && std::fs::metadata(&r.path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
             let _ = db.delete_recording_by_path(&r.path);
             changed = true;
         }
@@ -162,16 +170,24 @@ fn index_recordings(sh: &Shared, db: &Db) -> bool {
 
 fn retention(sh: &Shared, db: &Db) {
     let cfg = sh.cfg();
-    if cfg.recording.rolling_seconds().is_some() {
+    if cfg.recording.rolling_seconds().is_some() || cfg.validate_media_folders().is_err() {
         return;
     }
     let folder = PathBuf::from(&cfg.recording.folder);
+    if !media_path_allowed(&folder) {
+        return;
+    }
     let Some((free, _)) = crate::win::shell::disk_space(&folder) else { return };
     let _lock = sh.library_lock.lock();
+    let Ok(archive) = cv_core::paths::media_path_key(&folder) else { return };
+    let Ok(registered_clips) = db.clip_paths() else { return };
+    let saved: HashSet<_> = registered_clips.iter().filter_map(|(_, path, _)| {
+        cv_core::paths::media_path_key(Path::new(path)).ok()
+    }).collect();
     let recs = db.list_recordings().unwrap_or_default();
     let segments: Vec<SegmentInfo> = recs
         .iter()
-        .filter(|recording| Path::new(&recording.path).starts_with(&folder))
+        .filter(|recording| retention_path_allowed(Path::new(&recording.path), &archive, &saved))
         .map(|r| SegmentInfo {
             path: PathBuf::from(&r.path),
             start_ms: r.start_ms,
@@ -190,7 +206,12 @@ fn retention(sh: &Shared, db: &Db) {
     let mut reasons = HashSet::new();
     for (p, reason) in plan {
         // Re-check: never delete the file being recorded right now.
-        if sh.is_live(&p.to_string_lossy()) {
+        let current = sh.cfg.read();
+        if current.recording.rolling_seconds().is_some() || current.recording.folder != cfg.recording.folder
+            || current.validate_media_folders().is_err() {
+            break;
+        }
+        if sh.is_live(&p.to_string_lossy()) || !retention_path_allowed(&p, &archive, &saved) || !native_archive_media(&p) {
             continue;
         }
         let size = p.metadata().map(|m| m.len()).unwrap_or(0);
@@ -220,10 +241,26 @@ fn retention(sh: &Shared, db: &Db) {
     }
 }
 
+fn retention_path_allowed(path: &Path, archive: &Path, saved: &HashSet<PathBuf>) -> bool {
+    media_path_allowed(path) && cv_core::paths::media_path_key(path).is_ok_and(|key| key.starts_with(archive) && !saved.contains(&key))
+}
+
+fn native_archive_media(path: &Path) -> bool {
+    // Native recordings have ClipVault timing metadata and use fragmented
+    // MP4. Saved outputs are flat MP4 even when they have a source timestamp.
+    cv_media::probe::probe(path).is_ok_and(|info| info.fragmented && info.start_ms.is_some())
+}
+
 /// Find clips added/removed outside the app. Returns true if anything changed.
 fn scan_clips(sh: &Shared, db: &Db) -> bool {
     let cfg = sh.cfg();
+    if cfg.validate_media_folders().is_err() {
+        return false;
+    }
     let root = PathBuf::from(&cfg.clips.folder);
+    if !media_path_allowed(&root) {
+        return false;
+    }
     if !root.is_dir() {
         let _ = std::fs::create_dir_all(&root);
         if !root.is_dir() {
@@ -235,6 +272,8 @@ fn scan_clips(sh: &Shared, db: &Db) -> bool {
     let known: HashMap<String, (i64, bool)> =
         db.clip_paths().unwrap_or_default().into_iter().map(|(id, p, m)| (p.to_lowercase(), (id, m))).collect();
     let mut found: HashSet<String> = HashSet::new();
+    let Ok(clips_key) = cv_core::paths::media_path_key(&root) else { return false };
+    let Ok(exports_key) = cv_core::paths::media_path_key(&cfg.exports_dir()) else { return false };
     let mut files: Vec<(PathBuf, Option<String>)> = list_videos(&root).into_iter().map(|p| (p, None)).collect();
     if let Ok(rd) = std::fs::read_dir(&root) {
         for e in rd.flatten() {
@@ -246,6 +285,9 @@ fn scan_clips(sh: &Shared, db: &Db) -> bool {
             if name.eq_ignore_ascii_case(EXPORTS_DIR) || name.starts_with('.') {
                 continue;
             }
+            if !clips_path_allowed(&p, &clips_key, &exports_key) {
+                continue;
+            }
             for f in list_videos(&p) {
                 files.push((f, Some(name.clone())));
             }
@@ -253,6 +295,9 @@ fn scan_clips(sh: &Shared, db: &Db) -> bool {
     }
     let now = now_ms();
     for (p, folder) in files {
+        if !clips_path_allowed(&p, &clips_key, &exports_key) {
+            continue;
+        }
         let key = p.to_string_lossy().to_lowercase();
         found.insert(key.clone());
         match known.get(&key) {
@@ -299,6 +344,10 @@ fn scan_clips(sh: &Shared, db: &Db) -> bool {
     changed
 }
 
+fn clips_path_allowed(path: &Path, clips: &Path, exports: &Path) -> bool {
+    cv_core::paths::media_path_key(path).is_ok_and(|key| key.starts_with(clips) && !key.starts_with(exports))
+}
+
 /// Game row for a clips sub-folder (created on first sight).
 fn game_for_folder(db: &Db, folder: &str) -> anyhow::Result<i64> {
     let name = legacy_folder_to_game(folder);
@@ -320,7 +369,7 @@ fn probe_pending(sh: &Shared, db: &Db) {
             break;
         }
         let p = PathBuf::from(&path);
-        if p.is_file() {
+        if media_path_allowed(&p) && p.is_file() {
             probe_and_thumb(db, id, &p, thumbs);
             any = true;
         }
@@ -334,7 +383,12 @@ fn update_disk_status(sh: &Shared, db: &Db) {
     let cfg = sh.cfg();
     let recs = db.list_recordings().unwrap_or_default();
     let (clips_count, clips_bytes) = db.clip_stats().unwrap_or((0, 0));
-    let (free, total) = crate::win::shell::disk_space(Path::new(&cfg.recording.folder)).unwrap_or((0, 0));
+    let folder = Path::new(&cfg.recording.folder);
+    let (free, total) = if media_path_allowed(folder) {
+        crate::win::shell::disk_space(folder).unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
     sh.update_status(|s| {
         s.disk.free_bytes = free;
         s.disk.total_bytes = total;
@@ -355,6 +409,8 @@ fn legacy_reorganize(sh: &Shared, db: &Db) -> anyhow::Result<()> {
     }
     let cfg = sh.cfg();
     let root = PathBuf::from(&cfg.clips.folder);
+    let clips = cv_core::paths::media_path_key(&root)?;
+    let exports = cv_core::paths::media_path_key(&cfg.exports_dir())?;
     if !root.is_dir() {
         return Ok(()); // try again next start
     }
@@ -370,13 +426,18 @@ fn legacy_reorganize(sh: &Shared, db: &Db) -> anyhow::Result<()> {
         if name.eq_ignore_ascii_case(EXPORTS_DIR) {
             continue;
         }
+        let key = cv_core::paths::media_path_key(&dir)?;
+        if !clips_path_allowed(&dir, &clips, &exports) || exports.starts_with(&key) {
+            continue;
+        }
         let clean = sanitize_component(&legacy_folder_to_game(&name));
         if clean == name {
             continue;
         }
         let target = root.join(&clean);
+        cfg.validate_clip_destination(&target)?;
         for f in std::fs::read_dir(&dir)?.flatten().map(|e| e.path()) {
-            if !f.is_file() {
+            if !f.is_file() || !clips_path_allowed(&f, &clips, &exports) {
                 continue;
             }
             let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -405,6 +466,7 @@ fn legacy_reorganize(sh: &Shared, db: &Db) -> anyhow::Result<()> {
 /// Move a recording into/out of the Kept folder (protected from retention).
 pub fn set_kept(sh: &Shared, recording_id: i64, keep: bool) -> anyhow::Result<()> {
     let _lock = sh.library_lock.lock();
+    sh.cfg.read().validate_media_folders()?;
     let db = Db::open_default()?;
     let rec = db.recording(recording_id)?.ok_or_else(|| anyhow::anyhow!("recording not found"))?;
     if rec.kept == keep {
@@ -412,6 +474,7 @@ pub fn set_kept(sh: &Shared, recording_id: i64, keep: bool) -> anyhow::Result<()
     }
     anyhow::ensure!(!rec.is_live() || keep, "can't move the recording that's being written");
     let src = PathBuf::from(&rec.path);
+    require_media_path(&src)?;
     let folder = PathBuf::from(&sh.cfg.read().recording.folder);
     let dest_dir = if keep { folder.join(KEPT_DIR) } else { folder };
     if rec.is_live() {
@@ -419,10 +482,17 @@ pub fn set_kept(sh: &Shared, recording_id: i64, keep: bool) -> anyhow::Result<()
         db.set_recording_kept(recording_id, true, &rec.path)?;
         return Ok(());
     }
-    let name = src.file_name().map(|n| n.to_owned()).unwrap_or_default();
-    let dest = dest_dir.join(name);
+    let dest = kept_destination(&src, &dest_dir)?;
     move_file(&src, &dest, Duration::from_secs(10))?;
     db.set_recording_kept(recording_id, keep, &dest.to_string_lossy())?;
     sh.emit(Event::RecordingsChanged);
     Ok(())
+}
+
+fn kept_destination(source: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
+    let stem = source.file_stem().and_then(|stem| stem.to_str()).ok_or_else(|| anyhow::anyhow!("Invalid recording filename"))?;
+    let extension = source.extension().and_then(|extension| extension.to_str()).unwrap_or_default();
+    let destination = unique_path(dir, stem, extension, Some(source));
+    require_media_path(&destination)?;
+    Ok(destination)
 }

@@ -74,7 +74,7 @@ pub fn run(sh: Arc<Shared>) {
                 }
                 let src = PathBuf::from(&path);
                 let wp = wave_path(&src);
-                if wp.exists() || !src.is_file() {
+                if wp.exists() || !crate::shared::media_path_allowed(&src) || !src.is_file() {
                     continue;
                 }
                 let archive_slot = |span| {

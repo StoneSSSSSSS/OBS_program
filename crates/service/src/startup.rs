@@ -15,8 +15,14 @@ pub fn load_or_first_run() -> Config {
             tracing::error!("could not save config: {e:#}");
         }
     }
-    let _ = std::fs::create_dir_all(&cfg.recording.folder);
-    let _ = std::fs::create_dir_all(&cfg.clips.folder);
+    if cfg.validate_media_folders().is_ok() {
+        for folder in [&cfg.recording.folder, &cfg.clips.folder] {
+            let folder = Path::new(folder);
+            if crate::shared::media_path_allowed(folder) {
+                let _ = std::fs::create_dir_all(folder);
+            }
+        }
+    }
     cfg
 }
 
@@ -40,14 +46,11 @@ fn service_exe() -> PathBuf {
 
 /// Create or remove the Startup-folder shortcut for the service.
 pub fn sync_startup_shortcut(cfg: &Config) -> Result<()> {
-    let Some(dir) = paths::startup_dir() else { return Ok(()) };
-    let link = dir.join(paths::STARTUP_LINK_NAME);
-    // Never register a development build (cargo's target dir) at login.
-    let exe_dir = paths::exe_dir().to_string_lossy().to_lowercase();
-    if exe_dir.contains("\\target\\debug") || exe_dir.contains("\\target\\release") {
-        tracing::debug!("dev build: not touching the startup shortcut");
+    if paths::uses_local_storage() {
         return Ok(());
     }
+    let Some(dir) = paths::startup_dir() else { return Ok(()) };
+    let link = dir.join(paths::STARTUP_LINK_NAME);
     if cfg.general.start_with_windows {
         let exe = service_exe();
         if exe.is_file() {
@@ -58,9 +61,11 @@ pub fn sync_startup_shortcut(cfg: &Config) -> Result<()> {
     }
     Ok(())
 }
-
 /// Create Start Menu + Desktop shortcuts for the GUI.
 pub fn create_app_shortcuts(desktop: bool) -> Result<()> {
+    if paths::uses_local_storage() {
+        return Ok(());
+    }
     let gui = paths::exe_dir().join(paths::GUI_EXE);
     if let Some(sm) = paths::start_menu_dir() {
         crate::win::shell::create_shortcut(&sm.join("ClipVault.lnk"), &gui, "", &paths::exe_dir(), "ClipVault — clips and 24/7 recordings")?;

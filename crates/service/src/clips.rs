@@ -1,14 +1,14 @@
 //! Saving clips (from the clip hotkey) and clip file operations (rename /
 //! move to another game / delete) used by the GUI.
 
-use crate::shared::{ClipTask, Footage, Shared};
+use crate::shared::{media_path_allowed, require_media_path, ClipTask, Footage, Shared};
 use crate::win::ui::ToastLevel;
 use anyhow::{bail, Context, Result};
 use cv_core::db::Db;
 use cv_core::games::{attribute, Span};
 use cv_core::ipc::Event;
 use cv_core::model::NewClip;
-use cv_core::naming::{render_template, sanitize_component, unique_path};
+use cv_core::naming::{clean_display_title, render_title, sanitize_component, unique_path};
 use cv_core::util::{format_duration, now_ms};
 use cv_media::cut::{cut, CutSource};
 use std::path::{Path, PathBuf};
@@ -132,8 +132,10 @@ fn save_range(sh: &Shared, footage: &[Footage], from_ms: i64, to_ms: i64, short:
     let db = Db::open_default()?;
     let (game_id, game_name, exe) = attribute_game(&db, from_ms, to_ms, &cfg.clips.unknown_game_name)?;
     let local = chrono::DateTime::from_timestamp_millis(to_ms).unwrap_or_default().with_timezone(&chrono::Local);
-    let title = render_template(&cfg.clips.name_template, &game_name, &exe, local);
+    let title = render_title(&cfg.clips.name_template, &game_name, &exe, local);
     let dir = clip_dir(&cfg, &game_name);
+    cfg.validate_clip_destination(&dir)?;
+    require_media_path(&dir)?;
     std::fs::create_dir_all(&dir)?;
     let tmp = temp_beside(&dir);
     // The clip starts where the first part really starts (may be later than
@@ -150,11 +152,10 @@ fn save_range(sh: &Shared, footage: &[Footage], from_ms: i64, to_ms: i64, short:
     let _lock = sh.library_lock.lock();
     let dest = unique_path(&dir, &title, "mp4", None);
     move_file(&tmp, &dest, Duration::from_secs(10))?;
-    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(title);
     let is_game = db.game(game_id)?.map(|g| g.is_game()).unwrap_or(false);
     let id = db.insert_clip(&NewClip {
         path: dest.to_string_lossy().to_string(),
-        title: stem.clone(),
+        title: title.clone(),
         game_id: Some(game_id),
         created_at: to_ms,
         source_start_ms: Some(start_ms),
@@ -166,7 +167,7 @@ fn save_range(sh: &Shared, footage: &[Footage], from_ms: i64, to_ms: i64, short:
     let _ = short;
     probe_and_thumb(&db, id, &dest, cfg.clips.generate_thumbnails);
     copy_wave(footage, &parts, &dest);
-    Ok((id, stem, game_name, out.duration))
+    Ok((id, title, game_name, out.duration))
 }
 
 /// Give a new clip a waveform right away by decoding it (fast for clips).
@@ -214,18 +215,20 @@ pub fn probe_and_thumb(db: &Db, id: i64, path: &Path, thumbs: bool) {
 pub fn rename_clip(sh: &Shared, clip_id: i64, title: &str) -> Result<()> {
     let db = Db::open_default()?;
     let clip = db.clip(clip_id)?.context("clip not found")?;
-    let title = sanitize_component(title);
+    let title = clean_display_title(title);
+    anyhow::ensure!(!title.is_empty(), "Clip title cannot be empty");
     let src = PathBuf::from(&clip.path);
+    require_media_path(&src)?;
     let dir = src.parent().map(Path::to_path_buf).unwrap_or_default();
     let ext = src.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".into());
     let _lock = sh.library_lock.lock();
     let dest = unique_path(&dir, &title, &ext, Some(&src));
+    require_media_path(&dest)?;
     if dest.to_string_lossy() != clip.path {
         move_file(&src, &dest, Duration::from_secs(10))?;
         move_wave(&src, &dest);
     }
-    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(title);
-    db.set_clip_path_and_title(clip_id, &dest.to_string_lossy(), &stem)?;
+    db.set_clip_path_and_title(clip_id, &dest.to_string_lossy(), &title)?;
     Ok(())
 }
 
@@ -246,6 +249,7 @@ pub fn set_clip_game(sh: &Shared, clip_id: i64, game_id: Option<i64>) -> Result<
         None => cfg.clips.unknown_game_name.clone(),
     };
     let src = PathBuf::from(&clip.path);
+    require_media_path(&src)?;
     let _lock = sh.library_lock.lock();
     if cfg.clips.organize_by_game && src.is_file() {
         let dir = clip_dir(&cfg, &game_name);
@@ -253,10 +257,11 @@ pub fn set_clip_game(sh: &Shared, clip_id: i64, game_id: Option<i64>) -> Result<
         let ext = src.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "mp4".into());
         if src.parent() != Some(dir.as_path()) {
             let dest = unique_path(&dir, &stem, &ext, None);
+            cfg.validate_clip_destination(&dir)?;
+            require_media_path(&dest)?;
             move_file(&src, &dest, Duration::from_secs(10))?;
             move_wave(&src, &dest);
-            let new_stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(stem);
-            db.set_clip_path_and_title(clip_id, &dest.to_string_lossy(), &new_stem)?;
+            db.set_clip_path_and_title(clip_id, &dest.to_string_lossy(), &clip.title)?;
             remove_dir_if_empty(src.parent());
         }
     }
@@ -272,6 +277,7 @@ pub fn delete_clips(sh: &Shared, ids: &[i64]) -> Result<usize> {
     for id in ids {
         let Some(clip) = db.clip(*id)? else { continue };
         let p = PathBuf::from(&clip.path);
+        require_media_path(&p)?;
         if p.exists() {
             if cfg.clips.delete_to_recycle_bin {
                 crate::win::shell::recycle(&[p.as_path()])?;
@@ -279,7 +285,7 @@ pub fn delete_clips(sh: &Shared, ids: &[i64]) -> Result<usize> {
                 std::fs::remove_file(&p)?;
             }
         }
-        if !clip.thumb.is_empty() && clip.thumb != "-" {
+        if !clip.thumb.is_empty() && clip.thumb != "-" && media_path_allowed(Path::new(&clip.thumb)) {
             let _ = std::fs::remove_file(&clip.thumb);
         }
         let _ = std::fs::remove_file(cv_core::waveform::wave_path(&p));

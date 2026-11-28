@@ -15,6 +15,14 @@ const SCHEMA_VERSION: i64 = 2;
 pub struct ClipWrite<'a>(&'a Db);
 
 impl ClipWrite<'_> {
+    pub fn trim_committed(&self, key: &str) -> Result<bool> {
+        Ok(self.0.meta_get(key)?.as_deref() == Some("committed"))
+    }
+
+    pub fn mark_trim_committed(&self, key: &str) -> Result<()> {
+        self.0.meta_set(key, "committed")
+    }
+
     pub fn clip(&self, id: i64) -> Result<Option<Clip>> {
         self.0.clip(id)
     }
@@ -153,6 +161,11 @@ fn parse_mix(s: &str) -> Option<crate::mixer::MixSettings> {
 }
 
 impl Db {
+    pub fn clear_trim_commit(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM meta WHERE key=?1", [key])?;
+        Ok(())
+    }
+
     pub fn open(path: &Path) -> Result<Db> {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)?;

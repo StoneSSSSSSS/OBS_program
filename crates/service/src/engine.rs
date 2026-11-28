@@ -5,7 +5,7 @@
 //! When the 24/7 recording is paused, the recorder keeps a short rolling
 //! buffer instead (in the data folder) so the clip hotkey still works.
 
-use crate::shared::{ClipTask, EngineCmd, Footage, LibCmd, Reply, Shared};
+use crate::shared::{media_path_allowed, require_media_path, ClipTask, EngineCmd, Footage, LibCmd, Reply, Shared};
 use crate::win::ui::{ToastLevel, UiCmd};
 use crossbeam_channel::{select, Receiver};
 use cv_core::audio_names::MicDecision;
@@ -33,28 +33,25 @@ fn stall_restart_allowed(starts: &mut VecDeque<Instant>, now: Instant) -> bool {
 
 
 pub fn buffer_dir() -> PathBuf {
-    cv_core::paths::data_dir().join("buffer")
+    cv_core::paths::recorder_buffer_dir()
 }
 
 fn rolling_dir() -> PathBuf {
-    cv_core::paths::data_dir().join("rolling")
+    cv_core::paths::rolling_buffer_dir()
 }
 
-fn rolling_dir_conflicts(cfg: &Config) -> bool {
-    fn comparable(path: &Path) -> String {
-        let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        crate::shared::norm_path(&absolute.to_string_lossy())
-            .trim_start_matches(r"\\?\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
+fn internal_buffer_root_ok(dir: &Path) -> bool {
+    if !media_path_allowed(dir) {
+        return false;
     }
-    let dir = comparable(&rolling_dir());
-    let prefix = format!("{dir}\\");
-    [PathBuf::from(&cfg.recording.folder), PathBuf::from(&cfg.clips.folder), cfg.exports_dir()]
-        .iter()
-        .map(|path| comparable(path))
-        .any(|path| path == dir || path.starts_with(&prefix))
+    let Some(parent) = dir.parent().and_then(|path| path.canonicalize().ok()) else { return false };
+    let Some(name) = dir.file_name() else { return false };
+    match dir.canonicalize() {
+        Ok(actual) => crate::shared::same_path(&actual.to_string_lossy(), &parent.join(name).to_string_lossy()),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecordingMode {
@@ -299,10 +296,12 @@ impl Engine {
         self.mode = recording_mode(&cfg, self.wanted);
         let rc = self.recorder_config(&cfg);
         let folder = rc.folder.clone();
-        let capture = if self.mode == RecordingMode::Rolling && rolling_dir_conflicts(&cfg) {
-            Err(anyhow::anyhow!("The replay buffer folder is also configured for saved media. Choose a different recordings, clips, or exports folder."))
+        let capture = if let Err(error) = cfg.validate_media_folders() {
+            Err(error)
+        } else if self.mode != RecordingMode::Archive && !internal_buffer_root_ok(&folder) {
+            Err(anyhow::anyhow!("ClipVault’s temporary buffer must stay in its profile directory"))
         } else {
-            Recorder::start(rc, self.namer.clone(), self.events_tx.clone())
+            require_media_path(&folder).and_then(|_| Recorder::start(rc, self.namer.clone(), self.events_tx.clone()))
         };
         match capture {
             Ok(r) => {
@@ -389,41 +388,11 @@ impl Engine {
                 }
                 reply(r, result);
             }
-            EngineCmd::SetRecording { enabled, reply: r } => {
-                if self.mode == RecordingMode::Rolling {
-                    let message = "Replay only is active. Choose Full history in Settings to save continuous recordings.".to_string();
-                    self.sh.toast(ToastLevel::Info, &message);
-                    reply(r, Err(message));
-                    return;
-                }
-                if enabled && !self.sh.cfg().recording.enabled {
-                    let msg = "Turn on 24/7 recording in Settings before resuming".to_string();
-                    self.sh.toast(ToastLevel::Warning, &msg);
-                    reply(r, Err(msg));
-                    return;
-                }
-                let changed = self.wanted != enabled;
-                let stored = Db::open_default().and_then(|db| {
-                    db.meta_set(META_RECORDING_WANTED, if enabled { "1" } else { "0" })
-                });
-                if let Err(error) = stored {
-                    let msg = format!("Could not save the recording preference: {error:#}");
-                    self.sh.toast(ToastLevel::Error, &msg);
-                    reply(r, Err(msg));
-                    return;
-                }
-                self.wanted = enabled;
-                if changed || self.rec.is_none() {
-                    self.restart("24/7 toggled");
-                }
-                if self.rec.is_none() {
-                    reply(r, Err(self.sh.status.lock().engine.last_error.clone()));
-                    return;
-                }
-                let msg = if enabled { "24/7 recording resumed" } else { "24/7 recording paused (the clip hotkey still works)" };
-                self.sh.log_event("info", msg);
-                self.sh.toast(ToastLevel::Info, msg);
-                reply(r, Ok(()));
+            EngineCmd::SetRecording { enabled, reply: r } => self.set_recording(enabled, r),
+            EngineCmd::ToggleRecording => {
+                // Compute from the engine's state when this command is dequeued.
+                let enabled = self.mode != RecordingMode::Archive;
+                self.set_recording(enabled, None);
             }
             EngineCmd::Restart { reply: r } => {
                 self.starts.clear();
@@ -459,6 +428,43 @@ impl Engine {
             }
             EngineCmd::Shutdown => {}
         }
+    }
+
+    fn set_recording(&mut self, enabled: bool, r: Reply) {
+        if self.mode == RecordingMode::Rolling {
+            let message = "Replay only is active. Choose Full history in Settings to save continuous recordings.".to_string();
+            self.sh.toast(ToastLevel::Info, &message);
+            reply(r, Err(message));
+            return;
+        }
+        if enabled && !self.sh.cfg().recording.enabled {
+            let msg = "Turn on 24/7 recording in Settings before resuming".to_string();
+            self.sh.toast(ToastLevel::Warning, &msg);
+            reply(r, Err(msg));
+            return;
+        }
+        let changed = self.wanted != enabled;
+        let stored = Db::open_default().and_then(|db| {
+            db.meta_set(META_RECORDING_WANTED, if enabled { "1" } else { "0" })
+        });
+        if let Err(error) = stored {
+            let msg = format!("Could not save the recording preference: {error:#}");
+            self.sh.toast(ToastLevel::Error, &msg);
+            reply(r, Err(msg));
+            return;
+        }
+        self.wanted = enabled;
+        if changed || self.rec.is_none() {
+            self.restart("24/7 toggled");
+        }
+        if self.rec.is_none() {
+            reply(r, Err(self.sh.status.lock().engine.last_error.clone()));
+            return;
+        }
+        let msg = if enabled { "24/7 recording resumed" } else { "24/7 recording paused (the clip hotkey still works)" };
+        self.sh.log_event("info", msg);
+        self.sh.toast(ToastLevel::Info, msg);
+        reply(r, Ok(()));
     }
 
     fn save_clip(&mut self, short: bool) -> Result<(), String> {
@@ -514,7 +520,8 @@ impl Engine {
                 }
             }
         }
-        footage.retain(|segment| segment.end_ms() > from_ms && segment.start_ms < end_ms && segment.path.is_file());
+        footage.retain(|segment| segment.end_ms() > from_ms && segment.start_ms < end_ms
+            && media_path_allowed(&segment.path) && segment.path.is_file());
         if footage.is_empty() {
             return Err("There is no recent footage to save yet".into());
         }
@@ -634,6 +641,9 @@ impl Engine {
         let cutoff = now_ms() - keep_ms;
         let live = self.sh.live_path.lock().clone();
         let buffer = buffer_dir();
+        if cfg.validate_media_folders().is_err() || !internal_buffer_root_ok(&buffer) {
+            return;
+        }
         self.footage.retain(|f| {
             let end = f.start_ms + (f.duration_s * 1000.0) as i64;
             if end >= cutoff || Some(&f.path) == live.as_ref() {
@@ -650,7 +660,8 @@ impl Engine {
         if let Ok(rd) = std::fs::read_dir(&buffer) {
             for e in rd.flatten() {
                 let p = e.path();
-                if Some(&p) == live.as_ref() || self.footage.iter().any(|f| f.path == p) {
+                if Some(&p) == live.as_ref() || self.footage.iter().any(|f| f.path == p)
+                    || !native_segment_path(&p) {
                     continue;
                 }
                 let old = e.metadata().and_then(|m| m.modified()).ok()
@@ -664,7 +675,7 @@ impl Engine {
 
     fn clean_rolling(&mut self, cutoff: Option<i64>) {
         let dir = rolling_dir();
-        if !dir.is_dir() || rolling_dir_conflicts(&self.sh.cfg()) {
+        if !dir.is_dir() || !internal_buffer_root_ok(&dir) || self.sh.cfg().validate_media_folders().is_err() {
             return;
         }
         self.clip_leases.retain(|(lease, _)| lease.strong_count() > 0);
@@ -754,7 +765,7 @@ fn prune_rolling_files(dir: &Path, cutoff: Option<i64>, protected: &HashSet<Path
     let Ok(entries) = std::fs::read_dir(dir) else { return removed };
     for entry in entries.flatten() {
         let path = entry.path();
-        if protected.contains(&path) || !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("mp4") {
+        if protected.contains(&path) || !native_segment_path(&path) {
             continue;
         }
         let Some(start) = cv_core::filenames::parse_timestamp_ms(&path) else { continue };
@@ -767,6 +778,12 @@ fn prune_rolling_files(dir: &Path, cutoff: Option<i64>, protected: &HashSet<Path
         }
     }
     removed
+}
+
+fn native_segment_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("mp4")
+        && cv_core::filenames::parse_timestamp_ms(path).is_some()
+        && path.symlink_metadata().is_ok_and(|metadata| metadata.is_file())
 }
 
 /// Send a command and wait for its reply.
@@ -834,7 +851,8 @@ mod tests {
         let leased = rolling.join("2026-11-28 09-00-20.mp4");
         let archive = dir.path().join("2026-11-28 09-00-30.mp4");
         let saved_clip = dir.path().join("saved clip.mp4");
-        for path in [&old, &recent, &leased, &archive, &saved_clip] {
+        let unrelated = rolling.join("manual copy.mp4");
+        for path in [&old, &recent, &leased, &archive, &saved_clip, &unrelated] {
             std::fs::write(path, b"synthetic").unwrap();
         }
         let ends = HashMap::from([(old.clone(), 10), (recent.clone(), 30), (leased.clone(), 15)]);
@@ -847,7 +865,7 @@ mod tests {
         assert!(!recent.exists() && leased.exists());
         // Once the save job finishes, ordinary cleanup removes the source, not the clip.
         assert_eq!(prune_rolling_files(&rolling, None, &HashSet::new(), &ends), [leased.clone()]);
-        assert!(!leased.exists() && archive.exists() && saved_clip.exists());
+        assert!(!leased.exists() && archive.exists() && saved_clip.exists() && unrelated.exists());
     }
 
     #[test]

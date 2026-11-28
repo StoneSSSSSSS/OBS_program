@@ -42,6 +42,9 @@ pub fn format_duration(secs: f64) -> String {
         return "0:00".to_string();
     }
     let total = secs.floor() as u64;
+    if total == 0 && secs > 0.0 {
+        return format!("{:.0} ms", (secs * 1000.0).round().max(1.0));
+    }
     let h = total / 3600;
     let m = (total % 3600) / 60;
     let s = total % 60;
@@ -142,6 +145,7 @@ mod tests {
     #[test]
     fn duration_formatting() {
         assert_eq!(format_duration(0.0), "0:00");
+        assert_eq!(format_duration(0.101), "101 ms");
         assert_eq!(format_duration(59.9), "0:59");
         assert_eq!(format_duration(61.0), "1:01");
         assert_eq!(format_duration(3600.0), "1:00:00");

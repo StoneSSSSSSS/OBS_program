@@ -18,6 +18,7 @@ mod library;
 mod shared;
 mod startup;
 mod status;
+mod trim_recovery;
 mod waves;
 mod win;
 #[cfg(test)]
@@ -70,12 +71,14 @@ fn cli(args: &[String]) -> Result<()> {
             println!("recordings: {}  clips: {}  retention: {}h  clip length: {}s", cfg.recording.folder, cfg.clips.folder, cfg.recording.retention_hours, cfg.clips.clip_length_secs);
         }
         "--install-shortcuts" => {
+            anyhow::ensure!(!cv_core::paths::uses_local_storage(), "Project-local ClipVault does not create Windows shortcuts");
             let cfg = startup::load_or_first_run();
             startup::sync_startup_shortcut(&cfg)?;
             startup::create_app_shortcuts(args.iter().any(|a| a == "--desktop"))?;
             println!("shortcuts created");
         }
         "--remove-startup" => {
+            anyhow::ensure!(!cv_core::paths::uses_local_storage(), "Project-local ClipVault does not manage Windows startup");
             let mut cfg = Config::load_or_default();
             cfg.general.start_with_windows = false;
             startup::sync_startup_shortcut(&cfg)?;
@@ -128,7 +131,7 @@ fn run_service() -> Result<()> {
     cv_core::paths::ensure_dirs()?;
     let cfg = startup::load_or_first_run();
     let _log = cv_core::logging::init("service", &cfg.advanced.log_level, cfg.advanced.log_retention_days);
-    let Some(_instance) = win::process::SingleInstance::acquire("Local\\ClipVaultService") else {
+    let Some(_instance) = win::process::SingleInstance::acquire(&cv_core::paths::instance_name("Service")) else {
         tracing::info!("another ClipVault service is already running; exiting");
         return Ok(());
     };
@@ -136,6 +139,7 @@ fn run_service() -> Result<()> {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     tracing::info!("ClipVault service {} starting", cv_core::VERSION);
+    trim_recovery::recover_on_start();
     if let Err(e) = startup::sync_startup_shortcut(&cfg) {
         tracing::warn!("startup shortcut: {e:#}");
     }
@@ -231,8 +235,7 @@ fn actions(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<Action>) {
                 Err(e) => sh.toast(ToastLevel::Error, format!("Marker failed: {e}")),
             },
             Action::ToggleRecording => {
-                let paused = sh.status.lock().recording.paused_by_user;
-                let _ = sh.engine_tx.send(EngineCmd::SetRecording { enabled: paused, reply: None });
+                let _ = sh.engine_tx.send(EngineCmd::ToggleRecording);
             }
             Action::OpenGui => open_gui(&sh),
             Action::RestartRecorder => {
@@ -268,6 +271,7 @@ pub fn reload_config(sh: &Shared, restart_recorder: bool) -> Result<()> {
     let new = Config::load()?;
     #[cfg(test)]
     let new = if sh.isolated_test { test_ipc::isolate_config(new, &cv_core::paths::data_dir()) } else { new };
+    new.validate_media_folders()?;
     let old = std::mem::replace(&mut *sh.cfg.write(), new.clone());
     let restart = restart_recorder || old.recorder_restart_needed(&new);
     tracing::info!("config reloaded (restart recorder: {restart})");

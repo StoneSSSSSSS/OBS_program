@@ -40,14 +40,15 @@ impl Storage {
             }
         }
 
-        let anchor = exe.ancestors().find(|path| path.join(PROJECT_MARKER).is_file())
-            .or_else(|| {
-                // A packaged app can be moved together with its local folder
-                // without carrying the source checkout's marker.
-                let local = exe.parent().filter(|path| path.file_name() == Some(OsStr::new(LOCAL_ROOT)))?;
-                if exe.file_name() == Some(OsStr::new("app")) { local.parent() } else { None }
-            })
-            .unwrap_or(exe);
+        let local_root = Some(OsStr::new(LOCAL_ROOT));
+        let packaged = exe.parent().filter(|parent| {
+            parent.file_name() == local_root && exe.file_name() == Some(OsStr::new("app"))
+        }).and_then(Path::parent);
+        // A separate executable inside the local data tree (for example an
+        // extracted QA build) must not attach to the surrounding project's library.
+        let project = || exe.ancestors().take_while(|path| path.file_name() != local_root)
+            .find(|path| path.join(PROJECT_MARKER).is_file());
+        let anchor = packaged.or_else(project).unwrap_or(exe);
         Self { profile: anchor.join(LOCAL_ROOT).join("profile"), anchor: Some(anchor.into()), local: true }
     }
 
@@ -120,6 +121,25 @@ fn resolved_path(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Err(io::Error::new(io::ErrorKind::InvalidInput, "path cannot be safely resolved"))
+}
+
+/// Resolve a media path for case-insensitive containment comparisons. Missing
+/// destinations use their nearest existing directory, so aliases are checked
+/// before a new file or folder is created. This is a comparison key only.
+pub fn media_path_key(path: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let canonical = std::fs::canonicalize(&absolute).or_else(|error| {
+        if error.kind() == io::ErrorKind::NotFound { resolved_path(&absolute) } else { Err(error) }
+    })?;
+    Ok(PathBuf::from(canonical.to_string_lossy().to_lowercase()))
+}
+
+pub fn recorder_buffer_dir() -> PathBuf {
+    data_dir().join("buffer")
+}
+
+pub fn rolling_buffer_dir() -> PathBuf {
+    data_dir().join("rolling")
 }
 
 fn contains_resolved(parent: &Path, path: &Path) -> bool {
