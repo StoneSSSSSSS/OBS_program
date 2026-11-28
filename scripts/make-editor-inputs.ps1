@@ -43,4 +43,6 @@ try {
     if ($voice) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($voice) }
     if ($stream) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($stream) }
 }
+$captions = @('1', '00:00:01,000 --> 00:00:02,600', 'Café sur écran.', 'A second line.', '', '2', '00:00:04,000 --> 00:00:05,500', 'Dernier plan.', '') -join [Environment]::NewLine
+[IO.File]::WriteAllText((Join-Path $inputs 'Screening.srt'), $captions, [Text.UTF8Encoding]::new($true))
 Write-Output $inputs

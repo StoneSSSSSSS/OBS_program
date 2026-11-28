@@ -12,12 +12,13 @@ Each tester gets one brief, a fresh profile and a private copy of the synthetic 
 | Frame-accurate correction | In a numbered-frame source, remove a single unwanted frame between two named frames. Use the keyboard to verify the neighboring frames and export. | Decode immediately before and after the cut. Check the chosen frame is absent and both neighbors are present. |
 | Long assembly | Start from a long sequence with repeated shots. Zoom to a point near the end, change just that shot and return to an overview. | Verify the first and last shots, total length, and that the edit affects only the intended occurrence. Check controls remain usable on a narrow window. |
 | Handoff and relink | Open a project whose media directory was renamed. Recover the missing input, save and deliver from the moved project folder. | Confirm the app names the missing file, accepts the correct replacement and reopens after moving the project with its assets. Check protected outputs and source hashes. |
+| Accessible screening | Subtitle a short screening excerpt in two languages. Import a timed SRT, correct one cue, add a credit cue, and deliver both a captioned MP4 and a separate SRT. | Read the SRT back, compare cue boundaries, and inspect the rendered picture before, during and after each cue. Verify accented text and a multiline cue. |
 
 ## Prepare the review
 
 Build the GUI test executable with `cargo test --locked -p clipvault-gui --bin clipvault --no-run`. Use the test executable printed by Cargo with `scripts/make-editor-inputs.ps1 -GuiTests <path>`. It creates two sports angles, a simulated screen tutorial, a source with 100 visibly numbered frames, landscape and portrait framing cards, a music bed, a short cue and offline spoken narration inside the project's ignored QA folder.
 
-Run `scripts/start-editor-review.ps1 -Gui <clipvault.exe> -Brief <brief-name> -Inputs <generated-folder>` for each tester. The launcher opens a separate window and prints its process ID, input folder and output folder. Each tester receives private input copies with a SHA-256 manifest. For project-revision cases, provide a prepared editable project in that tester's private folder. The GUI runs with its own profile and the recorder offline.
+Run `scripts/start-editor-review.ps1 -Gui <clipvault.exe> -Brief <brief-name> -Inputs <generated-folder>` for each tester. The launcher opens a separate window and prints its process ID, input folder and output folder. Each tester receives private input copies with a SHA-256 manifest. For project-revision cases, provide a prepared editable project in that tester's private folder. For accessibility, include a short synthetic UTF-8 SRT with two timed cues. The GUI runs with its own profile and the recorder offline.
 
 ## Evidence and scoring
 
