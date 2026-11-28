@@ -134,6 +134,29 @@ fn saved_edit_moves_with_inputs_and_leaves_existing_files_intact() -> Result<()>
 }
 
 #[test]
+fn split_and_preview_keep_audio_fades_at_the_same_source_samples() -> Result<()> {
+    let mut p = Project::default();
+    let sound = p.import("song.wav".into(), info(AssetKind::Audio, 12))?;
+    let id = p.add_sound(sound, SoundRole::Music, S)?;
+    let range = Span { start: 2*S, end: 10*S };
+    let fade = AudioFade::for_range(range, 4*S, 2*S)?.unwrap();
+    p.sounds[0].range = range;
+    p.sounds[0].audio_fade = Some(fade);
+    assert_eq!(fade.gain_at(4*S), 0.5);
+    assert_eq!(fade.gain_at(9*S), 0.5);
+    assert_eq!(fade.gain_at(6*S), 1.0);
+    let right = p.split(id, 3*S)?;
+    assert_eq!(p.sounds[1].id, right);
+    assert_eq!(p.sounds[1].audio_fade, Some(fade));
+    let crop = p.slice(Span {start: 3*S,end: 4*S})?;
+    assert_eq!(crop.sounds[0].range.start, 4*S);
+    assert_eq!(crop.sounds[0].audio_fade.unwrap().gain_at(crop.sounds[0].range.start), 0.5);
+    assert!(AudioFade::for_range(range, 5*S, 4*S).is_err());
+    assert!(AudioFade::for_range(range, 0, 0)?.is_none());
+    Ok(())
+}
+
+#[test]
 fn invalid_projects_fail_before_arithmetic_or_rendering() -> Result<()> {
     let mut p = Project::default();
     p.color([20, 40, 60], S)?;

@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+mod captions;
 mod storage;
+pub use captions::{Caption, CaptionRun};
 #[cfg(test)]
 mod tests;
 
@@ -60,12 +62,71 @@ impl Span {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Rotation {
+    #[default]
+    None,
+    Clockwise90,
+    Clockwise180,
+    Clockwise270,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisualTransform {
+    pub rotation: Rotation,
+    /// Horizontal reflection in the rotated picture's coordinates.
+    pub mirror: bool,
+}
+
+impl VisualTransform {
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A gain envelope in original source time. Splitting an occurrence keeps its original ramp.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFade {
+    pub anchor: Span,
+    pub fade_in: u64,
+    pub fade_out: u64,
+}
+
+impl AudioFade {
+    pub fn for_range(anchor: Span, fade_in: u64, fade_out: u64) -> Result<Option<Self>> {
+        if fade_in == 0 && fade_out == 0 { return Ok(None); }
+        let fade = Self { anchor, fade_in, fade_out };
+        fade.validate()?;
+        Ok(Some(fade))
+    }
+
+    fn validate(self) -> Result<()> {
+        self.anchor.check(i64::MAX as u64)?;
+        ensure!(self.fade_in.checked_add(self.fade_out).is_some_and(|length| length <= self.anchor.len()),
+            "The two fades together must fit within the selected source range.");
+        Ok(())
+    }
+
+    pub fn gain_at(self, tick: u64) -> f64 {
+        let entering = if self.fade_in == 0 { 1.0 }
+            else { tick.saturating_sub(self.anchor.start).min(self.fade_in) as f64 / self.fade_in as f64 };
+        let leaving = if self.fade_out == 0 { 1.0 }
+            else { self.anchor.end.saturating_sub(tick).min(self.fade_out) as f64 / self.fade_out as f64 };
+        entering.min(leaving)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shot {
     pub id: Id,
     pub source: Source,
     pub range: Span,
     pub gain: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_fade: Option<AudioFade>,
+    #[serde(default, skip_serializing_if = "VisualTransform::is_identity")]
+    pub visual_transform: VisualTransform,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +140,8 @@ pub struct Sound {
     pub at: u64,
     pub range: Span,
     pub gain: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_fade: Option<AudioFade>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +161,8 @@ pub struct Project {
     pub assets: Vec<Asset>,
     pub shots: Vec<Shot>,
     pub sounds: Vec<Sound>,
+    #[serde(default)]
+    pub captions: Vec<Caption>,
 }
 
 impl Default for Project {
@@ -105,7 +170,7 @@ impl Default for Project {
         Self {
             format: "clipvault-editor".into(), version: 1, next_id: 1, name: "Untitled".into(),
             canvas: Canvas { width: 1280, height: 720, fps: 30 },
-            assets: Vec::new(), shots: Vec::new(), sounds: Vec::new(),
+            assets: Vec::new(), shots: Vec::new(), sounds: Vec::new(), captions: Vec::new(),
         }
     }
 }
@@ -136,7 +201,7 @@ impl Project {
 
     pub fn duration(&self) -> u64 {
         self.sounds.iter().map(|sound| sound.at.saturating_add(sound.range.len()))
-            .fold(self.visual_duration(), u64::max)
+            .chain(self.captions.iter().map(|cue| cue.range.end)).fold(self.visual_duration(), u64::max)
     }
 
     pub fn shot_start(&self, id: Id) -> Option<u64> {
@@ -182,7 +247,14 @@ impl Project {
     fn add_visual(&mut self, source: Source, duration: u64) -> Result<Id> {
         ensure!(duration > 0 && duration <= (i64::MAX as u64).saturating_sub(self.visual_duration()), "Choose a positive, playable duration.");
         let id = self.allocate_id()?;
-        self.shots.push(Shot { id, source, range: Span { start: 0, end: duration }, gain: 1.0 });
+        self.shots.push(Shot {
+            id,
+            source,
+            range: Span { start: 0, end: duration },
+            gain: 1.0,
+            audio_fade: None,
+            visual_transform: VisualTransform::default(),
+        });
         Ok(id)
     }
 
@@ -191,7 +263,7 @@ impl Project {
         ensure!(info.kind != AssetKind::Image, "Still pictures have no sound.");
         ensure!(at <= (i64::MAX as u64).saturating_sub(info.duration), "Choose an earlier audio start.");
         let id = self.allocate_id()?;
-        self.sounds.push(Sound { id, asset, role, at, range: Span { start: 0, end: info.duration }, gain: 1.0 });
+        self.sounds.push(Sound { id, asset, role, at, range: Span { start: 0, end: info.duration }, gain: 1.0, audio_fade: None });
         Ok(id)
     }
 
@@ -241,6 +313,8 @@ impl Project {
             self.shots.remove(i);
         } else if let Some(i) = self.sounds.iter().position(|item| item.id == id) {
             self.sounds.remove(i);
+        } else if let Some(i) = self.captions.iter().position(|item| item.id == id) {
+            self.captions.remove(i);
         } else {
             bail!("Select a timeline item to remove.");
         }
@@ -296,8 +370,11 @@ impl Project {
                 Source::Title(text) => { ensure!(!text.trim().is_empty(), "Enter the title text."); i64::MAX as u64 }
                 Source::Color(_) => i64::MAX as u64,
             };
+            ensure!(matches!(shot.source, Source::Asset(_)) || shot.visual_transform.is_identity(),
+                "Rotation and mirroring require an imported video or picture.");
             shot.range.check(limit)?;
             check_gain(shot.gain)?;
+            if let Some(fade) = shot.audio_fade { fade.validate()?; }
         }
         for sound in &self.sounds {
             ensure!(ids.insert(sound.id), "A timeline ID is duplicated.");
@@ -305,6 +382,12 @@ impl Project {
             ensure!(info.kind != AssetKind::Image, "A still image has no sound.");
             sound.range.check(info.duration)?;
             check_gain(sound.gain)?;
+            if let Some(fade) = sound.audio_fade { fade.validate()?; }
+        }
+        for cue in &self.captions {
+            ensure!(ids.insert(cue.id), "A caption ID is duplicated.");
+            ensure!(!cue.text.trim().is_empty(), "Enter the caption text.");
+            cue.range.check(i64::MAX as u64)?;
         }
         ensure!(self.next_id > 0 && ids.iter().all(|id| *id > 0 && *id < self.next_id), "Invalid project item IDs.");
         ensure!(self.duration() <= i64::MAX as u64, "The project exceeds the supported time range.");
@@ -318,6 +401,7 @@ impl Project {
         let mut result = self.clone();
         result.shots.clear();
         result.sounds.clear();
+        result.captions.clear();
         let mut at = 0;
         for shot in &self.shots {
             let timeline = Span { start: at, end: at + shot.range.len() };
@@ -337,6 +421,13 @@ impl Project {
                 out.range.start += part.start - timeline.start;
                 out.range.end = out.range.start + part.len();
                 result.sounds.push(out);
+            }
+        }
+        for cue in &self.captions {
+            if let Some(part) = cue.range.intersection(window) {
+                let mut out = cue.clone();
+                out.range = Span { start: part.start - window.start, end: part.end - window.start };
+                result.captions.push(out);
             }
         }
         let tail = window.len() - result.visual_duration();
