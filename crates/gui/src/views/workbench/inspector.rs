@@ -19,6 +19,7 @@ pub(super) struct Inspector {
     original: Option<Properties>,
     validation_error: Option<String>,
     camera_audio: bool,
+    frame_units: bool,
     name: String,
     canvas: Option<Canvas>,
 }
@@ -50,6 +51,11 @@ impl Workbench {
                 state.name != self.history.project.name || state.canvas != Some(self.history.project.canvas)
             };
             let button = ui.button(label).on_hover_text("Apply edited fields. Enter also applies changes to a selected item.");
+            if matches!(self.selected, Some(Selection::Shot(_))) {
+                ui.toggle_value(&mut state.frame_units, "Frames").on_hover_text(format!(
+                    "Enter source trims or card duration in frames on the {} fps project clock. Source Out is the first excluded frame.",
+                    self.history.project.canvas.fps));
+            }
             if pending { ui.label(theme::small("Unapplied edits")); }
             button.clicked()
         }).inner;
@@ -150,11 +156,12 @@ impl Workbench {
                     }
                 };
                 let timed_video = matches!(source, Source::Asset(id) if project.asset(*id).is_some_and(|asset| asset.info.kind == AssetKind::Video));
+                let unit = state.frame_units.then_some(project.canvas.fps);
                 if timed_video {
-                    trim_fields(ui, input, output, limit);
+                    trim_fields(ui, input, output, limit, unit);
                 } else {
                     let mut duration = *output - *input;
-                    if time_field(ui, "Duration", &mut duration, limit - *input).changed() {
+                    if unit_time_field(ui, "Duration", &mut duration, limit - *input, unit).changed() {
                         *output = *input + duration;
                     }
                 }
@@ -190,7 +197,7 @@ impl Workbench {
                 time_field(ui, "Start on Timeline", at, seconds(i64::MAX as u64));
                 gain_field(ui, gain);
                 let limit = seconds(asset.info.duration);
-                trim_fields(ui, input, output, limit);
+                trim_fields(ui, input, output, limit, None);
                 fade_fields(ui, fade, *output - *input);
             }
         }
@@ -271,26 +278,39 @@ fn properties(project: &Project, selection: Selection) -> Option<Properties> {
 }
 
 pub(super) fn time_field(ui: &mut Ui, label: &str, value: &mut f64, limit: f64) -> egui::Response {
+    unit_time_field(ui, label, value, limit, None)
+}
+
+fn unit_time_field(ui: &mut Ui, label: &str, value: &mut f64, limit: f64, fps: Option<u32>) -> egui::Response {
     ui.horizontal_wrapped(|ui| {
         let text = ui.label(label);
-        time_value(ui, value, limit).labelled_by(text.id)
+        time_value(ui, value, limit, fps).labelled_by(text.id)
     }).inner
 }
 
-fn trim_fields(ui: &mut Ui, input: &mut f64, output: &mut f64, limit: f64) {
+fn trim_fields(ui: &mut Ui, input: &mut f64, output: &mut f64, limit: f64, fps: Option<u32>) {
     let inline = ui.available_width() >= 310.0;
     ui.columns(2, |columns| {
         for ((column, label), value) in columns.iter_mut().zip(["Source In", "Source Out"]).zip([input, output]) {
             let field = |ui: &mut Ui| {
                 let name = ui.label(label);
-                time_value(ui, value, limit).labelled_by(name.id);
+                let field = time_value(ui, value, limit, fps).labelled_by(name.id);
+                if label == "Source Out" { field.on_hover_text("Exclusive end. The frame at this position is left out."); }
             };
             if inline { column.horizontal(field); } else { column.vertical(field); }
         }
     });
 }
 
-fn time_value(ui: &mut Ui, value: &mut f64, limit: f64) -> egui::Response {
+fn time_value(ui: &mut Ui, value: &mut f64, limit: f64, fps: Option<u32>) -> egui::Response {
+    if let Some(fps) = fps {
+        let rate = f64::from(fps.max(1));
+        let mut frame = *value * rate;
+        let response = ui.add(egui::DragValue::new(&mut frame).range(0.0..=limit * rate).speed(1.0)
+            .max_decimals(4).suffix(" fr").update_while_editing(false));
+        if response.changed() { *value = frame / rate; }
+        return response.on_hover_text(format!("Frames from the start at {fps} fps. Click to type an exact frame."));
+    }
     ui.add(egui::DragValue::new(value).range(0.0..=limit).speed(0.02).max_decimals(7)
         .suffix(" s").custom_parser(super::parse_time).update_while_editing(false))
         .on_hover_text("Click to type seconds or minutes:seconds. Ctrl+A replaces the value. Drag to adjust.")
