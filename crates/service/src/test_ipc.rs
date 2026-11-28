@@ -16,6 +16,12 @@ use std::time::Instant;
 #[path = "test_ipc/archive_day.rs"]
 mod archive_day;
 
+#[path = "test_ipc/hourly_split.rs"]
+mod hourly_split;
+
+#[path = "test_ipc/short_history.rs"]
+mod short_history;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const JOB_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -442,9 +448,44 @@ fn serve_isolated_profile() -> Result<()> {
         profile.dir.display()
     );
     let deadline = Instant::now() + Duration::from_secs(600);
+    let mut armed_live = false;
+    let observe_interactions = std::env::var_os("CLIPVAULT_INTERACTION_CHECK").is_some();
     while !profile.shared.is_shutting_down() && Instant::now() < deadline {
+        if observe_interactions && !armed_live && profile.dir.join("qa-arm-live").exists() {
+            arm_synthetic_live(&profile)?;
+            armed_live = true;
+        }
         thread::sleep(Duration::from_millis(100));
     }
+    Ok(())
+}
+
+fn arm_synthetic_live(profile: &TestProfile) -> Result<()> {
+    let db = Db::open_default()?;
+    let source = Path::new(&profile.recording.path);
+    let duration = profile.recording.duration;
+    let start = chrono::Local::now() - chrono::Duration::milliseconds((duration * 1000.0) as i64);
+    let path = source.with_file_name(format!("{}.mp4", start.format("%Y-%m-%d %H-%M-%S")));
+    std::fs::copy(source, &path)?;
+    let start_ms = cv_core::filenames::parse_timestamp_ms(&path).context("synthetic live timestamp")?;
+    let bytes = path.metadata()?.len() as i64;
+    let path_text = path.to_string_lossy().into_owned();
+    *profile.shared.live_path.lock() = Some(path.clone());
+    let id = db.upsert_recording(&path_text, start_ms, bytes, "recording")?;
+    db.set_recording_probe(id, start_ms, duration, profile.recording.audio_tracks, false, None)?;
+    profile.shared.update_status(|status| {
+        status.recording = cv_core::ipc::RecStatus {
+            active: true,
+            path: path_text,
+            started_ms: start_ms,
+            written_until_ms: start_ms + (duration * 1000.0) as i64,
+            bytes,
+            healthy: true,
+            tracks: profile.recording.audio_tracks as u32,
+            ..Default::default()
+        };
+    });
+    profile.shared.emit(Event::LibraryChanged);
     Ok(())
 }
 

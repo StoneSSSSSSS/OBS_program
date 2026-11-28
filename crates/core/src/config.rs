@@ -111,6 +111,9 @@ pub struct RecordingConfig {
     pub segment_minutes: u32,
     /// Keep this many hours of 24/7 footage (time the PC is off doesn't count).
     pub retention_hours: u32,
+    /// Exact archive window when the setting is not a whole number of hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_minutes: Option<u32>,
     /// Additionally delete footage older than this many days (0 = never).
     pub max_age_days: u32,
     /// Also cap total size of recordings (GB). 0 = no cap.
@@ -152,8 +155,9 @@ impl Default for RecordingConfig {
             history_mode: HistoryMode::Archive,
             rolling_minutes: 2,
             folder: default_media_folder("Recordings"),
-            segment_minutes: 30,
+            segment_minutes: 60,
             retention_hours: 48,
+            retention_minutes: None,
             max_age_days: 0,
             max_storage_gb: 0,
             min_free_space_gb: 30,
@@ -178,6 +182,35 @@ pub const QUALITIES: &[(&str, &str)] = &[("low", "Low (small files)"), ("medium"
 pub const HEIGHTS: &[(u32, &str)] = &[(0, "Full resolution"), (1440, "1440p"), (1080, "1080p (recommended)"), (720, "720p")];
 
 impl RecordingConfig {
+    pub fn history_minutes(&self) -> u32 {
+        self.retention_minutes.unwrap_or_else(|| self.retention_hours.saturating_mul(60)).clamp(1, 60 * 24 * 60)
+    }
+
+    pub fn set_history_minutes(&mut self, minutes: u32) {
+        let minutes = minutes.clamp(1, 60 * 24 * 60);
+        self.retention_hours = minutes.div_ceil(60);
+        self.retention_minutes = (minutes % 60 != 0).then_some(minutes);
+    }
+
+    pub fn history_label(&self) -> String {
+        let minutes = self.history_minutes();
+        match (minutes / 60, minutes % 60) {
+            (0, m) => format!("{m} min"),
+            (h, 0) => format!("{h} h"),
+            (h, m) => format!("{h} h {m} min"),
+        }
+    }
+
+    pub fn archive_segment_seconds(&self) -> u32 {
+        let window = self.history_minutes() * 60;
+        let preferred = self.segment_minutes.clamp(1, 240) * 60;
+        if window < 3600 {
+            preferred.min((window / 10).clamp(10, 60))
+        } else {
+            preferred.min(window)
+        }
+    }
+
     pub fn rolling_seconds(&self) -> Option<u32> {
         (self.history_mode == HistoryMode::Rolling)
             .then(|| self.rolling_minutes.clamp(1, MAX_ROLLING_MINUTES) * 60)
@@ -425,6 +458,10 @@ pub struct PlayerConfig {
     pub edit_fade_ms: u32,
     /// Audio lanes you've hidden (lane ids, e.g. "cat:other").
     pub hidden_lanes: Vec<String>,
+    /// Overrides for player-only shortcuts, with a primary and alternate chord.
+    /// Missing actions keep their app defaults; empty chords disable that binding.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub hotkeys: BTreeMap<String, [String; 2]>,
 }
 
 impl Default for PlayerConfig {
@@ -444,6 +481,7 @@ impl Default for PlayerConfig {
             smooth_edits: true,
             edit_fade_ms: 30,
             hidden_lanes: Vec::new(),
+            hotkeys: BTreeMap::new(),
         }
     }
 }
@@ -570,7 +608,7 @@ impl Config {
         let r = &mut self.recording;
         clamp(&mut r.rolling_minutes, 1, MAX_ROLLING_MINUTES);
         clamp(&mut r.segment_minutes, 1, 240);
-        clamp(&mut r.retention_hours, 1, 24 * 60);
+        r.set_history_minutes(r.history_minutes());
         clamp(&mut r.max_age_days, 0, 3650);
         clamp(&mut r.min_free_space_gb, 1, 10_000);
         clamp(&mut r.fps, 10, 240);
@@ -738,6 +776,7 @@ impl Config {
             || a.enabled != b.enabled
             || a.folder != b.folder
             || a.segment_minutes != b.segment_minutes
+            || (b.history_mode == HistoryMode::Archive && a.archive_segment_seconds() != b.archive_segment_seconds())
             || a.fps != b.fps
             || a.max_height != b.max_height
             || a.quality != b.quality
@@ -880,8 +919,8 @@ impl Config {
             self.clips.folder = p.clone();
         }
         if let Some(n) = legacy.keep_recordings {
-            let minutes = n.max(1) * segment_minutes_legacy.max(1);
-            self.recording.retention_hours = minutes.div_ceil(60).max(1);
+            let minutes = n.max(1).saturating_mul(segment_minutes_legacy.max(1));
+            self.recording.set_history_minutes(minutes);
         }
         self.sanitize();
     }
@@ -974,7 +1013,7 @@ mod tests {
         cfg.sanitize();
         assert_eq!(cfg.recording.retention_hours, 24);
         assert_eq!(cfg.recording.encoder, "auto", "old OBS encoder ids map to auto");
-        assert_eq!(cfg.recording.segment_minutes, 30);
+        assert_eq!(cfg.recording.segment_minutes, 60);
         assert_eq!(cfg.audio.voice_apps, vec!["Discord.exe", "TeamSpeak.exe"]);
         assert_eq!(cfg.hotkeys.save_clip, "Ctrl+Shift+`");
     }
@@ -1062,6 +1101,20 @@ mod tests {
     }
 
     #[test]
+    fn full_history_minutes_migrate_and_round_trip() {
+        let mut r: RecordingConfig = serde_json::from_str(r#"{"retention_hours":24,"segment_minutes":30}"#).unwrap();
+        assert_eq!((r.history_minutes(), r.archive_segment_seconds()), (1440, 1800));
+        for (input, expected, segment) in [(0, 1, 10), (10, 10, 60), (65, 65, 1800), (u32::MAX, 86400, 1800)] {
+            r.set_history_minutes(input);
+            let restored: RecordingConfig = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+            assert_eq!((restored.history_minutes(), restored.archive_segment_seconds()), (expected, segment));
+        }
+        r.set_history_minutes(60);
+        assert!(serde_json::to_value(&r).unwrap().get("retention_minutes").is_none());
+        assert_eq!(RecordingConfig::default().archive_segment_seconds(), 3600);
+    }
+
+    #[test]
     fn legacy_configs_are_migrated() {
         let text = "overlay img name=overlay_img.png\noverlay hotkey=ctrl+shift+`\n\
                     recordings path=I:\\OBS\\Recordings\nclips path=I:\\OBS\\Clips\n\
@@ -1095,5 +1148,22 @@ mod tests {
         assert!(!a.recorder_restart_needed(&b));
         b.recording.fps = 30;
         assert!(a.recorder_restart_needed(&b));
+    }
+}
+
+#[cfg(test)]
+mod player_hotkey_config_tests {
+    use super::*;
+
+    #[test]
+    fn older_player_config_preserves_defaults_and_round_trips_overrides() {
+        let mut cfg: Config = toml::from_str("[player]\nvolume = 62\nautoplay = false\n").unwrap();
+        assert_eq!(cfg.player.volume, 62);
+        assert!(!cfg.player.autoplay);
+        assert!(cfg.player.hotkeys.is_empty());
+        cfg.player.hotkeys.insert("jump_latest".into(), ["F8".into(), String::new()]);
+        cfg.player.hotkeys.insert("previous_frame".into(), [String::new(), String::new()]);
+        let restored: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg.player.hotkeys, restored.player.hotkeys);
     }
 }

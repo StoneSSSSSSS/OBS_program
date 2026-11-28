@@ -3,7 +3,7 @@
 //! Pure logic so it can be tested exhaustively; the service supplies the
 //! segment list and free-space figure and performs the deletions.
 //!
-//! Retention is measured in *hours of footage*, like the old program's "keep
+//! Retention is measured in *recorded time*, like the old program's "keep
 //! the last 48 recordings": time the PC is switched off doesn't eat into it.
 
 use std::path::PathBuf;
@@ -14,21 +14,15 @@ pub struct SegmentInfo {
     pub start_ms: i64,
     pub end_ms: i64,
     pub size: u64,
-    /// OBS is still writing this file.
+    /// The recorder is still writing this file.
     pub in_progress: bool,
     /// The user asked to keep this one.
     pub kept: bool,
 }
 
-impl SegmentInfo {
-    fn duration_ms(&self) -> i64 {
-        (self.end_ms - self.start_ms).max(0)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Policy {
-    /// Hours of footage to keep (newest first).
+    /// Recorded time to keep in milliseconds (newest first).
     pub keep_footage_ms: i64,
     /// Also delete anything that ended longer ago than this. 0 = no age limit.
     pub max_age_ms: i64,
@@ -40,7 +34,7 @@ pub struct Policy {
 impl Policy {
     pub fn from_config(cfg: &crate::config::RecordingConfig) -> Self {
         Self {
-            keep_footage_ms: cfg.retention_hours as i64 * 3_600_000,
+            keep_footage_ms: i64::from(cfg.history_minutes()) * 60_000,
             max_age_ms: cfg.max_age_days as i64 * 86_400_000,
             max_total_bytes: cfg.max_storage_gb as u64 * 1024 * 1024 * 1024,
             min_free_bytes: cfg.min_free_space_gb as u64 * 1024 * 1024 * 1024,
@@ -74,38 +68,49 @@ pub fn select_for_deletion(
     free_bytes: u64,
     policy: Policy,
 ) -> Vec<(PathBuf, Reason)> {
-    // The footage budget counts every non-kept segment, including the live one.
-    let mut by_newest: Vec<&SegmentInfo> = segments.iter().filter(|s| !s.kept).collect();
-    by_newest.sort_by(|a, b| b.start_ms.cmp(&a.start_ms).then(b.path.cmp(&a.path)));
-    let mut over_budget: Vec<PathBuf> = Vec::new();
-    let mut covered = 0i64;
-    for s in &by_newest {
-        if covered >= policy.keep_footage_ms && !s.in_progress {
-            over_budget.push(s.path.clone());
+    // Count overlapping copies only once. Offline gaps use no footage budget.
+    let mut spans: Vec<_> = segments.iter()
+        .filter(|s| !s.kept && s.end_ms > s.start_ms)
+        .map(|s| (s.start_ms, s.end_ms)).collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in spans {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
         }
-        covered += s.duration_ms();
+        merged.push((start, end));
+    }
+    let mut remaining = policy.keep_footage_ms.max(0);
+    let mut cutoff = if remaining == 0 { i64::MAX } else { i64::MIN };
+    for (start, end) in merged.into_iter().rev() {
+        let length = end.saturating_sub(start);
+        if remaining <= length {
+            cutoff = end.saturating_sub(remaining);
+            break;
+        }
+        remaining -= length;
     }
 
     let mut candidates: Vec<&SegmentInfo> = segments.iter().filter(|s| !s.in_progress && !s.kept).collect();
-    candidates.sort_by_key(|s| (s.start_ms, s.path.clone()));
+    candidates.sort_unstable_by(|a, b| a.start_ms.cmp(&b.start_ms).then_with(|| a.path.cmp(&b.path)));
 
-    let mut out = Vec::new();
-    let mut deleted = vec![false; candidates.len()];
+    let mut deleted = vec![None; candidates.len()];
     for (i, s) in candidates.iter().enumerate() {
-        if over_budget.contains(&s.path) {
-            out.push((s.path.clone(), Reason::Footage));
-            deleted[i] = true;
-        } else if policy.max_age_ms > 0 && s.end_ms < now_ms - policy.max_age_ms {
-            out.push((s.path.clone(), Reason::Age));
-            deleted[i] = true;
+        if s.end_ms <= cutoff {
+            deleted[i] = Some(Reason::Footage);
+        } else if policy.max_age_ms > 0 && s.end_ms < now_ms.saturating_sub(policy.max_age_ms) {
+            deleted[i] = Some(Reason::Age);
         }
     }
 
-    let freed: u64 = candidates.iter().zip(&deleted).filter(|(_, d)| **d).map(|(s, _)| s.size).sum();
+    let freed: u64 = candidates.iter().zip(&deleted).filter(|(_, d)| d.is_some()).map(|(s, _)| s.size).sum();
     let mut total: u64 = segments.iter().map(|s| s.size).sum::<u64>() - freed;
-    let mut free = free_bytes + freed;
+    let mut free = free_bytes.saturating_add(freed);
     for (i, s) in candidates.iter().enumerate() {
-        if deleted[i] {
+        if deleted[i].is_some() {
             continue;
         }
         let over_total = policy.max_total_bytes > 0 && total > policy.max_total_bytes;
@@ -113,13 +118,13 @@ pub fn select_for_deletion(
         if !over_total && !low_disk {
             break;
         }
-        out.push((s.path.clone(), if over_total { Reason::TotalSize } else { Reason::LowDisk }));
-        deleted[i] = true;
+        deleted[i] = Some(if over_total { Reason::TotalSize } else { Reason::LowDisk });
         total = total.saturating_sub(s.size);
-        free += s.size;
+        free = free.saturating_add(s.size);
     }
-    out.sort_by_key(|(p, _)| candidates.iter().position(|s| &s.path == p).unwrap_or(usize::MAX));
-    out
+    candidates.into_iter().zip(deleted)
+        .filter_map(|(s, reason)| reason.map(|reason| (s.path.clone(), reason)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -172,6 +177,18 @@ mod tests {
         // 47 newest complete files + half-hour live file = 47.5h < 48 -> the
         // oldest is the one crossing the line, so nothing is deleted.
         assert!(d.is_empty(), "{:?}", names(&d));
+    }
+
+    #[test]
+    fn overlapping_files_count_once_in_a_short_window() {
+        let mut spans = vec![seg("expired", 0, 0), seg("needed", 0, 0), seg("first", 0, 0), seg("copy", 0, 0)];
+        for (s, (from, to)) in spans.iter_mut().zip([(0, 60), (60, 300), (400, 760), (400, 760)]) {
+            s.start_ms = from * 1000;
+            s.end_ms = to * 1000;
+        }
+        let mut p = policy(1);
+        p.keep_footage_ms = 600_000;
+        assert_eq!(names(&select_for_deletion(&spans, 1_000_000, GB, p)), vec!["expired"]);
     }
 
     #[test]

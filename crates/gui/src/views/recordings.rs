@@ -1351,6 +1351,7 @@ mod tests {
             audio_tracks: 1,
             kept: false,
             probed: true,
+            probe_filetime: None,
         };
         let mut view = RecordingsView {
             recs: vec![recording("closed.mp4", 1_000, 2.0, "complete"),

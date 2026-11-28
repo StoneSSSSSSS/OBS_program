@@ -68,7 +68,7 @@ fn cli(args: &[String]) -> Result<()> {
             let dir = args.get(1).map(std::path::PathBuf::from).ok_or_else(|| anyhow::anyhow!("--migrate <old program folder>"))?;
             let cfg = startup::migrate_legacy(&dir)?;
             println!("config written to {}", cv_core::paths::config_path().display());
-            println!("recordings: {}  clips: {}  retention: {}h  clip length: {}s", cfg.recording.folder, cfg.clips.folder, cfg.recording.retention_hours, cfg.clips.clip_length_secs);
+            println!("recordings: {}  clips: {}  retention: {}  clip length: {}s", cfg.recording.folder, cfg.clips.folder, cfg.recording.history_label(), cfg.clips.clip_length_secs);
         }
         "--install-shortcuts" => {
             anyhow::ensure!(!cv_core::paths::uses_local_storage(), "Project-local ClipVault does not create Windows shortcuts");

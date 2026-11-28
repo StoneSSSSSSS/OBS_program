@@ -42,15 +42,14 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<ClipTask>) {
 
 /// Cut plan: the parts of `footage` covering `[from_ms, to_ms)`.
 pub fn plan(footage: &[Footage], from_ms: i64, to_ms: i64) -> Vec<CutSource> {
-    let mut v: Vec<&Footage> = footage.iter().collect();
-    v.sort_by_key(|f| f.start_ms);
-    v.into_iter()
-        .filter_map(|f| {
-            let end = f.start_ms + (f.duration_s * 1000.0) as i64;
-            let a = from_ms.max(f.start_ms);
-            let b = to_ms.min(end);
-            (b > a + 100).then(|| CutSource { path: f.path.clone(), from_s: (a - f.start_ms) as f64 / 1000.0, to_s: Some((b - f.start_ms) as f64 / 1000.0) })
-        })
+    let segments: Vec<_> = footage.iter().map(|f| cv_core::timeline::Segment {
+        path: f.path.clone(), start_ms: f.start_ms,
+        duration_ms: (f.duration_s.max(0.0) * 1000.0).round() as i64,
+        // Always use the observed extent, including the file still being written.
+        live: true,
+    }).collect();
+    cv_core::timeline::plan_cut(&segments, from_ms, to_ms).into_iter()
+        .map(|part| CutSource { path: part.path, from_s: part.in_s, to_s: part.out_s })
         .collect()
 }
 

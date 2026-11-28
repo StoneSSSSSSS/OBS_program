@@ -175,7 +175,7 @@ fn footage_for(sh: &Shared, from_ms: i64, to_ms: i64) -> Result<Vec<Footage>> {
         .list_recordings()?
         .into_iter()
         .filter(|recording| media_path_allowed(Path::new(&recording.path)))
-        .filter(|r| r.start_ms < to_ms && (r.end_ms() > from_ms || r.is_live()))
+        .filter(|r| r.start_ms < to_ms && ((r.probed && r.end_ms() > from_ms) || r.is_live()))
         .filter(|r| !r.is_live() || crate::shared::same_path(&r.path, &live_path))
         .map(|r| Footage {
             duration_s: if r.is_live() { (written - r.start_ms).max(0) as f64 / 1000.0 } else { r.duration },

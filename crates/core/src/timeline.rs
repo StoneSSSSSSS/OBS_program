@@ -15,7 +15,7 @@ pub struct Segment {
 
 impl Segment {
     pub fn end_ms(&self) -> i64 {
-        self.start_ms + self.duration_ms.max(0)
+        self.start_ms.saturating_add(self.duration_ms.max(0))
     }
 }
 
@@ -28,27 +28,40 @@ pub struct Located {
     pub snapped: bool,
 }
 
+/// A recording that extends coverage takes over at its first frame. Completely
+/// contained copies add no footage. Every interior join thus starts at the
+/// new file's native keyframe, even if the archive contains overlapping copies.
+pub fn coverage(segments: &[Segment]) -> Vec<(usize, i64)> {
+    let mut order: Vec<_> = (0..segments.len()).filter(|&i| segments[i].duration_ms > 0).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&segments[a], &segments[b]);
+        a.start_ms.cmp(&b.start_ms).then_with(|| b.end_ms().cmp(&a.end_ms())).then_with(|| a.path.cmp(&b.path))
+    });
+    let mut timeline: Vec<(usize, i64)> = Vec::with_capacity(order.len());
+    for i in order {
+        let s = &segments[i];
+        if let Some((_, end)) = timeline.last_mut() {
+            if s.end_ms() <= *end { continue; }
+            *end = (*end).min(s.start_ms);
+        }
+        timeline.push((i, s.end_ms()));
+    }
+    timeline
+}
+
 /// Find the segment containing wall-clock time `t_ms`. `segments` must be
 /// sorted by start. Times in gaps snap forward to the next segment; times
 /// after the end snap to the end of the last segment.
 pub fn locate(segments: &[Segment], t_ms: i64) -> Option<Located> {
-    if segments.is_empty() {
-        return None;
+    let timeline = coverage(segments);
+    for &(index, end) in &timeline {
+        let s = &segments[index];
+        if t_ms < end {
+            return Some(Located { index, offset_ms: t_ms.saturating_sub(s.start_ms).max(0), snapped: t_ms < s.start_ms });
+        }
     }
-    // Last segment that starts at or before t.
-    let idx = segments.partition_point(|s| s.start_ms <= t_ms);
-    if idx == 0 {
-        return Some(Located { index: 0, offset_ms: 0, snapped: true });
-    }
-    let i = idx - 1;
-    let s = &segments[i];
-    if t_ms < s.end_ms() {
-        return Some(Located { index: i, offset_ms: t_ms - s.start_ms, snapped: false });
-    }
-    if i + 1 < segments.len() {
-        return Some(Located { index: i + 1, offset_ms: 0, snapped: true });
-    }
-    Some(Located { index: i, offset_ms: s.duration_ms.max(0), snapped: true })
+    let &(index, _) = timeline.last()?;
+    Some(Located { index, offset_ms: segments[index].duration_ms, snapped: true })
 }
 
 /// Wall-clock time for an offset in a segment.
@@ -73,9 +86,10 @@ pub fn plan_cut(segments: &[Segment], from_ms: i64, to_ms: i64) -> Vec<CutPart> 
     if to_ms <= from_ms {
         return parts;
     }
-    for s in segments {
+    for (index, end) in coverage(segments) {
+        let s = &segments[index];
         let a = from_ms.max(s.start_ms);
-        let b = to_ms.min(s.end_ms());
+        let b = to_ms.min(end);
         if b <= a {
             continue;
         }
@@ -146,6 +160,19 @@ mod tests {
         );
         assert!((plan_duration_s(&p, &segs) - 80.0).abs() < 1e-9);
         assert!(plan_cut(&segs, 10, 10).is_empty());
+    }
+
+    #[test]
+    fn overlaps_choose_one_source_and_tiny_boundary_ranges_keep_both_sides() {
+        let segs = [seg("second", 10_000, 40_000), seg("first", 0, 40_000),
+            seg("duplicate", 10_000, 40_000), seg("contained", 20_000, 500)];
+        assert_eq!(coverage(&segs), vec![(1, 10_000), (2, 50_000)]);
+        assert_eq!(locate(&segs, 15_000).unwrap().index, 2);
+        for (a, b) in [(15_000, 25_000), (35_000, 47_000), (9_980, 10_020)] {
+            let cut = plan_cut(&segs, a, b);
+            assert!((plan_duration_s(&cut, &segs) - (b - a) as f64 / 1000.0).abs() < 1e-8);
+        }
+        assert_eq!(plan_cut(&segs, 9_980, 10_020).len(), 2);
     }
 
     #[test]

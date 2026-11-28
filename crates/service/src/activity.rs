@@ -130,7 +130,7 @@ pub fn run(sh: Arc<Shared>) {
 
         if last_prune.elapsed() > Duration::from_secs(3600) {
             last_prune = Instant::now();
-            let keep_days = cfg.advanced.activity_history_days.max(cfg.recording.retention_hours.div_ceil(24) + 1);
+            let keep_days = cfg.advanced.activity_history_days.max(cfg.recording.history_minutes().div_ceil(24 * 60) + 1);
             let _ = db.prune_activity(now - keep_days as i64 * 86_400_000);
             let _ = db.prune_markers(now - keep_days as i64 * 86_400_000);
         }

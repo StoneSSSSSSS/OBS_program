@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Clip writes performed under the same SQLite writer lock as file publication.
 pub struct ClipWrite<'a>(&'a Db);
@@ -187,34 +187,57 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Db { conn };
+        let mut db = Db { conn };
         db.migrate()?;
         Ok(db)
     }
 
-    fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch(SCHEMA_V1)?;
-        // v2: non-destructive audio edits per clip.
-        let has_edits: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('clips') WHERE name='audio_edits'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_edits == 0 {
-            self.conn.execute("ALTER TABLE clips ADD COLUMN audio_edits TEXT NOT NULL DEFAULT ''", [])?;
+    fn migrate(&mut self) -> Result<()> {
+        // Opening a healthy library is read-only. Recorder events and desktop
+        // queries should not compete for a SQLite writer lock just to open it.
+        let current: Option<String> = self.conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0),
+        ).optional().unwrap_or(None);
+        if current.as_deref().and_then(|s| s.parse::<i64>().ok()) == Some(SCHEMA_VERSION)
+            && self.conn.prepare("SELECT audio_edits FROM clips LIMIT 0").is_ok()
+            && self.conn.prepare("SELECT probe_filetime FROM recordings LIMIT 0").is_ok()
+        {
+            return Ok(());
         }
-        let v: Option<String> = self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
-            .optional()?;
-        let v: i64 = v.and_then(|s| s.parse().ok()).unwrap_or(0);
-        if v > SCHEMA_VERSION {
-            anyhow::bail!("library.db was created by a newer ClipVault (schema {v})");
+        // Desktop and service may open the same old library simultaneously.
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(SCHEMA_V1)?;
+        let version: Option<String> = tx.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0),
+        ).optional()?;
+        let version = version.as_deref().unwrap_or("0").parse::<i64>()?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!("library.db was created by a newer ClipVault (schema {version})");
         }
-        self.conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
-            [SCHEMA_VERSION.to_string()],
+        // Some legacy databases are marked current despite a missing column.
+        {
+            let has_edits: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clips') WHERE name='audio_edits')", [], |r| r.get(0),
+            )?;
+            if !has_edits {
+                tx.execute("ALTER TABLE clips ADD COLUMN audio_edits TEXT NOT NULL DEFAULT ''", [])?;
+            }
+        }
+        let has_stamp: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recordings') WHERE name='probe_filetime')", [], |r| r.get(0),
         )?;
+        if !has_stamp {
+            tx.execute("ALTER TABLE recordings ADD COLUMN probe_filetime INTEGER", [])?;
+        }
+        if version < 3 || !has_stamp {
+            // Old failed probes stored a timestamp estimate as finalized media.
+            // Unknown lengths must not contribute to selections or retention.
+            tx.execute("UPDATE recordings SET probed=0, duration=0 WHERE status!='recording' AND audio_tracks=0", [])?;
+        }
+        if version != SCHEMA_VERSION {
+            tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)", [SCHEMA_VERSION.to_string()])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -703,22 +726,24 @@ impl Db {
             audio_tracks: r.get("audio_tracks")?,
             kept: r.get::<_, i64>("kept")? != 0,
             probed: r.get::<_, i64>("probed")? != 0,
+            probe_filetime: r.get("probe_filetime")?,
         })
     }
 
     pub fn upsert_recording(&self, path: &str, start_ms: i64, size: i64, status: &str) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO recordings(path, start_ms, size, status) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(path) DO UPDATE SET size=excluded.size, status=excluded.status",
+             ON CONFLICT(path) DO UPDATE SET start_ms=excluded.start_ms, size=excluded.size, status=excluded.status,
+                 probed=CASE WHEN recordings.size!=excluded.size OR recordings.status!=excluded.status THEN 0 ELSE recordings.probed END",
             params![path, start_ms, size, status],
         )?;
         Ok(self.conn.query_row("SELECT id FROM recordings WHERE path=?1", [path], |r| r.get(0))?)
     }
 
-    pub fn set_recording_probe(&self, id: i64, duration: f64, audio_tracks: i64, final_probe: bool) -> Result<()> {
+    pub fn set_recording_probe(&self, id: i64, start_ms: i64, duration: f64, audio_tracks: i64, final_probe: bool, filetime: Option<i64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE recordings SET duration=?2, audio_tracks=?3, probed=?4 WHERE id=?1",
-            params![id, duration, audio_tracks, final_probe as i64],
+            "UPDATE recordings SET duration=?2, audio_tracks=?3, probed=?4, probe_filetime=?5, start_ms=?6 WHERE id=?1",
+            params![id, duration, audio_tracks, final_probe as i64, filetime, start_ms],
         )?;
         Ok(())
     }
@@ -898,7 +923,7 @@ mod tests {
         }
         let db = Db::open(&p).unwrap();
         assert_eq!(db.meta_get("x").unwrap().as_deref(), Some("1"));
-        assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("3"));
     }
 
     #[test]
@@ -1000,7 +1025,7 @@ mod tests {
         let r = db.upsert_recording(r"I:\a.mp4", 1000, 10, "recording").unwrap();
         let r2 = db.upsert_recording(r"I:\a.mp4", 1000, 20, "complete").unwrap();
         assert_eq!(r, r2);
-        db.set_recording_probe(r, 3600.0, 6, true).unwrap();
+        db.set_recording_probe(r, 1000, 3600.0, 6, true, None).unwrap();
         let rec = db.recording(r).unwrap().unwrap();
         assert_eq!((rec.size, rec.status.as_str(), rec.audio_tracks), (20, "complete", 6));
         assert_eq!(rec.end_ms(), 1000 + 3_600_000);
@@ -1047,6 +1072,21 @@ mod tests {
 mod migration_tests {
     use super::*;
 
+    #[test]
+    fn old_unplayable_archive_is_retryable_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '2')", []).unwrap();
+            c.execute("INSERT INTO recordings(path,start_ms,size,status,duration,probed,audio_tracks) VALUES ('partial.mp4',1000,96,'complete',7580260.048,1,0)", []).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let row = db.list_recordings().unwrap().pop().unwrap();
+        assert!(!row.probed && row.duration == 0.0 && row.probe_filetime.is_none());
+    }
+
     /// A v1 database (no audio_edits column) upgrades in place.
     #[test]
     fn upgrades_v1_database() {
@@ -1061,6 +1101,6 @@ mod migration_tests {
         let db = Db::open(&p).unwrap();
         let clip = db.clip_by_path("a.mp4").unwrap().unwrap();
         assert!(clip.audio_edits.is_empty());
-        assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("3"));
     }
 }

@@ -170,6 +170,10 @@ fn run_inner(sh: &Arc<Shared>, tx: &Sender<MuxMsg>, namer: Arc<dyn AppNamer>, mi
     let n_wave = 2 + if cfg.record_apps { cfg.app_slots as usize } else { 0 };
     let mut wave_pos: Option<i64> = None;
     let mut wave_acc = vec![0.0f32; n_wave];
+    // Hub blocks have a fixed format. Reuse the mix for the full recording
+    // and borrow source samples when sending them to each independent encoder.
+    let mut mix = [0.0f32; BLOCK * CHANNELS];
+    let silence = [0.0f32; BLOCK * CHANNELS];
     let mut level_at = Instant::now();
     let own: Vec<u32> = cfg.exclude_pids.iter().copied().chain(std::iter::once(std::process::id())).collect();
 
@@ -283,18 +287,17 @@ fn run_inner(sh: &Arc<Shared>, tx: &Sender<MuxMsg>, namer: Arc<dyn AppNamer>, mi
                 wave_acc.iter_mut().for_each(|v| *v = 0.0);
             }
             wave_pos = Some(win);
-            let mut mix = vec![0.0f32; BLOCK * CHANNELS];
-            // Microphone.
-            let mic_blk: Vec<f32> = match b.sources.iter().find(|(id, _)| *id == MIC_ID) {
-                Some((_, v)) => v.iter().map(|x| x * mic_gain).collect(),
-                None => vec![0.0; BLOCK * CHANNELS],
-            };
-            level_acc.mic = level_acc.mic.max(peak(&mic_blk));
-            wave_acc[1] = wave_acc[1].max(peak(&mic_blk));
-            for (m, x) in mix.iter_mut().zip(&mic_blk) {
-                *m += x;
+            if let Some((_, mic_samples)) = b.sources.iter().find(|(id, _)| *id == MIC_ID) {
+                for (out, sample) in mix.iter_mut().zip(mic_samples) {
+                    *out = sample * mic_gain;
+                }
+            } else {
+                mix.fill(0.0);
             }
-            st.mic_enc.push(b.pos, &mic_blk, tx);
+            let mic_peak = peak(&mix);
+            level_acc.mic = level_acc.mic.max(mic_peak);
+            wave_acc[1] = wave_acc[1].max(mic_peak);
+            st.mic_enc.push(b.pos, &mix, tx);
             // Apps.
             let mut assigned = false;
             for (id, v) in &b.sources {
@@ -332,11 +335,11 @@ fn run_inner(sh: &Arc<Shared>, tx: &Sender<MuxMsg>, namer: Arc<dyn AppNamer>, mi
             // App tracks (silence while an assigned app is quiet).
             for (i, s) in st.slots.iter_mut().enumerate() {
                 let Some((app_id, enc)) = s else { continue };
-                let pcm = b.sources.iter().find(|(id, _)| id == app_id).map(|(_, v)| v.clone()).unwrap_or_else(|| vec![0.0; BLOCK * CHANNELS]);
+                let pcm = b.sources.iter().find(|(id, _)| id == app_id).map(|(_, v)| v.as_slice()).unwrap_or(&silence);
                 if let Some(w) = wave_acc.get_mut(2 + i) {
-                    *w = w.max(peak(&pcm));
+                    *w = w.max(peak(pcm));
                 }
-                enc.push(b.pos, &pcm, tx);
+                enc.push(b.pos, pcm, tx);
             }
             if assigned {
                 announce(sh, tx, &st, &apps, b.pos);
@@ -344,8 +347,9 @@ fn run_inner(sh: &Arc<Shared>, tx: &Sender<MuxMsg>, namer: Arc<dyn AppNamer>, mi
             for m in mix.iter_mut() {
                 *m = cv_core::mixer::limit(*m);
             }
-            level_acc.full = level_acc.full.max(peak(&mix));
-            wave_acc[0] = wave_acc[0].max(peak(&mix));
+            let full_peak = peak(&mix);
+            level_acc.full = level_acc.full.max(full_peak);
+            wave_acc[0] = wave_acc[0].max(full_peak);
             st.full.push(b.pos, &mix, tx);
             // Free tracks of apps that have been quiet for a long time.
             let idle: Vec<u32> = apps.values().filter(|a| a.slot.is_some() && b.pos - a.last_sound > SLOT_IDLE_FRAMES).filter_map(|a| a.slot).collect();

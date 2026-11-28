@@ -214,6 +214,8 @@ pub struct Recording {
     pub audio_tracks: i64,
     pub kept: bool,
     pub probed: bool,
+    #[serde(default)]
+    pub probe_filetime: Option<i64>,
 }
 
 impl Recording {

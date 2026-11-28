@@ -17,6 +17,9 @@
 mod audio;
 mod video;
 
+#[cfg(test)]
+mod rollover_test;
+
 use crate::capture::hub::{frames_to_hns, hns_to_frames};
 use crate::capture::CaptureMethod;
 use crate::clock::{now_hns, Epoch};
@@ -536,7 +539,11 @@ impl Muxer {
             None => true,
         };
         if roll {
+            let mut continuous_start = None;
             if let Some(seg) = self.seg.take() {
+                if seg.end_hns == gop.start {
+                    continuous_start = Some(seg.start_ms + (gop.start - seg.start_hns) / 10_000);
+                }
                 self.finish_segment(seg);
             }
             // Assignments that took effect before this file starts go in its header.
@@ -544,7 +551,7 @@ impl Muxer {
             while self.slot_changes.front().map(|c| c.0 <= start_frames).unwrap_or(false) {
                 self.slots = self.slot_changes.pop_front().unwrap().1;
             }
-            self.seg = Some(self.open_segment(&gop, &cfg)?);
+            self.seg = Some(self.open_segment(&gop, &cfg, continuous_start)?);
         }
         let end_frames = self.frame_pos(end);
         self.write_slot_changes(end_frames)?;
@@ -642,14 +649,15 @@ impl Muxer {
         Ok(())
     }
 
-    fn open_segment(&mut self, gop: &Gop, cfg: &RecorderConfig) -> Result<Segment> {
+    fn open_segment(&mut self, gop: &Gop, cfg: &RecorderConfig, continuous_start: Option<i64>) -> Result<Segment> {
         let first = &gop.packets[0];
         let sps = first.sps.clone().context("keyframe without SPS")?;
         let pps = first.pps.clone().context("keyframe without PPS")?;
         let avcc = crate::h264::build_avcc(&sps, &pps);
-        // Anchor to the wall clock now (no drift over days, correct after sleep).
+        // An ordinary rotation shares the previous segment's endpoint. A new
+        // capture or a discontinuity anchors its first frame to the wall clock.
         let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-        let start_ms = unix_now - (now_hns() - gop.start) / 10_000;
+        let start_ms = continuous_start.unwrap_or_else(|| unix_now - (now_hns() - gop.start) / 10_000);
         std::fs::create_dir_all(&cfg.folder)?;
         let mut path = cfg.folder.join(segment_name(start_ms));
         let mut n = 2;

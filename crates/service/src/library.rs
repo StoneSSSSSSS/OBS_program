@@ -105,12 +105,14 @@ fn index_recordings(sh: &Shared, db: &Db) -> bool {
         present.insert(path.to_lowercase());
         let meta = p.metadata().ok();
         let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-        let start = parse_timestamp_ms(&p)
+        let prev = existing.get(&path.to_lowercase());
+        let named_start = parse_timestamp_ms(&p);
+        let start = prev.map(|r| r.start_ms).or(named_start)
             .or_else(|| meta.as_ref().and_then(|m| m.created().ok()).map(system_time_ms))
             .unwrap_or(now);
+        let filetime = meta.as_ref().map(|m| std::os::windows::fs::MetadataExt::last_write_time(m) as i64);
         let is_live = sh.is_live(&path);
         let status = if is_live { "recording" } else { "complete" };
-        let prev = existing.get(&path.to_lowercase());
         let needs_upsert = prev.map(|r| r.size != size || r.status != status).unwrap_or(true);
         let id = if needs_upsert {
             changed = true;
@@ -140,21 +142,23 @@ fn index_recordings(sh: &Shared, db: &Db) -> bool {
         }
         if is_live {
             let _ = db.set_recording_duration(id, ((now - start) as f64 / 1000.0).max(0.0));
-        } else if !prev.map(|r| r.probed).unwrap_or(false) {
-            // Finished file: get its real duration and track count.
-            let mut dur = 0.0;
-            let mut tracks = 0;
-            if let Ok(info) = cv_media::probe::probe(&p) {
-                dur = info.duration;
-                tracks = info.audio.len() as i64;
+        } else if prev.is_none_or(|r| !r.probed || r.size != size || r.probe_filetime != filetime || r.is_live()) {
+            let info = cv_media::probe::probe(&p).ok().filter(|i| i.width > 0 && i.height > 0 && i.duration.is_finite() && i.duration > 0.0);
+            // Native headers carry milliseconds. Honor explicitly renamed archive copies,
+            // and use the header to disambiguate repeated local times during a DST fold.
+            let native_start = info.as_ref().and_then(|i| i.start_ms).filter(|ms| {
+                named_start.is_none_or(|named| {
+                    named.div_euclid(1000) == ms.div_euclid(1000)
+                        || cv_media::recorder::segment_name(named) == cv_media::recorder::segment_name(*ms)
+                })
+            });
+            let start = native_start.or(named_start).unwrap_or(start);
+            let (duration, tracks, valid) = info.map_or((0.0, 0, false), |i| (i.duration, i.audio.len() as i64, true));
+            // Partial copies and locked files remain retryable. Filesystem age
+            // is unrelated to the amount of playable media in an archive.
+            if needs_upsert || prev.is_none_or(|r| r.start_ms != start || r.duration != duration || r.audio_tracks != tracks || r.probed != valid || r.probe_filetime != filetime) {
+                changed |= db.set_recording_probe(id, start, duration, tracks, valid, filetime).is_ok();
             }
-            if dur <= 0.0 {
-                // Fall back to the file's timestamps.
-                let modified = meta.as_ref().and_then(|m| m.modified().ok()).map(system_time_ms).unwrap_or(start);
-                dur = ((modified - start) as f64 / 1000.0).max(0.0);
-            }
-            let _ = db.set_recording_probe(id, dur, tracks, true);
-            changed = true;
         }
     }
     // Forget files that are gone.
@@ -187,6 +191,7 @@ fn retention(sh: &Shared, db: &Db) {
     let recs = db.list_recordings().unwrap_or_default();
     let segments: Vec<SegmentInfo> = recs
         .iter()
+        .filter(|recording| recording.is_live() || (recording.probed && recording.duration > 0.0))
         .filter(|recording| retention_path_allowed(Path::new(&recording.path), &archive, &saved))
         .map(|r| SegmentInfo {
             path: PathBuf::from(&r.path),

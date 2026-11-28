@@ -63,7 +63,7 @@ enum RecordingMode {
 impl RecordingMode {
     fn segment_secs(self, cfg: &Config) -> u32 {
         match self {
-            Self::Archive => cfg.recording.segment_minutes * 60,
+            Self::Archive => cfg.recording.archive_segment_seconds(),
             Self::Paused => 60,
             Self::Rolling => ROLLING_SEGMENT_SECS,
         }
@@ -513,7 +513,7 @@ impl Engine {
             footage.retain(|segment| !segment.path.starts_with(&rolling));
             let db = Db::open_default().map_err(|error| format!("{error:#}"))?;
             let records = db.list_recordings().map_err(|error| format!("{error:#}"))?;
-            for record in records.into_iter().filter(|record| !record.is_live() && record.end_ms() > from_ms) {
+            for record in records.into_iter().filter(|record| record.probed && !record.is_live() && record.end_ms() > from_ms) {
                 let path = PathBuf::from(record.path);
                 if !footage.iter().any(|segment| crate::shared::same_path(&segment.path.to_string_lossy(), &path.to_string_lossy())) {
                     footage.push(Footage { path, start_ms: record.start_ms, duration_s: record.duration });
@@ -559,8 +559,10 @@ impl Engine {
                 if self.mode == RecordingMode::Archive {
                     if let Ok(db) = Db::open_default() {
                         if let Ok(id) = db.upsert_recording(&path.to_string_lossy(), start_ms, bytes as i64, "complete") {
-                            let tracks = cv_media::probe::probe(&path).map(|i| i.audio.len() as i64).unwrap_or(0);
-                            let _ = db.set_recording_probe(id, duration_s, tracks, true);
+                            if let Ok(info) = cv_media::probe::probe(&path) {
+                                let stamp = path.metadata().ok().map(|m| std::os::windows::fs::MetadataExt::last_write_time(&m) as i64);
+                                let _ = db.set_recording_probe(id, start_ms, duration_s, info.audio.len() as i64, true, stamp);
+                            }
                         }
                     }
                     self.sh.emit(Event::RecordingsChanged);
@@ -836,7 +838,7 @@ mod tests {
         cfg.recording.rolling_minutes = 2;
         assert!(recording_mode(&cfg, false) == RecordingMode::Rolling);
         assert_eq!(RecordingMode::Rolling.segment_secs(&cfg), 10);
-        assert_eq!(RecordingMode::Archive.segment_secs(&cfg), 1800);
+        assert_eq!(RecordingMode::Archive.segment_secs(&cfg), 3600);
         assert_eq!(clip_seconds(420, cfg.recording.rolling_seconds()), 120);
         assert_eq!(clip_seconds(30, cfg.recording.rolling_seconds()), 30);
     }

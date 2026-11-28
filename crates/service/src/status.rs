@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub fn build(sh: &Shared) -> Status {
-    let cfg = sh.cfg();
+    let min_free_gb = sh.cfg.read().recording.min_free_space_gb;
     let mut s = sh.status.lock().clone();
     s.version = cv_core::VERSION.to_string();
     s.jobs = sh.jobs.lock().clone();
@@ -31,7 +31,7 @@ pub fn build(sh: &Shared) -> Status {
     for e in sh.hotkey_errors.lock().iter() {
         w.push(e.clone());
     }
-    let min_free = cfg.recording.min_free_space_gb as u64 * 1024 * 1024 * 1024;
+    let min_free = u64::from(min_free_gb) * 1024 * 1024 * 1024;
     if s.disk.total_bytes > 0 && s.disk.free_bytes < min_free {
         w.push(format!("Low disk space on the recordings drive ({} free)", human_bytes(s.disk.free_bytes)));
     }
