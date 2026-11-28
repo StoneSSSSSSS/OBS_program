@@ -4,7 +4,7 @@ ClipVault records your Windows screen and app audio, saves highlights and export
 
 ## Open ClipVault
 
-Extract the Windows app folder somewhere you can write, keep `clipvault.exe` and `clipvault-service.exe` together, and open **clipvault.exe**. The window starts the background recorder. Closing the window lets the recorder continue. Use **Quit ClipVault service** in the tray when you want to stop capturing.
+Extract the whole Windows app folder somewhere you can write and open **clipvault.exe**. Keep it beside `clipvault-service.exe`, the bundled Microsoft C++ runtime, and the assets folder. The window starts the background recorder. Closing the window lets the recorder continue. Use **Quit ClipVault service** in the tray when you want to stop capturing.
 
 ## Keep just the last two minutes
 
@@ -52,3 +52,9 @@ For development, use a Windows Rust toolchain with a linker and Windows SDK. Run
 To build the two Windows executables from source, run `cargo build --release --locked` at the workspace root. Open `target\release\clipvault.exe` to run that build. For a per-user installation with shortcuts, run `scripts\install.ps1` from PowerShell after the release build finishes.
 
 See [TODO.md](TODO.md) for the current rewrite and verification status.
+
+### Check resizing after a UI change
+
+The Windows layout workflow runs the editor, page layout and pointer-input regression tests when the rewrite branch changes. Locally, `cargo test --locked -p clipvault-gui --bin clipvault views::` exercises retained layouts as the window shrinks and grows.
+
+For a release check on a Windows desktop, use [scripts/check-resize.ps1](scripts/check-resize.ps1). Pass `-Gui` the candidate executable, `-FixtureService` the test executable from `cargo test --locked -p clipvault-service --no-run`, and `-Media` a synthetic H.264/AAC MP4 with at least 30 seconds of footage. Run with `-Scale 1`, `1.25`, and `1.5`. Each run opens a disposable library, measures the rendered text during native resizing, and leaves intermediate screenshots and a pass/fail report under `.clipvault-local\qa`.

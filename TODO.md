@@ -13,10 +13,12 @@
 - [x] Recover from controlled process termination during trim replacement. Isolated child processes stopped before and after the SQLite commit. Startup recovery restored the original before commit, kept the replacement after commit, and preserved conflicting files and newer edits. The tests also covered a migrated library, repeated recovery and rollback on a deferred database commit failure.
 - [x] Keep long display titles independent of filenames. An IPC fixture preserved a 226 UTF-16-unit title at cut and a 182-unit title after renaming, with safe trim and export filename suffixes.
 - [x] Pause archived waveform backfill at its next decode chunk while a classified game is in the foreground. Scheduling tests simulate focus and shutdown and verify that a 200 ms audio chunk waits for focus to clear and incurs at least 4 ms of throttle time before decoding.
+- [x] Keep the player, waveforms, transport and inspector in separate regions during resizing. The previous build reproduced the overlap at intermediate widths. The fixed optimized executable passed 3,816 rendered frames across 18 views and UI scales of 100%, 125% and 150%. The sweep checks marked trim ranges, scrolled export actions and a dirty Settings footer. Saved screenshots include the 1094 × 671 case.
+- [x] Complete an independent hands-on review of recent footage, range/preview, save/reopen, child-track mute/undo and size-limited export. All five tasks passed the review rubric. The reviewer verified the formerly failing widths during active Windows sizing and measured the 1 MB export at 770,655 bytes.
+- [x] Scope the completed export shown in the inspector to the open clip. The complete export queue remains available in Jobs.
 
 ## Next verification
 
-- [ ] Verify the latest native resize matrix for the standalone Windows executable. Check compact and wide views, transport and timeline controls, audio lanes, long job titles and empty recording screens.
 - [ ] Run a sustained live replay-only session on a second Windows setup. Check hotkey capture and rebinding, headset and display reconnects, disk pressure, and waveform backfill while entering and leaving a game.
 - [ ] Measure backfill on long, multitrack archives alongside recording and playback. Check CPU and disk usage, actual pause and resume latency, and recorder dropped frames. The scheduling tests do not measure hardware or OS behavior.
 - [ ] Verify trim recovery after a real power interruption on a disposable Windows setup.
