@@ -2,6 +2,7 @@
 name = "clipvault-gui"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "ClipVault desktop app: clips, 24/7 recordings, player with per-track audio mixing"
 build = "build.rs"

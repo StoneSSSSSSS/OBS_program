@@ -2,6 +2,7 @@
 name = "clipvault-service"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "ClipVault background service: records 24/7 (screen + every app's sound), handles clip hotkeys, guards the mic"
 build = "build.rs"

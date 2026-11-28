@@ -2,6 +2,7 @@
 name = "clipvault-media"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "ClipVault's own media engine: screen/audio capture, encoding, MP4 muxing/demuxing, decoding, cutting and exporting (Windows built-ins only)"
 

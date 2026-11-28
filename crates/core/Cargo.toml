@@ -2,6 +2,7 @@
 name = "clipvault-core"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "ClipVault configuration, library, mixer, timeline and service protocol"
 
