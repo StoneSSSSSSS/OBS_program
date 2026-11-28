@@ -103,6 +103,18 @@ pub struct Db {
     conn: Connection,
 }
 
+/// Clip mixer column: current format (MixSettings JSON) or the old list of
+/// per-track gains.
+fn parse_mix(s: &str) -> Option<crate::mixer::MixSettings> {
+    if s.trim().is_empty() {
+        return None;
+    }
+    if let Ok(m) = serde_json::from_str::<crate::mixer::MixSettings>(s) {
+        return Some(m);
+    }
+    serde_json::from_str::<Vec<f32>>(s).ok().map(|g| crate::mixer::MixSettings::from_legacy_gains(&g))
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         if let Some(p) = path.parent() {
@@ -387,7 +399,7 @@ impl Db {
             favorite: r.get::<_, i64>("favorite")? != 0,
             notes: r.get("notes")?,
             source: r.get("source")?,
-            mixer: serde_json::from_str(&mixer).ok(),
+            mixer: parse_mix(&mixer),
             audio_edits: serde_json::from_str(&edits).unwrap_or_default(),
             thumb: r.get("thumb")?,
             probed: r.get::<_, i64>("probed")? != 0,
@@ -547,9 +559,9 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_clip_mixer(&self, id: i64, gains: Option<&[f32]>) -> Result<()> {
-        let s = match gains {
-            Some(g) => serde_json::to_string(g)?,
+    pub fn set_clip_mixer(&self, id: i64, mix: Option<&crate::mixer::MixSettings>) -> Result<()> {
+        let s = match mix {
+            Some(m) => serde_json::to_string(m)?,
             None => String::new(),
         };
         self.conn.execute("UPDATE clips SET mixer=?2 WHERE id=?1", params![id, s])?;
@@ -900,11 +912,17 @@ mod tests {
         let g2 = db.upsert_game("pioneergame.exe", "ARC Raiders", "", true, 0).unwrap();
         let c = new_clip(&db, "x.mp4", Some(g1), 5);
         db.update_clip_probe(c, 12.5, 999, 2560, 1440, 60.0, 6, &["Full mix".into(), "Game".into()]).unwrap();
-        db.set_clip_mixer(c, Some(&[1.0, 0.5])).unwrap();
+        let mut m = crate::mixer::MixSettings::default();
+        m.set("cat:voice", crate::mixer::LaneGain { gain: 0.5, muted: false });
+        db.set_clip_mixer(c, Some(&m)).unwrap();
         let clip = db.clip(c).unwrap().unwrap();
         assert!(clip.probed);
         assert_eq!(clip.track_names, vec!["Full mix", "Game"]);
-        assert_eq!(clip.mixer, Some(vec![1.0, 0.5]));
+        assert_eq!(clip.mixer, Some(m));
+        // Old per-track gain lists still load.
+        db.conn().execute("UPDATE clips SET mixer='[0.0,1.0,0.5,1.0,1.0,0.0]' WHERE id=?1", [c]).unwrap();
+        let old = db.clip(c).unwrap().unwrap().mixer.unwrap();
+        assert_eq!(old.lane("cat:voice").gain, 0.5);
         db.set_clip_audio_edits(c, &[AudioEdit::new("cat:voice", 1.0, 2.5, 0.0)]).unwrap();
         assert_eq!(db.clip(c).unwrap().unwrap().audio_edits, vec![AudioEdit::new("cat:voice", 1.0, 2.5, 0.0)]);
         db.set_clip_audio_edits(c, &[]).unwrap();

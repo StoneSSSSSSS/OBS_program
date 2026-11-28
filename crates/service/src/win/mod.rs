@@ -18,12 +18,6 @@ pub fn wide_path(p: &std::path::Path) -> Vec<u16> {
     p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// Read a NUL-terminated (or full) UTF-16 buffer.
-pub fn from_wide(buf: &[u16]) -> String {
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..end])
-}
-
 /// Holds a `Vec<u16>` and hands out a PCWSTR into it.
 pub struct WStr(Vec<u16>);
 

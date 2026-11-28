@@ -279,6 +279,37 @@ pub fn compose(tracks: &[TrackSource], mix: &MixSettings, edits: &[AudioEdit], e
         .collect()
 }
 
+/// Gain curve for a 24/7 recording's app track that held different apps at
+/// different times: `intervals` = (start, end, the app's TrackSource).
+pub fn compose_slot(intervals: &[(f64, f64, TrackSource)], mix: &MixSettings, edits: &[AudioEdit], edit_offset: f64, fade: f64, overrides: &BTreeMap<String, String>) -> GainCurve {
+    if mix.mode == MixMode::Full || intervals.is_empty() {
+        return GainCurve::constant(0.0);
+    }
+    let mut out = Vec::new();
+    for (a, b, src) in intervals {
+        let ov = match src {
+            TrackSource::App { key, .. } => overrides.get(&key.to_lowercase()).map(String::as_str),
+            _ => None,
+        };
+        let lanes = src.lanes(ov);
+        let g = lanes.iter().fold(1.0f32, |g, l| g * mix.lane(l).effective());
+        if (g - 1.0).abs() > 1e-6 {
+            out.push((*a, *b, g));
+        }
+        for l in &lanes {
+            for (ea, eb, eg) in lane_edits(edits, l, edit_offset) {
+                let (x, y) = (ea.max(*a), eb.min(*b));
+                if y > x {
+                    out.push((x, y, eg));
+                }
+            }
+        }
+    }
+    out.sort_by(|x, y| x.0.total_cmp(&y.0));
+    // Interval gains switch instantly at app changes (fades only on edits).
+    GainCurve { base: 1.0, edits: out, fade }
+}
+
 /// Soft limiter used on every mix so boosted tracks don't clip harshly.
 pub fn limit(v: f32) -> f32 {
     let a = v.abs();
@@ -396,6 +427,20 @@ mod tests {
         let tracks = vec![TrackSource::Other(0)];
         let c = compose(&tracks, &MixSettings::default(), &[], 0.0, 0.0, &BTreeMap::new());
         assert_eq!(c[0].base, 1.0);
+    }
+
+    #[test]
+    fn slot_tracks_follow_their_apps() {
+        let iv = vec![(0.0, 10.0, app("discord.exe", "voice")), (10.0, 20.0, app("chrome.exe", "media"))];
+        let mut mix = MixSettings::default();
+        mix.set("cat:voice", LaneGain { gain: 0.0, muted: true });
+        let edits = vec![edit("app:chrome.exe", 15.0, 30.0, 2.0)];
+        let g = compose_slot(&iv, &mix, &edits, 0.0, 0.0, &BTreeMap::new());
+        assert_eq!(g.at(5.0), 0.0, "discord muted");
+        assert_eq!(g.at(12.0), 1.0);
+        assert_eq!(g.at(17.0), 2.0, "chrome edit inside its interval");
+        mix.mode = MixMode::Full;
+        assert!(compose_slot(&iv, &mix, &edits, 0.0, 0.0, &BTreeMap::new()).is_silent());
     }
 
     #[test]

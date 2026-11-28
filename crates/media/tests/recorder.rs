@@ -97,3 +97,33 @@ fn records_screen_and_app_sound() {
     eprintln!("app track: {} blocks of 10 ms with tone", loud);
     assert!((150..=230).contains(&loud), "tone length off: {loud}");
 }
+
+#[test]
+fn live_waveform_is_written() {
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CLIPVAULT_DATA_DIR", dir.path().join("data"));
+    let wav = dir.path().join("tone.wav");
+    tone_wav(&wav, 1.5);
+    let cfg = RecorderConfig { folder: dir.path().join("rec"), fps: 30, max_height: 360, app_slots: 2, ..Default::default() };
+    let (etx, erx) = crossbeam_channel::unbounded();
+    let rec = Recorder::start(cfg, Arc::new(Namer), etx).unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    let mut child = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", wav.display())])
+        .spawn()
+        .unwrap();
+    let _ = child.wait();
+    std::thread::sleep(Duration::from_millis(1200));
+    rec.stop();
+    let path = erx.try_iter().find_map(|e| match e { RecEvent::SegmentFinished { path, .. } => Some(path), _ => None }).unwrap();
+    let w = cv_core::waveform::Waveform::load(&cv_core::waveform::wave_path(&path)).expect("waveform file");
+    let loud_full = (0..w.frames()).filter(|f| w.get(*f, 0) > 150).count();
+    let loud_app = (0..w.frames()).filter(|f| w.get(*f, 2) > 150).count();
+    eprintln!("waveform {} tracks x {} frames; full loud {loud_full}, app loud {loud_app}", w.tracks, w.frames());
+    assert_eq!(w.tracks, 4);
+    assert!((10..=17).contains(&loud_app), "{loud_app}");
+    assert!(loud_full >= loud_app);
+}

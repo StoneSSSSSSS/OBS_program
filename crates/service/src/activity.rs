@@ -3,7 +3,7 @@
 //! This history powers: naming clips after the right game, the game bands on
 //! the 24/7 timeline, and pointing the "Game" audio track at the game.
 
-use crate::shared::{GameTarget, Shared, SupCmd};
+use crate::shared::Shared;
 use crate::win::foreground::{self, ExeCache};
 use cv_core::db::Db;
 use cv_core::games::{self, Classifier, WindowInfo};
@@ -40,8 +40,6 @@ pub fn run(sh: Arc<Shared>) {
     let mut classifier = make_classifier(&sh, &db);
     let mut classifier_built = Instant::now();
     let mut span: Option<OpenSpan> = None;
-    let mut focus: Option<(String, Instant)> = None;
-    let mut target_key: Option<String> = None;
     let mut last_game_name: Option<(String, Instant)> = None;
     let mut last_prune = Instant::now() - Duration::from_secs(3600);
 
@@ -125,29 +123,6 @@ pub fn run(sh: Arc<Shared>) {
             .filter(|(_, t)| t.elapsed() < Duration::from_secs(300))
             .map(|(n, _)| n.clone());
         sh.update_status(|s| s.game.current = current);
-
-        // Game audio follows a game once it's been focused for a moment.
-        if is_game && cfg.audio.game_audio_capture {
-            match &focus {
-                Some((k, since)) if *k == key => {
-                    if since.elapsed() >= Duration::from_secs(cfg.games.audio_follow_delay_secs as u64)
-                        && target_key.as_deref() != Some(key.as_str())
-                    {
-                        target_key = Some(key.clone());
-                        let _ = sh.sup_tx.send(SupCmd::GameTarget(GameTarget {
-                            exe: if info.exe_name.is_empty() { games::exe_name_of(&info.exe_path) } else { info.exe_name.clone() },
-                            title: info.title.clone(),
-                            class: info.class.clone(),
-                            name: game_name.clone(),
-                        }));
-                        let _ = sh.audio_tx.try_send(());
-                    }
-                }
-                _ => focus = Some((key.clone(), Instant::now())),
-            }
-        } else {
-            focus = None;
-        }
 
         if last_prune.elapsed() > Duration::from_secs(3600) {
             last_prune = Instant::now();

@@ -5,41 +5,37 @@ use crossbeam_channel::Sender;
 use cv_core::audio_names::MicDecision;
 use cv_core::config::Config;
 use cv_core::db::Db;
-use cv_core::ffmpeg::Tools;
 use cv_core::ipc::{AudioDevices, Event, JobInfo, ServerMsg, Status};
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// What game audio should follow.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GameTarget {
-    pub exe: String,
-    pub title: String,
-    pub class: String,
-    pub name: String,
+pub type Reply = Option<Sender<Result<(), String>>>;
+
+/// Commands for the recording engine thread.
+pub enum EngineCmd {
+    SaveClip { short: bool, reply: Reply },
+    SetRecording { enabled: bool, reply: Reply },
+    Restart { reply: Reply },
+    ConfigChanged { restart: bool },
+    Mic { decision: MicDecision },
+    Shutdown,
 }
 
-/// Commands for the OBS supervisor thread.
-pub enum SupCmd {
-    SaveClip { short: bool, reply: Option<Sender<Result<(), String>>> },
-    SetRecording { enabled: bool, reply: Option<Sender<Result<(), String>>> },
-    RestartObs { reply: Option<Sender<Result<(), String>>> },
-    ConfigChanged { restart_obs: bool },
-    Mic { decision: MicDecision },
-    DesktopDevice { device_id: String },
-    /// exe (lower case) -> include that app's capture in the full mix.
-    AppRouting(HashMap<String, bool>),
-    GameTarget(GameTarget),
-    Shutdown,
+/// A stretch of footage, for cutting clips.
+#[derive(Debug, Clone)]
+pub struct Footage {
+    pub path: PathBuf,
+    pub start_ms: i64,
+    /// Seconds (for the file being written: recorded so far).
+    pub duration_s: f64,
 }
 
 /// Work for the clip-saving thread.
 pub enum ClipTask {
-    ReplaySaved { path: PathBuf, at_ms: i64, short: bool },
-    ImportStray { path: PathBuf },
+    /// Save `[from_ms, to_ms)` (wall clock) from these files as a new clip.
+    SaveRange { footage: Vec<Footage>, from_ms: i64, to_ms: i64, short: bool },
 }
 
 /// Work for the library thread.
@@ -52,13 +48,12 @@ pub struct Shared {
     pub cfg: Arc<RwLock<Config>>,
     pub status: Mutex<Status>,
     pub ui: UiHandle,
-    pub sup_tx: Sender<SupCmd>,
+    pub engine_tx: Sender<EngineCmd>,
     pub clip_tx: Sender<ClipTask>,
     pub job_tx: Sender<crate::jobs::JobRequest>,
     pub lib_tx: Sender<LibCmd>,
     pub audio_tx: Sender<()>,
     pub clients: Mutex<Vec<Sender<String>>>,
-    pub tools: RwLock<Option<Tools>>,
     pub hotkey_errors: Arc<Mutex<Vec<String>>>,
     pub devices: Mutex<AudioDevices>,
     pub jobs: Mutex<Vec<JobInfo>>,
@@ -66,6 +61,8 @@ pub struct Shared {
     /// Held while moving/renaming clip files so the scanner never sees a
     /// half-finished operation.
     pub library_lock: Mutex<()>,
+    /// The file the recorder is writing right now (never deleted or moved).
+    pub live_path: Mutex<Option<PathBuf>>,
     pub shutdown: AtomicBool,
 }
 
@@ -123,30 +120,17 @@ impl Shared {
         }
     }
 
-    pub fn tools(&self) -> Option<Tools> {
-        if let Some(t) = self.tools.read().clone() {
-            return Some(t);
-        }
-        let cfg = self.cfg();
-        match cv_core::ffmpeg::locate(&cfg.advanced.ffmpeg_path, &cfg.advanced.ffprobe_path) {
-            Ok(t) => {
-                tracing::info!("using {} ({})", t.ffmpeg.display(), t.version);
-                *self.tools.write() = Some(t.clone());
-                Some(t)
-            }
-            Err(e) => {
-                tracing::warn!("{e:#}");
-                None
-            }
-        }
-    }
-
     pub fn update_status(&self, f: impl FnOnce(&mut Status)) {
         f(&mut self.status.lock());
     }
+
+    /// Is `path` the file being recorded right now?
+    pub fn is_live(&self, path: &str) -> bool {
+        self.live_path.lock().as_ref().map(|p| same_path(&p.to_string_lossy(), path)).unwrap_or(false)
+    }
 }
 
-/// Normalise a path reported by OBS (forward slashes) to Windows form.
+/// Normalise a path (forward slashes) to Windows form.
 pub fn norm_path(p: &str) -> String {
     p.replace('/', "\\")
 }

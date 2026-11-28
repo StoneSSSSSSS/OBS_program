@@ -3,12 +3,12 @@
 //! old program created.
 
 use crate::clips::{move_file, probe_and_thumb, remove_dir_if_empty};
-use crate::shared::{same_path, ClipTask, LibCmd, Shared};
+use crate::shared::{LibCmd, Shared};
 use cv_core::db::Db;
 use cv_core::ipc::Event;
 use cv_core::model::NewClip;
 use cv_core::naming::{legacy_folder_to_game, merge_key, sanitize_component, unique_path};
-use cv_core::obs::filename::{is_replay_file, is_video_file, parse_timestamp_ms};
+use cv_core::filenames::{is_video_file, parse_timestamp_ms};
 use cv_core::retention::{select_for_deletion, Policy, Reason, SegmentInfo};
 use cv_core::util::{human_bytes, now_ms, system_time_ms};
 use std::collections::{HashMap, HashSet};
@@ -33,13 +33,12 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<LibCmd>) {
         tracing::warn!("folder tidy-up failed: {e:#}");
     }
     let mut last_clip_scan: Option<Instant> = None;
-    let mut stray_seen: HashMap<PathBuf, Instant> = HashMap::new();
     let mut force_scan = true;
     loop {
         if sh.is_shutting_down() {
             break;
         }
-        let rec_changed = index_recordings(&sh, &db, &mut stray_seen);
+        let rec_changed = index_recordings(&sh, &db);
         if rec_changed {
             sh.emit(Event::RecordingsChanged);
         }
@@ -57,10 +56,7 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<LibCmd>) {
 
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(LibCmd::Rescan) => force_scan = true,
-            Ok(LibCmd::RecordingsChanged) => {
-                // OBS just split/started a file: give it a moment to appear.
-                std::thread::sleep(Duration::from_millis(1500));
-            }
+            Ok(LibCmd::RecordingsChanged) => {}
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(_) => break,
         }
@@ -75,14 +71,12 @@ fn list_videos(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Sync the recordings table with the folder. Returns true if anything changed.
-fn index_recordings(sh: &Shared, db: &Db, stray_seen: &mut HashMap<PathBuf, Instant>) -> bool {
+fn index_recordings(sh: &Shared, db: &Db) -> bool {
     let cfg = sh.cfg();
     let folder = PathBuf::from(&cfg.recording.folder);
     if !folder.is_dir() {
         return false;
     }
-    let live = sh.status.lock().recording.path.clone();
-    let live_active = sh.status.lock().recording.active;
     let mut changed = false;
     let mut present: HashSet<String> = HashSet::new();
     let existing: HashMap<String, cv_core::model::Recording> =
@@ -92,15 +86,6 @@ fn index_recordings(sh: &Shared, db: &Db, stray_seen: &mut HashMap<PathBuf, Inst
     let mut files: Vec<(PathBuf, bool)> = list_videos(&folder).into_iter().map(|p| (p, false)).collect();
     files.extend(list_videos(&folder.join(KEPT_DIR)).into_iter().map(|p| (p, true)));
     for (p, kept) in files {
-        if is_replay_file(&p) {
-            // A replay that never got filed (e.g. saved while the service was down).
-            let seen = stray_seen.entry(p.clone()).or_insert_with(Instant::now);
-            if seen.elapsed() > Duration::from_secs(90) {
-                let _ = sh.clip_tx.send(ClipTask::ImportStray { path: p.clone() });
-                stray_seen.remove(&p);
-            }
-            continue;
-        }
         let path = p.to_string_lossy().to_string();
         present.insert(path.to_lowercase());
         let meta = p.metadata().ok();
@@ -108,7 +93,7 @@ fn index_recordings(sh: &Shared, db: &Db, stray_seen: &mut HashMap<PathBuf, Inst
         let start = parse_timestamp_ms(&p)
             .or_else(|| meta.as_ref().and_then(|m| m.created().ok()).map(system_time_ms))
             .unwrap_or(now);
-        let is_live = live_active && !live.is_empty() && same_path(&live, &path);
+        let is_live = sh.is_live(&path);
         let status = if is_live { "recording" } else { "complete" };
         let prev = existing.get(&path.to_lowercase());
         let needs_upsert = prev.map(|r| r.size != size || r.status != status).unwrap_or(true);
@@ -145,11 +130,9 @@ fn index_recordings(sh: &Shared, db: &Db, stray_seen: &mut HashMap<PathBuf, Inst
             // Finished file: get its real duration and track count.
             let mut dur = 0.0;
             let mut tracks = 0;
-            if let Some(t) = sh.tools() {
-                if let Ok(info) = t.probe(&p) {
-                    dur = info.duration;
-                    tracks = info.audio.len() as i64;
-                }
+            if let Ok(info) = cv_media::probe::probe(&p) {
+                dur = info.duration;
+                tracks = info.audio.len() as i64;
             }
             if dur <= 0.0 {
                 // Fall back to the file's timestamps.
@@ -167,7 +150,6 @@ fn index_recordings(sh: &Shared, db: &Db, stray_seen: &mut HashMap<PathBuf, Inst
             changed = true;
         }
     }
-    stray_seen.retain(|p, _| p.exists());
     changed
 }
 
@@ -195,9 +177,8 @@ fn retention(sh: &Shared, db: &Db) {
     let mut count = 0;
     let mut reasons = HashSet::new();
     for (p, reason) in plan {
-        // Re-check: never delete the file OBS is writing right now.
-        let live = sh.status.lock().recording.path.clone();
-        if !live.is_empty() && same_path(&live, &p.to_string_lossy()) {
+        // Re-check: never delete the file being recorded right now.
+        if sh.is_live(&p.to_string_lossy()) {
             continue;
         }
         let size = p.metadata().map(|m| m.len()).unwrap_or(0);
@@ -320,7 +301,6 @@ fn probe_pending(sh: &Shared, db: &Db) {
     if pending.is_empty() {
         return;
     }
-    let Some(tools) = sh.tools() else { return };
     let thumbs = sh.cfg.read().clips.generate_thumbnails;
     let mut any = false;
     for (id, path) in pending {
@@ -329,7 +309,7 @@ fn probe_pending(sh: &Shared, db: &Db) {
         }
         let p = PathBuf::from(&path);
         if p.is_file() {
-            probe_and_thumb(db, &tools, id, &p, thumbs);
+            probe_and_thumb(db, id, &p, thumbs);
             any = true;
         }
     }
@@ -419,7 +399,7 @@ pub fn set_kept(sh: &Shared, recording_id: i64, keep: bool) -> anyhow::Result<()
     let folder = PathBuf::from(&sh.cfg.read().recording.folder);
     let dest_dir = if keep { folder.join(KEPT_DIR) } else { folder };
     if rec.is_live() {
-        // Can't move a file OBS is writing: flag it, the move happens later.
+        // Can't move the file being recorded: flag it, the move happens later.
         db.set_recording_kept(recording_id, true, &rec.path)?;
         return Ok(());
     }

@@ -35,38 +35,61 @@ impl IpcInfo {
     }
 }
 
+/// Where an export takes its picture and sound from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum ExportSource {
+    Clip { clip_id: i64 },
+    /// A wall-clock range of the 24/7 recording.
+    Recording { from_ms: i64, to_ms: i64 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Auth { token: String },
     Status,
-    /// Save the replay buffer. `short` = only the last `short_clip_secs`.
+    /// Save the last `clip_length_secs` (or `short_clip_secs`) as a clip.
     SaveClip { short: bool },
     AddMarker { label: String },
     /// Pause/resume the 24/7 recording.
     SetRecording { enabled: bool },
-    RestartObs,
-    /// Config file changed; reload it (restarting OBS if `restart_obs`).
-    ReloadConfig { restart_obs: bool },
-    /// Make a clip from wall-clock range of the continuous recording.
-    /// `gains` = per-track volumes to remember with the clip; `audio_edits`
-    /// use wall-clock seconds and are re-based onto the clip.
+    #[serde(alias = "restart_obs")]
+    RestartRecorder,
+    /// Config file changed; reload it (restarting the recorder if needed).
+    ReloadConfig {
+        #[serde(alias = "restart_obs", default)]
+        restart_recorder: bool,
+    },
+    /// Make a clip from a wall-clock range of the continuous recording.
+    /// `mix` and `audio_edits` (wall-clock seconds) are remembered with the clip.
     CutRange {
         from_ms: i64,
         to_ms: i64,
         title: String,
         game_id: Option<i64>,
         category_ids: Vec<i64>,
-        precise: Option<bool>,
         #[serde(default)]
-        gains: Vec<f32>,
+        mix: Option<crate::mixer::MixSettings>,
         #[serde(default)]
         audio_edits: Vec<crate::model::AudioEdit>,
     },
     /// Trim an existing clip into a new clip (or replace it).
-    TrimClip { clip_id: i64, start_s: f64, end_s: f64, replace: bool, precise: Option<bool> },
-    /// Export a shareable copy with a mixed-down audio track.
-    Export { clip_id: i64, range: Option<(f64, f64)>, gains: Vec<f32>, target_size_mb: Option<u32> },
+    TrimClip { clip_id: i64, start_s: f64, end_s: f64, replace: bool },
+    /// Export a shareable copy with one mixed audio track. `range` is in the
+    /// source's seconds; `edits` in the same time base (clip seconds, or
+    /// wall-clock seconds for a recording range).
+    Export {
+        source: ExportSource,
+        #[serde(default)]
+        range: Option<(f64, f64)>,
+        mix: crate::mixer::MixSettings,
+        #[serde(default)]
+        edits: Vec<crate::model::AudioEdit>,
+        target_size_mb: Option<u32>,
+        #[serde(default)]
+        title: String,
+    },
     CancelJob { id: u64 },
     AudioDevices,
     RescanLibrary,
@@ -86,14 +109,17 @@ pub enum Request {
     Shutdown,
 }
 
+/// The recording engine (screen + sound capture, encoders).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct ObsStatus {
+pub struct EngineStatus {
     pub running: bool,
-    pub connected: bool,
-    pub version: String,
+    pub encoder: String,
+    pub capture: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub dropped_frames: u64,
     pub last_error: String,
-    pub restarts: u32,
-    pub closed_by_user: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -109,6 +135,7 @@ pub struct RecStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ReplayStatus {
+    /// The clip hotkey works right now.
     pub active: bool,
     pub seconds: u32,
 }
@@ -156,7 +183,8 @@ pub struct JobInfo {
 pub struct Status {
     pub version: String,
     pub service_started_ms: i64,
-    pub obs: ObsStatus,
+    #[serde(default)]
+    pub engine: EngineStatus,
     pub recording: RecStatus,
     pub replay: ReplayStatus,
     pub mic: MicStatus,
@@ -354,7 +382,7 @@ mod tests {
         let v = c.call(Request::Status, Duration::from_secs(2)).unwrap();
         assert_eq!(v["x"], 1);
         assert_eq!(events.recv_timeout(Duration::from_secs(2)).unwrap(), Event::LibraryChanged);
-        let e = c.call(Request::RestartObs, Duration::from_secs(2)).unwrap_err();
+        let e = c.call(Request::RestartRecorder, Duration::from_secs(2)).unwrap_err();
         assert!(e.to_string().contains("unsupported"));
     }
 

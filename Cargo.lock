@@ -670,6 +670,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clipvault-core",
+ "clipvault-media",
  "crossbeam-channel",
  "embed-resource",
  "image",

@@ -150,6 +150,64 @@ pub fn slot_app(history: &[SegmentMeta], slot: u32, at_s: f64) -> Option<AppIden
     cur
 }
 
+
+/// How each audio track maps onto the mixing lanes. 24/7 app tracks
+/// ("slots") hold different apps over time; see [`slot_intervals`].
+pub fn track_sources(info: &MediaInfo) -> Vec<cv_core::mixer::TrackSource> {
+    use cv_core::mixer::TrackSource;
+    let n = info.audio.len();
+    let legacy = n == LEGACY_NAMES.len() && info.audio.iter().all(|a| a.role == TrackRole::Other);
+    info.audio
+        .iter()
+        .enumerate()
+        .map(|(i, a)| match &a.role {
+            TrackRole::Full => TrackSource::Full,
+            TrackRole::Mic => TrackSource::Mic,
+            TrackRole::App { app } => TrackSource::App { key: app.key.clone(), name: app.name.clone(), category: app.category.clone() },
+            TrackRole::Slot { .. } => TrackSource::Other(i),
+            TrackRole::Other if legacy => match i {
+                0 => TrackSource::Full,
+                4 => TrackSource::Mic,
+                1 => TrackSource::Category("game".into()),
+                2 => TrackSource::Category("voice".into()),
+                3 => TrackSource::Category("media".into()),
+                _ => TrackSource::Category("other".into()),
+            },
+            TrackRole::Other => TrackSource::Other(i),
+        })
+        .collect()
+}
+
+/// When each app occupied recording slot `slot`: (start s, end s, app), in
+/// file seconds. The last interval runs to `end_s`.
+pub fn slot_intervals(info: &MediaInfo, slot: u32, end_s: f64) -> Vec<(f64, f64, AppIdent)> {
+    let mut out: Vec<(f64, f64, AppIdent)> = Vec::new();
+    let mut cur: Option<(f64, AppIdent)> = None;
+    for m in &info.slot_history {
+        let now = m.slots.iter().find(|s| s.slot == slot).map(|s| s.app.clone());
+        let same = match (&cur, &now) {
+            (Some((_, a)), Some(b)) => a.key == b.key,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            continue;
+        }
+        if let Some((start, app)) = cur.take() {
+            if m.at_s > start {
+                out.push((start, m.at_s, app));
+            }
+        }
+        cur = now.map(|a| (m.at_s, a));
+    }
+    if let Some((start, app)) = cur {
+        if end_s > start {
+            out.push((start, end_s, app));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +230,9 @@ mod tests {
         assert_eq!(slot_app(&h, 0, 60.0).unwrap().key, "chrome.exe");
         assert_eq!(slot_app(&h, 1, 60.0).unwrap().key, "cs2.exe");
         assert_eq!(slot_app(&h, 1, 20.0), None);
+        let info = MediaInfo { slot_history: h, ..Default::default() };
+        let iv = slot_intervals(&info, 0, 80.0);
+        assert_eq!(iv.iter().map(|(a, b, x)| (*a, *b, x.key.as_str())).collect::<Vec<_>>(), vec![(10.0, 50.0, "discord.exe"), (50.0, 80.0, "chrome.exe")]);
+        assert_eq!(slot_intervals(&info, 1, 80.0).len(), 1);
     }
 }

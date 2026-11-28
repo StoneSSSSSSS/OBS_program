@@ -215,6 +215,8 @@ pub(crate) enum MuxMsg {
     AudioWatermark(i64),
     /// App-track assignment from frame position pos on.
     Slots { pos: i64, slots: Vec<SlotInfo> },
+    /// Loudness of every audio track (file order) for the 100 ms starting at `pos`.
+    Peaks { pos: i64, levels: Vec<u8> },
     Flush { after_hns: i64, reply: Sender<i64> },
     Stop,
 }
@@ -352,7 +354,13 @@ struct Segment {
     avcc: Vec<u8>,
     size: (u32, u32),
     end_hns: i64,
+    /// Live waveform of this file's audio tracks.
+    wave: cv_core::waveform::Waveform,
+    wave_saved: std::time::Instant,
 }
+
+/// Frames per waveform value (100 ms).
+const WAVE_STEP: i64 = 4800;
 
 /// 100 ns -> 90 kHz ticks, rounded to nearest.
 fn ticks90(hns: i64) -> i64 {
@@ -374,6 +382,7 @@ struct Muxer {
     /// After a write error, don't try again before this time.
     retry_at: Option<std::time::Instant>,
     last_trim: std::time::Instant,
+    peaks: VecDeque<(i64, Vec<u8>)>,
 }
 
 impl Muxer {
@@ -390,6 +399,7 @@ impl Muxer {
             waiters: Vec::new(),
             retry_at: None,
             last_trim: std::time::Instant::now(),
+            peaks: VecDeque::new(),
         }
     }
 
@@ -420,6 +430,7 @@ impl Muxer {
                     self.write_ready(false);
                 }
                 Some(MuxMsg::Slots { pos, slots }) => self.slot_changes.push_back((pos, slots)),
+                Some(MuxMsg::Peaks { pos, levels }) => self.peaks.push_back((pos, levels)),
                 Some(MuxMsg::Flush { after_hns, reply }) => self.waiters.push((after_hns, reply)),
                 Some(MuxMsg::Stop) => break,
                 None => self.write_ready(false),
@@ -456,6 +467,9 @@ impl Muxer {
             while q.front().map(|p| p.pos < limit).unwrap_or(false) {
                 q.pop_front();
             }
+        }
+        while self.peaks.front().map(|p| p.0 < limit).unwrap_or(false) {
+            self.peaks.pop_front();
         }
         while self.slot_changes.len() > 1 && self.slot_changes[1].0 < limit {
             let (_, s) = self.slot_changes.pop_front().unwrap();
@@ -589,6 +603,28 @@ impl Muxer {
         seg.w.write_fragment(&runs)?;
         seg.w.flush()?;
         seg.end_hns = end;
+        // Waveform values for what was just written.
+        let n = seg.wave.tracks.max(1);
+        while self.peaks.front().map(|p| p.0 < end_frames).unwrap_or(false) {
+            let (pos, levels) = self.peaks.pop_front().unwrap();
+            let idx = (pos - seg.start_frames).div_euclid(WAVE_STEP);
+            if idx < 0 {
+                continue;
+            }
+            let idx = idx as usize;
+            let need = (idx + 1) * n;
+            if seg.wave.peaks.len() < need {
+                seg.wave.peaks.resize(need, 0);
+            }
+            for (k, v) in levels.iter().take(n).enumerate() {
+                let slot = &mut seg.wave.peaks[idx * n + k];
+                *slot = (*slot).max(*v);
+            }
+        }
+        if seg.wave_saved.elapsed() >= Duration::from_secs(5) {
+            seg.wave_saved = std::time::Instant::now();
+            let _ = seg.wave.save(&cv_core::waveform::wave_path(&seg.path));
+        }
         let written_ms = seg.start_ms + (end - seg.start_hns) / 10_000;
         {
             let mut st = self.sh.status.lock();
@@ -672,12 +708,15 @@ impl Muxer {
             st.bytes = 0;
         }
         let _ = self.sh.events.send(RecEvent::SegmentStarted { path: path.clone(), start_ms });
-        Ok(Segment { w, path, start_hns: gop.start, start_frames: self.frame_pos(gop.start), start_ms, avcc, size: (first.width, first.height), end_hns: gop.start })
+        let n_audio = 2 + if cfg.record_apps { cfg.app_slots as usize } else { 0 };
+        let wave = cv_core::waveform::Waveform { tracks: n_audio, rate: cv_core::waveform::PEAKS_PER_SEC, peaks: Vec::new() };
+        Ok(Segment { w, path, start_hns: gop.start, start_frames: self.frame_pos(gop.start), start_ms, avcc, size: (first.width, first.height), end_hns: gop.start, wave, wave_saved: std::time::Instant::now() })
     }
 
     fn finish_segment(&mut self, seg: Segment) {
         let duration_s = (seg.end_hns - seg.start_hns) as f64 / 1e7;
         let path = seg.path.clone();
+        let _ = seg.wave.save(&cv_core::waveform::wave_path(&path));
         match seg.w.finish() {
             Ok(bytes) => {
                 let _ = self.sh.events.send(RecEvent::SegmentFinished { path, start_ms: seg.start_ms, duration_s, bytes });

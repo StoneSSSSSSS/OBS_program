@@ -1,8 +1,8 @@
 //! Loopback TCP server the GUI connects to.
 
 use crate::jobs::{self, JobKind};
-use crate::shared::{LibCmd, Shared, SupCmd};
-use crate::supervisor::send_and_wait;
+use crate::engine::send_and_wait;
+use crate::shared::{EngineCmd, LibCmd, Shared};
 use anyhow::Result;
 use cv_core::ipc::{ClientMsg, Event, IpcInfo, Request, ServerMsg};
 use serde_json::{json, Value};
@@ -106,29 +106,29 @@ fn handle(sh: &Arc<Shared>, req: Request) -> Result<Value, String> {
         Request::Auth { .. } => Ok(Value::Null),
         Request::Status => Ok(serde_json::to_value(crate::status::build(sh)).unwrap_or_default()),
         Request::SaveClip { short } => {
-            send_and_wait(&sh.sup_tx, |r| SupCmd::SaveClip { short, reply: Some(r) }, Duration::from_secs(15)).map(|_| Value::Null)
+            send_and_wait(sh, |r| EngineCmd::SaveClip { short, reply: Some(r) }, Duration::from_secs(15)).map(|_| Value::Null)
         }
         Request::AddMarker { label } => crate::add_marker(sh, &label).map(|id| json!({"id": id})).map_err(e2s),
         Request::SetRecording { enabled } => {
-            send_and_wait(&sh.sup_tx, |r| SupCmd::SetRecording { enabled, reply: Some(r) }, Duration::from_secs(20)).map(|_| Value::Null)
+            send_and_wait(sh, |r| EngineCmd::SetRecording { enabled, reply: Some(r) }, Duration::from_secs(30)).map(|_| Value::Null)
         }
-        Request::RestartObs => {
-            send_and_wait(&sh.sup_tx, |r| SupCmd::RestartObs { reply: Some(r) }, Duration::from_secs(90)).map(|_| Value::Null)
+        Request::RestartRecorder => {
+            send_and_wait(sh, |r| EngineCmd::Restart { reply: Some(r) }, Duration::from_secs(60)).map(|_| Value::Null)
         }
-        Request::ReloadConfig { restart_obs } => {
-            crate::reload_config(sh, restart_obs).map_err(e2s)?;
+        Request::ReloadConfig { restart_recorder } => {
+            crate::reload_config(sh, restart_recorder).map_err(e2s)?;
             Ok(Value::Null)
         }
-        Request::CutRange { from_ms, to_ms, title, game_id, category_ids, precise, gains, audio_edits } => {
-            let id = jobs::submit(sh, JobKind::CutRange { from_ms, to_ms, title, game_id, category_ids, precise, gains, audio_edits });
+        Request::CutRange { from_ms, to_ms, title, game_id, category_ids, mix, audio_edits } => {
+            let id = jobs::submit(sh, JobKind::CutRange { from_ms, to_ms, title, game_id, category_ids, mix, audio_edits });
             Ok(json!({"job_id": id}))
         }
-        Request::TrimClip { clip_id, start_s, end_s, replace, precise } => {
-            let id = jobs::submit(sh, JobKind::Trim { clip_id, start_s, end_s, replace, precise });
+        Request::TrimClip { clip_id, start_s, end_s, replace } => {
+            let id = jobs::submit(sh, JobKind::Trim { clip_id, start_s, end_s, replace });
             Ok(json!({"job_id": id}))
         }
-        Request::Export { clip_id, range, gains, target_size_mb } => {
-            let id = jobs::submit(sh, JobKind::Export { clip_id, range, gains, target_size_mb });
+        Request::Export { source, range, mix, edits, target_size_mb, title } => {
+            let id = jobs::submit(sh, JobKind::Export { source, range, mix, edits, target_size_mb, title });
             Ok(json!({"job_id": id}))
         }
         Request::CancelJob { id } => Ok(json!({"cancelled": jobs::cancel(id)})),

@@ -1,14 +1,11 @@
-//! Windows Core Audio: endpoint enumeration, change notifications, and which
-//! processes are playing audio on which output device.
+//! Windows Core Audio: endpoint enumeration and change notifications.
 
 use cv_core::audio_names::Endpoint;
 use crossbeam_channel::Sender;
-use std::collections::{HashMap, HashSet};
-use windows::core::{implement, Interface, PCWSTR};
+use windows::core::{implement, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, AudioSessionStateExpired, EDataFlow, ERole, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
+    eCapture, eConsole, eRender, EDataFlow, ERole, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
     MMDeviceEnumerator, DEVICE_STATE, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
@@ -121,33 +118,5 @@ impl AudioSystem {
                 .ok()?;
             Some(Endpoint { id: device_id(&dev)?, name: device_name(&dev)? })
         }
-    }
-
-    /// For every active output device: the set of process ids with a live
-    /// (non-expired) audio session on it.
-    pub fn sessions_by_output(&self) -> HashMap<String, HashSet<u32>> {
-        let mut out = HashMap::new();
-        for (ep, dev) in self.list(eRender) {
-            let mut pids = HashSet::new();
-            unsafe {
-                let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
-                let Ok(en) = mgr.GetSessionEnumerator() else { continue };
-                let n = en.GetCount().unwrap_or(0);
-                for i in 0..n {
-                    let Ok(ctl) = en.GetSession(i) else { continue };
-                    if ctl.GetState().map(|s| s == AudioSessionStateExpired).unwrap_or(true) {
-                        continue;
-                    }
-                    let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
-                    if let Ok(pid) = ctl2.GetProcessId() {
-                        if pid != 0 {
-                            pids.insert(pid);
-                        }
-                    }
-                }
-            }
-            out.insert(ep.id, pids);
-        }
-        out
     }
 }

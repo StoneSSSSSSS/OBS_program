@@ -1,7 +1,7 @@
-//! Turning saved replays into organised clips, plus clip file operations
-//! (rename / move to another game / delete) used by the GUI.
+//! Saving clips (from the clip hotkey) and clip file operations (rename /
+//! move to another game / delete) used by the GUI.
 
-use crate::shared::{ClipTask, Shared};
+use crate::shared::{ClipTask, Footage, Shared};
 use crate::win::ui::ToastLevel;
 use anyhow::{bail, Context, Result};
 use cv_core::db::Db;
@@ -9,9 +9,8 @@ use cv_core::games::{attribute, Span};
 use cv_core::ipc::Event;
 use cv_core::model::NewClip;
 use cv_core::naming::{render_template, sanitize_component, unique_path};
-use cv_core::timeline::CutPart;
 use cv_core::util::{format_duration, now_ms};
-use std::collections::HashSet;
+use cv_media::cut::{cut, CutSource};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -20,61 +19,39 @@ use std::time::{Duration, Instant};
 pub const DESKTOP_KEY: &str = "desktop";
 
 pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<ClipTask>) {
-    let mut failed: HashSet<PathBuf> = HashSet::new();
     while let Ok(task) = rx.recv() {
         if sh.is_shutting_down() {
             break;
         }
-        let (path, at_ms, short, stray) = match task {
-            ClipTask::ReplaySaved { path, at_ms, short } => (path, at_ms, short, false),
-            ClipTask::ImportStray { path } => {
-                if failed.contains(&path) {
-                    continue;
-                }
-                let at = cv_core::obs::filename::parse_timestamp_ms(&path)
-                    .or_else(|| path.metadata().and_then(|m| m.modified()).ok().map(cv_core::util::system_time_ms))
-                    .unwrap_or_else(now_ms);
-                (path, at, false, true)
-            }
-        };
-        match save_replay(&sh, &path, at_ms, short) {
-            Ok((id, title, game, dur)) => {
-                sh.log_event("info", format!("Saved clip \"{title}\" ({game}, {})", format_duration(dur)));
-                if !stray {
+        match task {
+            ClipTask::SaveRange { footage, from_ms, to_ms, short } => match save_range(&sh, &footage, from_ms, to_ms, short) {
+                Ok((id, title, game, dur)) => {
+                    sh.log_event("info", format!("Saved clip \"{title}\" ({game}, {})", format_duration(dur)));
                     sh.toast(ToastLevel::Success, format!("Clip saved: {game} · {}", format_duration(dur)));
+                    sh.emit(Event::ClipAdded { clip_id: id });
+                    sh.emit(Event::LibraryChanged);
                 }
-                sh.emit(Event::ClipAdded { clip_id: id });
-                sh.emit(Event::LibraryChanged);
-            }
-            Err(e) => {
-                sh.log_event("error", format!("Could not save clip {}: {e:#}", path.display()));
-                sh.toast(ToastLevel::Error, format!("Clip could not be filed: {e}"));
-                failed.insert(path);
-            }
+                Err(e) => {
+                    sh.log_event("error", format!("Could not save the clip: {e:#}"));
+                    sh.toast(ToastLevel::Error, format!("Clip could not be saved: {e}"));
+                }
+            },
         }
     }
 }
 
-/// Wait for a file to exist and stop growing.
-fn wait_stable(path: &Path, max: Duration) -> Result<u64> {
-    let start = Instant::now();
-    let mut last = None;
-    loop {
-        if let Ok(m) = path.metadata() {
-            let len = m.len();
-            if last == Some(len) && len > 0 {
-                return Ok(len);
-            }
-            last = Some(len);
-        }
-        if start.elapsed() > max {
-            if let Some(l) = last {
-                return Ok(l);
-            }
-            bail!("{} never appeared", path.display());
-        }
-        std::thread::sleep(Duration::from_millis(400));
-    }
+/// Cut plan: the parts of `footage` covering `[from_ms, to_ms)`.
+pub fn plan(footage: &[Footage], from_ms: i64, to_ms: i64) -> Vec<CutSource> {
+    let mut v: Vec<&Footage> = footage.iter().collect();
+    v.sort_by_key(|f| f.start_ms);
+    v.into_iter()
+        .filter_map(|f| {
+            let end = f.start_ms + (f.duration_s * 1000.0) as i64;
+            let a = from_ms.max(f.start_ms);
+            let b = to_ms.min(end);
+            (b > a + 100).then(|| CutSource { path: f.path.clone(), from_s: (a - f.start_ms) as f64 / 1000.0, to_s: Some((b - f.start_ms) as f64 / 1000.0) })
+        })
+        .collect()
 }
 
 /// Move a file, retrying while it's locked; copies across drives.
@@ -104,7 +81,7 @@ pub fn move_file(src: &Path, dest: &Path, retry_for: Duration) -> Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                // 32 = sharing violation, 5 = access denied (still being written / scanned).
+                // 32 = sharing violation, 5 = access denied (antivirus scanning).
                 let transient = matches!(e.raw_os_error(), Some(32) | Some(5) | Some(33));
                 if !transient || start.elapsed() > retry_for {
                     return Err(e).with_context(|| format!("moving {} -> {}", src.display(), dest.display()));
@@ -141,101 +118,89 @@ pub fn clip_dir(cfg: &cv_core::config::Config, game_name: &str) -> PathBuf {
     }
 }
 
-fn save_replay(sh: &Shared, src: &Path, at_ms: i64, short: bool) -> Result<(i64, String, String, f64)> {
-    let cfg = sh.cfg();
-    wait_stable(src, Duration::from_secs(15))?;
-    let tools = sh.tools();
-    let info = tools.as_ref().and_then(|t| t.probe(src).ok());
-    let dur = info.as_ref().map(|i| i.duration).filter(|d| *d > 0.0).unwrap_or(cfg.clips.clip_length_secs as f64);
-    let end_ms = at_ms;
-    let start_ms = end_ms - (dur * 1000.0) as i64;
+/// A temporary output path next to where the clip will end up.
+pub fn temp_beside(dir: &Path) -> PathBuf {
+    dir.join(format!(".cv_{}.mp4", now_ms()))
+}
 
+fn save_range(sh: &Shared, footage: &[Footage], from_ms: i64, to_ms: i64, short: bool) -> Result<(i64, String, String, f64)> {
+    let cfg = sh.cfg();
+    let parts = plan(footage, from_ms, to_ms);
+    if parts.is_empty() {
+        bail!("nothing has been recorded yet");
+    }
     let db = Db::open_default()?;
-    let (game_id, game_name, exe) = attribute_game(&db, start_ms, end_ms, &cfg.clips.unknown_game_name)?;
-    let local = chrono::DateTime::from_timestamp_millis(end_ms).unwrap_or_default().with_timezone(&chrono::Local);
+    let (game_id, game_name, exe) = attribute_game(&db, from_ms, to_ms, &cfg.clips.unknown_game_name)?;
+    let local = chrono::DateTime::from_timestamp_millis(to_ms).unwrap_or_default().with_timezone(&chrono::Local);
     let title = render_template(&cfg.clips.name_template, &game_name, &exe, local);
     let dir = clip_dir(&cfg, &game_name);
-
+    std::fs::create_dir_all(&dir)?;
+    let tmp = temp_beside(&dir);
+    // The clip starts where the first part really starts (may be later than
+    // asked if the recording began recently).
+    let first = footage.iter().find(|f| f.path == parts[0].path).map(|f| f.start_ms).unwrap_or(from_ms);
+    let start_ms = first + (parts[0].from_s * 1000.0) as i64;
+    let out = match cut(&parts, &tmp, Some(start_ms), &mut |_| {}, &AtomicBool::new(false)) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
     let _lock = sh.library_lock.lock();
     let dest = unique_path(&dir, &title, "mp4", None);
-    let final_dur;
-    if short && dur > cfg.clips.short_clip_secs as f64 + 1.0 {
-        let tools = tools.as_ref().context("ffmpeg is needed for short clips")?;
-        std::fs::create_dir_all(&dir)?;
-        let parts = [CutPart { path: src.to_path_buf(), in_s: dur - cfg.clips.short_clip_secs as f64, out_s: None }];
-        let tmp = dest.with_extension("tmp.mp4");
-        let args = cv_core::ffmpeg::cut_args(&parts, &tmp, Path::new("unused"), false, 0, &Default::default())?;
-        tools.run_progress(&args, cfg.clips.short_clip_secs as f64, &mut |_| {}, &AtomicBool::new(false))?;
-        std::fs::rename(&tmp, &dest)?;
-        let _ = std::fs::remove_file(src);
-        final_dur = cfg.clips.short_clip_secs as f64;
-    } else {
-        move_file(src, &dest, MOVE_RETRY)?;
-        final_dur = dur;
-    }
+    move_file(&tmp, &dest, Duration::from_secs(10))?;
     let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(title);
-    let size = dest.metadata().map(|m| m.len() as i64).unwrap_or(0);
     let is_game = db.game(game_id)?.map(|g| g.is_game()).unwrap_or(false);
     let id = db.insert_clip(&NewClip {
         path: dest.to_string_lossy().to_string(),
         title: stem.clone(),
         game_id: Some(game_id),
-        created_at: end_ms,
-        source_start_ms: Some(end_ms - (final_dur * 1000.0) as i64),
-        size,
+        created_at: to_ms,
+        source_start_ms: Some(start_ms),
+        size: dest.metadata().map(|m| m.len() as i64).unwrap_or(0),
         source: "replay".into(),
         favorite: cfg.clips.auto_favorite && is_game,
     })?;
     drop(_lock);
-    if let Some(t) = &tools {
-        probe_and_thumb(&db, t, id, &dest, cfg.clips.generate_thumbnails);
-    }
-    Ok((id, stem, game_name, final_dur))
+    let _ = short;
+    probe_and_thumb(&db, id, &dest, cfg.clips.generate_thumbnails);
+    copy_wave(footage, &parts, &dest);
+    Ok((id, stem, game_name, out.duration))
+}
+
+/// Give a new clip a waveform right away by decoding it (fast for clips).
+fn copy_wave(_footage: &[Footage], _parts: &[CutSource], dest: &Path) {
+    let dest = dest.to_path_buf();
+    std::thread::spawn(move || {
+        if let Ok(w) = cv_media::wave::generate(&dest, 0.0, None, &AtomicBool::new(false)) {
+            let _ = w.save(&cv_core::waveform::wave_path(&dest));
+        }
+    });
 }
 
 /// Fill in duration/tracks and make a thumbnail.
-pub fn probe_and_thumb(db: &Db, tools: &cv_core::ffmpeg::Tools, id: i64, path: &Path, thumbs: bool) {
-    match tools.probe(path) {
+pub fn probe_and_thumb(db: &Db, id: i64, path: &Path, thumbs: bool) {
+    match cv_media::probe::probe(path) {
         Ok(info) => {
-            let names: Vec<String> = info
-                .audio
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    if !a.title.is_empty() {
-                        a.title.clone()
-                    } else if info.audio.len() == cv_core::config::TRACK_NAMES.len() {
-                        cv_core::config::TRACK_NAMES[i].to_string()
-                    } else if i == 0 {
-                        "Audio".to_string()
-                    } else {
-                        format!("Track {}", i + 1)
-                    }
-                })
-                .collect();
-            let _ = db.update_clip_probe(
-                id,
-                info.duration,
-                info.size as i64,
-                info.width as i64,
-                info.height as i64,
-                info.fps,
-                info.audio.len() as i64,
-                &names,
-            );
+            let names: Vec<String> = info.audio.iter().map(|a| a.name.clone()).collect();
+            let _ = db.update_clip_probe(id, info.duration, info.size as i64, info.width as i64, info.height as i64, info.fps, info.audio.len() as i64, &names);
             if thumbs {
                 let out = cv_core::paths::thumbs_dir().join(format!("clip_{id}.jpg"));
                 let at = (info.duration * 0.85).max(0.0);
-                match tools.thumbnail(path, at, &out, 480) {
+                match cv_media::thumb::thumbnail(path, at, &out, 480) {
                     Ok(()) => {
                         let _ = db.set_clip_thumb(id, &out.to_string_lossy());
                     }
-                    Err(e) => tracing::warn!("thumbnail for clip {id}: {e:#}"),
+                    Err(e) => {
+                        tracing::warn!("thumbnail for clip {id}: {e:#}");
+                        let _ = db.set_clip_thumb(id, "-");
+                    }
                 }
             }
         }
         Err(e) => {
-            tracing::warn!("probe failed for {}: {e:#}", path.display());
+            tracing::warn!("can't read {}: {e:#}", path.display());
             // Mark as probed with what we know so we don't retry forever.
             let size = path.metadata().map(|m| m.len() as i64).unwrap_or(0);
             let _ = db.update_clip_probe(id, 0.0, size, 0, 0, 0.0, 0, &[]);
@@ -243,9 +208,6 @@ pub fn probe_and_thumb(db: &Db, tools: &cv_core::ffmpeg::Tools, id: i64, path: &
         }
     }
 }
-
-/// How long to keep retrying a move while OBS/antivirus still holds the file.
-const MOVE_RETRY: Duration = Duration::from_secs(120);
 
 // ------------------------------------------------------------ file ops
 
@@ -260,10 +222,19 @@ pub fn rename_clip(sh: &Shared, clip_id: i64, title: &str) -> Result<()> {
     let dest = unique_path(&dir, &title, &ext, Some(&src));
     if dest.to_string_lossy() != clip.path {
         move_file(&src, &dest, Duration::from_secs(10))?;
+        move_wave(&src, &dest);
     }
     let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(title);
     db.set_clip_path_and_title(clip_id, &dest.to_string_lossy(), &stem)?;
     Ok(())
+}
+
+/// Keep a clip's waveform when its file moves.
+fn move_wave(src: &Path, dest: &Path) {
+    let (a, b) = (cv_core::waveform::wave_path(src), cv_core::waveform::wave_path(dest));
+    if a.exists() {
+        let _ = std::fs::rename(a, b);
+    }
 }
 
 pub fn set_clip_game(sh: &Shared, clip_id: i64, game_id: Option<i64>) -> Result<()> {
@@ -283,6 +254,7 @@ pub fn set_clip_game(sh: &Shared, clip_id: i64, game_id: Option<i64>) -> Result<
         if src.parent() != Some(dir.as_path()) {
             let dest = unique_path(&dir, &stem, &ext, None);
             move_file(&src, &dest, Duration::from_secs(10))?;
+            move_wave(&src, &dest);
             let new_stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(stem);
             db.set_clip_path_and_title(clip_id, &dest.to_string_lossy(), &new_stem)?;
             remove_dir_if_empty(src.parent());
@@ -310,6 +282,7 @@ pub fn delete_clips(sh: &Shared, ids: &[i64]) -> Result<usize> {
         if !clip.thumb.is_empty() && clip.thumb != "-" {
             let _ = std::fs::remove_file(&clip.thumb);
         }
+        let _ = std::fs::remove_file(cv_core::waveform::wave_path(&p));
         db.delete_clip(*id)?;
         remove_dir_if_empty(p.parent());
         n += 1;
@@ -330,17 +303,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn move_within_volume_and_waits() {
+    fn move_within_volume() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.mp4");
         std::fs::write(&a, b"data").unwrap();
-        assert_eq!(wait_stable(&a, Duration::from_secs(3)).unwrap(), 4);
         let b = dir.path().join("sub").join("b.mp4");
         move_file(&a, &b, Duration::from_secs(1)).unwrap();
         assert!(!a.exists());
         assert_eq!(std::fs::read(&b).unwrap(), b"data");
         assert!(move_file(&a, &b, Duration::from_millis(100)).is_err());
-        assert!(wait_stable(&a, Duration::from_millis(500)).is_err());
     }
 
     #[test]
@@ -358,8 +329,20 @@ mod tests {
     }
 
     #[test]
+    fn cut_plans_across_files() {
+        let f = |p: &str, s: i64, d: f64| Footage { path: PathBuf::from(p), start_ms: s, duration_s: d };
+        let footage = vec![f("b", 60_000, 60.0), f("a", 0, 60.0), f("c", 200_000, 30.0)];
+        let p = plan(&footage, 50_000, 210_000);
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[0].path, PathBuf::from("a"));
+        assert_eq!((p[0].from_s, p[0].to_s), (50.0, Some(60.0)));
+        assert_eq!((p[1].from_s, p[1].to_s), (0.0, Some(60.0)));
+        assert_eq!((p[2].from_s, p[2].to_s), (0.0, Some(10.0)));
+        assert!(plan(&footage, 125_000, 199_000).is_empty(), "gaps have nothing");
+    }
+
+    #[test]
     fn attribution_falls_back_to_desktop() {
-        // Uses an in-memory-like temp DB through a direct Db handle.
         let db = Db::open_in_memory().unwrap();
         let (id, name, exe) = attribute_game(&db, 0, 10_000, "Desktop").unwrap();
         assert_eq!((name.as_str(), exe.as_str()), ("Desktop", ""));

@@ -13,24 +13,14 @@ pub fn build(sh: &Shared) -> Status {
     s.version = cv_core::VERSION.to_string();
     s.jobs = sh.jobs.lock().clone();
     let mut w = Vec::new();
-    if !s.obs.running {
-        if s.obs.closed_by_user {
-            w.push("OBS was closed — recording and clipping are stopped".to_string());
-        } else {
-            w.push("OBS is not running".to_string());
-        }
-    } else if !s.obs.connected {
-        w.push("Connecting to OBS…".to_string());
-    }
-    if !s.obs.last_error.is_empty() {
-        w.push(s.obs.last_error.clone());
-    }
-    if s.obs.connected {
-        if !s.recording.active && !s.recording.paused_by_user {
-            w.push("24/7 recording is not running".to_string());
+    if !s.engine.running {
+        w.push(if s.engine.last_error.is_empty() { "Recording is starting…".to_string() } else { s.engine.last_error.clone() });
+    } else {
+        if !s.engine.last_error.is_empty() {
+            w.push(format!("Screen recording problem: {}", s.engine.last_error));
         }
         if !s.replay.active {
-            w.push("Replay buffer is off — clips can't be saved".to_string());
+            w.push("Recording isn't keeping up — clips may not save".to_string());
         }
     }
     match s.mic.state.as_str() {
@@ -45,9 +35,6 @@ pub fn build(sh: &Shared) -> Status {
     if s.disk.total_bytes > 0 && s.disk.free_bytes < min_free {
         w.push(format!("Low disk space on the recordings drive ({} free)", human_bytes(s.disk.free_bytes)));
     }
-    if sh.tools.read().is_none() && cfg.advanced.ffmpeg_path.is_empty() && sh.tools().is_none() {
-        w.push("ffmpeg not found — clipping from recordings and exports won't work".to_string());
-    }
     s.warnings = w;
     s
 }
@@ -60,7 +47,7 @@ pub fn run(sh: Arc<Shared>) {
         if sh.has_clients() {
             sh.emit(Event::Status { status: Box::new(s.clone()) });
         }
-        let state = if !s.warnings.is_empty() && (!s.obs.connected || !s.replay.active || s.mic.state == "missing" || s.mic.state == "fallback") {
+        let state = if !s.warnings.is_empty() && (!s.engine.running || !s.replay.active || s.mic.state == "missing" || s.mic.state == "fallback") {
             TrayState::Warning
         } else if s.recording.active {
             TrayState::Recording

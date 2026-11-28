@@ -138,8 +138,8 @@ pub struct Clip {
     pub favorite: bool,
     pub notes: String,
     pub source: String,
-    /// JSON array of per-track gains the user last used.
-    pub mixer: Option<Vec<f32>>,
+    /// The volumes the user last used for this clip.
+    pub mixer: Option<crate::mixer::MixSettings>,
     /// Non-destructive per-track volume edits (clip time).
     #[serde(default)]
     pub audio_edits: Vec<AudioEdit>,
