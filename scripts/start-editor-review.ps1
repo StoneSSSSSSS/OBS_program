@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)][string]$Gui,
     [Parameter(Mandatory)][ValidatePattern('^[a-z0-9-]{1,40}$')][string]$Brief,
-    [string]$Inputs = (Join-Path $PSScriptRoot '..\.clipvault-local\qa\editor-inputs')
+    [string]$Inputs = (Join-Path $PSScriptRoot '..\.clipvault-local\qa\editor-inputs'),
+    [switch]$Driver
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -15,7 +16,9 @@ if (!$sourceDir.StartsWith($localRoot + '\',[StringComparison]::OrdinalIgnoreCas
 }
 $runName = $Brief + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
 $run = Join-Path (Join-Path $localRoot 'qa\editor-reviews') $runName
-foreach ($folder in 'inputs','output','profile','tmp') {
+$folders = @('inputs', 'output', 'profile', 'tmp')
+if ($Driver) { $folders += 'driver' }
+foreach ($folder in $folders) {
     [void][IO.Directory]::CreateDirectory((Join-Path $run $folder))
 }
 $inputFiles = @(Get-ChildItem -LiteralPath $sourceDir -File)
@@ -38,6 +41,12 @@ $psi.UseShellExecute = $false
 $psi.EnvironmentVariables['CLIPVAULT_DATA_DIR'] = Join-Path $run 'profile'
 $psi.EnvironmentVariables['TEMP'] = Join-Path $run 'tmp'
 $psi.EnvironmentVariables['TMP'] = $psi.EnvironmentVariables['TEMP']
+$driverDir = $null
+$psi.EnvironmentVariables.Remove('CLIPVAULT_EDITOR_REVIEW_DRIVER')
+if ($Driver) {
+    $driverDir = Join-Path $run 'driver'
+    $psi.EnvironmentVariables['CLIPVAULT_EDITOR_REVIEW_DRIVER'] = $driverDir
+}
 foreach ($name in 'CLIPVAULT_RESIZE_CHECK','CLIPVAULT_INTERACTION_CHECK','CLIPVAULT_QA_CAPTURE_WINDOW','CLIPVAULT_SELFTEST') {
     $psi.EnvironmentVariables.Remove($name)
 }
@@ -48,4 +57,5 @@ $process = [Diagnostics.Process]::Start($psi)
     Inputs = Join-Path $run 'inputs'
     Output = Join-Path $run 'output'
     Evidence = $run
+    Driver = $driverDir
 }

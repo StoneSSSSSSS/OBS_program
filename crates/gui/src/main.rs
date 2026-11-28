@@ -6,6 +6,7 @@ mod app;
 mod lanes;
 mod native_player;
 mod player;
+mod qa_driver;
 mod service;
 mod theme;
 mod thumbs;

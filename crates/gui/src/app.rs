@@ -89,6 +89,7 @@ pub struct App {
     titlebar_done: u32,
     selftest: Option<SelfTest>,
     resize_check: Option<resize_check::Sweep>,
+    review_driver: Option<crate::qa_driver::Driver>,
 }
 
 /// `CLIPVAULT_SELFTEST=<dir>`: visit each page, save a screenshot of the app
@@ -137,6 +138,7 @@ impl App {
             settings: SettingsView::default(),
             titlebar_done: 0,
             resize_check: resize_check::Sweep::from_env(),
+            review_driver: crate::qa_driver::Driver::from_env(),
             selftest: std::env::var_os("CLIPVAULT_SELFTEST").map(|d| SelfTest { dir: d.into(), step: 0, at: Instant::now(), entered: false, shot: false }),
         }
     }
@@ -417,8 +419,10 @@ pub fn status_block(ui: &mut Ui, connected: bool, status: Option<&cv_core::ipc::
 }
 
 impl eframe::App for App {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
-        if let Some(sweep) = &mut self.resize_check {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        if let Some(driver) = &mut self.review_driver {
+            driver.inject(ctx, input);
+        } else if let Some(sweep) = &mut self.resize_check {
             sweep.inject_input(input);
         }
     }
@@ -459,6 +463,9 @@ impl eframe::App for App {
                 Page::Settings => self.settings.ui(ui, &mut self.c),
             });
         self.toasts(&ctx);
+        if let Some(driver) = &mut self.review_driver {
+            driver.after_frame(&ctx);
+        }
         if let Some(mut sweep) = self.resize_check.take() {
             sweep.after_frame(self, &ctx);
             self.resize_check = Some(sweep);
