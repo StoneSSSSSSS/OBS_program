@@ -1,7 +1,7 @@
 //! Timeline geometry and gestures calculated from the current frame's width.
 mod caption_lane;
 
-use super::{clock, filename, frame_number, frame_tick, role_name, seconds, ticks, Generated, Selection, Workbench};
+use super::{clock, filename, frame_number, frame_tick, role_name, Generated, Selection, Workbench};
 use crate::theme;
 use anyhow::Context as _;
 use cv_core::editor::{AssetKind, Id, Project, SoundRole, Source, Span, TICKS_PER_SECOND};
@@ -96,9 +96,9 @@ impl Workbench {
                         self.edit_actions(ui);
                     });
                     ui.horizontal_wrapped(|ui| {
-                        let mut seek = seconds(self.playhead);
-                        if super::inspector::time_field(ui, "Playhead", &mut seek, seconds(duration)).changed() {
-                            self.seek(ticks(seek), ui.ctx());
+                        let label = format!("Go to {}", clock(self.playhead));
+                        if ui.button(label).on_hover_text("Go to time… · type seconds or minutes:seconds").clicked() {
+                            self.seek_input = Some((String::new(), true));
                         }
                         self.item_picker(ui);
                         self.navigation_actions(ui, domain, false);
@@ -126,6 +126,10 @@ impl Workbench {
     }
 
     fn navigation_actions(&mut self, ui: &mut Ui, domain: u64, menu: bool) {
+        if menu && ui.button("Go to time…").clicked() {
+            self.seek_input = Some((String::new(), true));
+            ui.close();
+        }
         if ui.button("Fit").on_hover_text("Fit the full timeline").clicked() { self.timeline.window = None; }
         for (title, factor) in [("Zoom Out", 1.6), ("Zoom In", 0.625)] {
             let button = ui.button(if menu { title } else if factor > 1.0 { "−" } else { "+" });

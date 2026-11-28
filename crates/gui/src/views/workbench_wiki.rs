@@ -70,7 +70,7 @@ const GUIDES: &[Guide] = &[
         "For ducking, split the music at the start and end of the narration and lower the middle piece. Sound splits use the exact playhead time. Picture splits use the nearest project frame."] },
     Guide { section: "Sound", title: "Place repeated sound effects", terms: "foley knocks footsteps sound design cue effects sfx beats audio snip repeat delayed delay timing offset silent silence tail ending credits half volume quiet quieter loud level gain percentage",
         intro: "Independent cues let one sound play at several points with a different level each time.",
-        steps: &["Import the cue and select it in the Media Bin. Set the timeline Playhead field to the first entrance time. Select Effects and choose Add to Timeline, or drag the source onto the Effects lane.",
+        steps: &["Import the cue and select it in the Media Bin. Choose Go to on the timeline and enter the first entrance time. In a compact window use View → Go to time…. Select Effects and choose Add to Timeline, or drag the source onto the Effects lane.",
         "Duplicate the cue for each additional entrance. In the Inspector set Start on Timeline, then choose Apply Changes or press Enter.",
         "Set Gain to 50% for half volume on an individual occurrence. Apply Changes, then preview. Source Out trims the cue itself before the credits.",
         "For a silent tail, keep the picture running after the last effect. Select the video and choose Camera audio in the Inspector to mute its Gain. Hover over a short effect to see its full filename and timing, or zoom in for a longer label. Preview the final seconds. Audio extending beyond the last picture adds time on a black background."] },
@@ -104,7 +104,7 @@ const GUIDES: &[Guide] = &[
         "Choose Export MP4… for a movie with visible credits. For a separate subtitle file, open Captions… and choose Export SRT…."] },
     Guide { section: "Timeline", title: "Keyboard shortcuts and a larger preview", terms: "keys keyboard hotkeys shortcuts shortcut play pause step nudge enlarge expand restore save undo",
         intro: "Use these shortcuts when editing in the Workbench.",
-        steps: &["Click the playback clock to open Go to time. Type seconds or minutes:seconds and press Enter. Space plays or pauses. Comma steps back one frame and period steps forward. S splits the selected item and Delete removes it.",
+        steps: &["Choose Go to on the timeline, View → Go to time… in a small window, or click the playback clock. Type seconds or minutes:seconds and press Enter. Space plays or pauses. Comma steps back one frame and period steps forward. S splits the selected item and Delete removes it.",
         "Ctrl+Z undoes and Ctrl+Y redoes. Ctrl+I imports media. Ctrl+O opens a project, Ctrl+S saves, and Ctrl+Shift+S saves a new version.",
         "Choose Expand Preview above the picture for a larger monitor. Use the scrub bar beneath it to seek. Choose Restore Preview for the editing layout."] },
     Guide { section: "Pictures", title: "Add a title card or solid color", terms: "slate title text credit opening chapter intertitle black blank color matte",
@@ -123,6 +123,11 @@ const GUIDES: &[Guide] = &[
         steps: &["Open the project. Choose Relink in the missing-file notice beside the project name, or select a missing item in the Media Bin. Check its filename before choosing a replacement.",
         "Select the item, choose Relink Media… and locate its original file at the new path.",
         "Use the same kind of media with enough duration to cover the existing trims. Preview every occurrence, then save the project."] },
+    Guide { section: "Files", title: "Export a second version", terms: "export a second version v2 alternate revised revision preserve first filename save copy deliver another output",
+        intro: "Give a revised movie its own filename so both deliveries stay available.",
+        steps: &["Save the editable revision with Project → Save Project As… if you want to keep both projects.",
+        "Choose Export MP4…. When the previous movie still exists, the suggested filename adds a number, such as Tutorial (2).mp4. You can also type your own version name.",
+        "If you select an occupied filename, choose Choose new filename… and pick a fresh name. Open Output Folder shows the delivery beside the original."] },
     Guide { section: "Files", title: "Export, cancel and find the result", terms: "render delivery job mp4 progress cancel overwrite existing location destination folder output share",
         intro: "Preview and export use the same shot order, source trims, timing and audio levels.",
         steps: &["Check the canvas, frame rate and end of the timeline. Choose Export MP4… and select a new output filename.",
@@ -263,7 +268,7 @@ mod tests {
     #[test]
     fn search_finds_workflows_by_user_vocabulary() {
         for (query, expected) in [("black after video", "closing credits"), ("caption boundaries", "captions"), ("missing file", "relink"), ("frame counter", "one frame"), ("how do I nudge a frame", "one frame"),
-            ("voiceover music", "narration"), ("camera audio", "camera audio"), ("portrait montage", "portrait"), ("penultimate shot", "long sequence"), ("cancel export", "Export"),
+            ("voiceover music", "narration"), ("camera audio", "camera audio"), ("portrait montage", "portrait"), ("penultimate shot", "long sequence"), ("cancel export", "Export"), ("export a second version", "second version"),
             ("move shot to beginning", "Reorder"), ("move title to front", "Reorder"), ("move closing chaptercard to front", "Reorder"), ("save as revision", "revise"), ("foley", "effects"), ("effects cue", "effects"), ("silent tail", "effects"), ("half volume", "effects"), ("letterbox", "portrait"), ("crop fill focus", "portrait")] {
             assert!(GUIDES.iter().any(|g| g.title.to_lowercase().contains(&expected.to_lowercase()) && rank(g, query).is_some()), "{query}");
         }
