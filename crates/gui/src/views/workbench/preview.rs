@@ -2,10 +2,11 @@
 use super::{availability::Availability, seconds, ticks};
 use crate::{native_player::NativePlayer, theme};
 use anyhow::{bail, Context as _, Result};
-use cv_core::editor::{Id, Project, Span, TICKS_PER_SECOND};
+use cv_core::editor::{Id, Project, Source, Span, TICKS_PER_SECOND};
 use cv_media::editor::{self, RenderControl};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2};
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
@@ -14,11 +15,17 @@ use std::{
         mpsc::{self, Receiver, TryRecvError},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const PROXY_LENGTH: u64 = 12 * TICKS_PER_SECOND;
+const THUMBNAIL_EDGE: usize = 640;
+const THUMBNAIL_CACHE_SIZE: usize = 4;
+const THUMBNAIL_SOURCE_LIMIT: usize = 8;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+mod tests;
 
 struct Worker {
     control: Arc<RenderControl>,
@@ -77,7 +84,74 @@ impl Drop for ProxyTask {
     }
 }
 
-type Thumbnail = (u64, u64, Result<egui::ColorImage>);
+type ThumbnailKey = (u64, u64);
+type FileIdentity = (u64, SystemTime, Option<SystemTime>);
+
+struct ThumbnailImage {
+    pixels: Arc<egui::ColorImage>,
+    sources: Option<Vec<(PathBuf, FileIdentity)>>,
+}
+
+impl ThumbnailImage {
+    fn is_current(&self) -> bool {
+        self.sources.as_ref().is_some_and(|sources| sources.iter().all(|(path, identity)| {
+            file_identity(path).as_ref() == Some(identity)
+        }))
+    }
+
+    fn can_cache(&self) -> bool {
+        self.sources.is_some() && self.pixels.pixels.len() <= THUMBNAIL_EDGE * THUMBNAIL_EDGE
+    }
+}
+
+struct ThumbnailTask {
+    key: ThumbnailKey,
+    result: Receiver<Result<Arc<ThumbnailImage>>>,
+    obsolete: bool,
+}
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let metadata = File::open(path).ok()?.metadata().ok()?;
+    if !metadata.is_file() { return None; }
+    Some((metadata.len(), metadata.modified().ok()?, metadata.created().ok()))
+}
+
+fn thumbnail_sources(project: &Project, at: u64) -> Option<Vec<(PathBuf, FileIdentity)>> {
+    // The direct path reads the active shot. Windows composition can also read
+    // visual sources within half a second on either side. Paused frames ignore audio.
+    let frame_length = TICKS_PER_SECOND.div_ceil(u64::from(project.canvas.fps.max(1)));
+    let at = at.min(project.duration().saturating_sub(frame_length));
+    let mut sources = Vec::<(PathBuf, FileIdentity)>::new();
+    if at >= project.visual_duration() { return Some(sources); }
+    let start = at.saturating_sub(TICKS_PER_SECOND / 2);
+    let end = at.saturating_add(TICKS_PER_SECOND / 2);
+    let mut shot_start = 0u64;
+    for shot in &project.shots {
+        if shot_start >= end { break; }
+        let shot_end = shot_start.saturating_add(shot.range.len());
+        shot_start = shot_end;
+        if shot_end <= start { continue; }
+        let Source::Asset(id) = shot.source else { continue; };
+        let path = &project.asset(id)?.path;
+        if sources.iter().any(|(existing, _)| existing == path) { continue; }
+        if sources.len() == THUMBNAIL_SOURCE_LIMIT { return None; }
+        sources.push((path.clone(), file_identity(path)?));
+    }
+    Some(sources)
+}
+
+fn render_thumbnail(project: &Project, at: u64) -> Result<Arc<ThumbnailImage>> {
+    let sources = thumbnail_sources(project, at);
+    let scale = THUMBNAIL_EDGE as f64 / f64::from(project.canvas.width.max(project.canvas.height).max(1));
+    let width = (f64::from(project.canvas.width) * scale).round().max(1.0) as u32;
+    let height = (f64::from(project.canvas.height) * scale).round().max(1.0) as u32;
+    let frame_at = at.min(project.duration().saturating_sub(1));
+    let image = editor::thumbnail(project, frame_at, width, height)?;
+    let pixels = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize], image.as_raw(),
+    ));
+    Ok(Arc::new(ThumbnailImage { pixels, sources }))
+}
 
 #[derive(Default)]
 pub(super) struct Preview {
@@ -87,8 +161,9 @@ pub(super) struct Preview {
     displayed: Option<(u64, u64)>,
     proxy: Option<Proxy>,
     task: Option<ProxyTask>,
-    thumbnail: Option<Receiver<Thumbnail>>,
-    shown: Option<(u64, u64)>,
+    thumbnail: Option<ThumbnailTask>,
+    thumbnail_cache: VecDeque<(ThumbnailKey, Arc<ThumbnailImage>)>,
+    shown: Option<ThumbnailKey>,
     error: Option<String>,
     offline_source: Option<Id>,
     playing: bool,
@@ -126,6 +201,8 @@ impl Preview {
         self.displayed = None;
         self.serial = None;
         self.shown = None;
+        self.thumbnail_cache.clear();
+        if let Some(task) = &mut self.thumbnail { task.obsolete = true; }
         self.error = None;
         self.offline_source = None;
         self.wait_seek = None;
@@ -224,23 +301,26 @@ impl Preview {
             }
         }
 
-        if let Some(result) = self.thumbnail.as_ref().and_then(|rx| match rx.try_recv() {
+        if let Some(result) = self.thumbnail.as_ref().and_then(|task| match task.result.try_recv() {
             Ok(result) => Some(Some(result)),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => Some(None),
         }) {
-            self.thumbnail = None;
-            if let Some((rendered_revision, rendered_at, result)) = result {
-                if self.proxy.is_none() && revision == rendered_revision && *at == rendered_at {
-                    self.shown = Some((revision, *at));
-                    match result {
-                        Ok(image) => {
-                            self.displayed = Some((revision, rendered_at));
-                            self.set_image(ctx, image);
+            let task = self.thumbnail.take().unwrap();
+            if let Some(result) = result.filter(|_| !task.obsolete && self.proxy.is_none() && task.key == (revision, *at)) {
+                self.shown = Some(task.key);
+                match result {
+                    Ok(image) => {
+                        self.displayed = Some(task.key);
+                        self.set_image(ctx, Arc::clone(&image.pixels));
+                        if !self.playing && image.can_cache() {
+                            self.thumbnail_cache.retain(|(key, _)| *key != task.key);
+                            if self.thumbnail_cache.len() == THUMBNAIL_CACHE_SIZE { self.thumbnail_cache.pop_front(); }
+                            self.thumbnail_cache.push_back((task.key, image));
                         }
-                        Err(error) if self.error.is_none() => self.report_error(project, &error, availability),
-                        Err(_) => {}
                     }
+                    Err(error) if self.error.is_none() => self.report_error(project, &error, availability),
+                    Err(_) => {}
                 }
             }
         }
@@ -300,22 +380,27 @@ impl Preview {
 
     fn request_thumbnail(&mut self, ctx: &egui::Context, project: &Project, revision: u64, at: u64) {
         self.next_thumb = None;
-        let (tx, rx) = mpsc::channel();
+        let key = (revision, at);
+        let cached = if self.playing {
+            None
+        } else {
+            self.thumbnail_cache.iter().position(|(entry, _)| *entry == key)
+                .and_then(|index| self.thumbnail_cache.remove(index))
+                .map(|(_, image)| image)
+        };
+        let (tx, result) = mpsc::channel();
         let project = project.clone();
         let wake = ctx.clone();
         let task = std::thread::Builder::new().name("clipvault-editor-frame".into()).spawn(move || {
-            let scale = 640.0 / f64::from(project.canvas.width.max(project.canvas.height).max(1));
-            let width = (f64::from(project.canvas.width) * scale).round().max(1.0) as u32;
-            let height = (f64::from(project.canvas.height) * scale).round().max(1.0) as u32;
-            let frame_at = at.min(project.duration().saturating_sub(1));
-            let result = editor::thumbnail(&project, frame_at, width, height).map(|im| {
-                egui::ColorImage::from_rgba_unmultiplied([im.width() as usize, im.height() as usize], im.as_raw())
-            });
-            let _ = tx.send((revision, at, result));
+            let result = match cached.filter(|image| image.is_current()) {
+                Some(image) => Ok(image),
+                None => render_thumbnail(&project, at),
+            };
+            let _ = tx.send(result);
             wake.request_repaint();
         });
         match task {
-            Ok(_) => self.thumbnail = Some(rx),
+            Ok(_) => self.thumbnail = Some(ThumbnailTask { key, result, obsolete: false }),
             Err(error) => {
                 self.shown = Some((revision, at));
                 self.error = Some(format!("Could not show frame: {error}"));
@@ -323,7 +408,7 @@ impl Preview {
         }
     }
 
-    fn set_image(&mut self, ctx: &egui::Context, image: egui::ColorImage) {
+    fn set_image(&mut self, ctx: &egui::Context, image: impl Into<egui::ImageData>) {
         if let Some(texture) = &mut self.texture {
             texture.set(image, egui::TextureOptions::LINEAR);
         } else {
