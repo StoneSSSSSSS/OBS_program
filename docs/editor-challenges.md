@@ -14,6 +14,16 @@ Each tester gets one brief, a fresh profile and a private copy of the synthetic 
 | Handoff and relink | Open a project whose media directory was renamed. Recover the missing input, save and deliver from the moved project folder. | Confirm the app names the missing file, accepts the correct replacement and reopens after moving the project with its assets. Check protected outputs and source hashes. |
 | Accessible screening | Subtitle a short screening excerpt in two languages. Import a timed SRT, correct one cue, add a credit cue, and deliver both a captioned MP4 and a separate SRT. | Read the SRT back, compare cue boundaries, and inspect the rendered picture before, during and after each cue. Verify accented text and a multiline cue. |
 
+## Keep the briefs distinct
+
+Assign each reviewer one primary deliverable. Rotate the actual target frame, cue times, caption text or delivery name between independent rounds. The reviewers can use the same save, reopen and export checks because every final project must survive delivery.
+
+- The sports brief judges the cut on action from two sources. The frame correction removes one numbered picture from one source and checks the entire surviving sequence.
+- The tutorial judges speech intelligibility over a continuous music bed. The location-sound brief judges isolated onsets, relative levels and digital silence.
+- The montage judges composition and subject framing across aspect ratios. The screening brief judges bilingual legibility, subtitle boundaries and agreement between the SRT and burned picture.
+- The revision judges undo and version preservation. The long assembly judges navigation to one occurrence among dozens. The handoff judges recovery after files actually move.
+- The edge reviewer concentrates on failures, interrupted actions and recovery. A separate ideas reviewer assembles an original mini-project and suggests up to three improvements grounded in that experience.
+
 ## Prepare the review
 
 Build the GUI test executable with `cargo test --locked -p clipvault-gui --bin clipvault --no-run`. Use the test executable printed by Cargo with `scripts/make-editor-inputs.ps1 -GuiTests <path>`. It creates two sports angles, a simulated screen tutorial, a source with 100 visibly numbered frames, landscape and portrait framing cards, a music bed, a short cue and offline spoken narration inside the project's ignored QA folder.
