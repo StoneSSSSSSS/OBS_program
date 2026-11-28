@@ -67,6 +67,7 @@ pub struct Shared {
     pub devices: Mutex<AudioDevices>,
     pub jobs: Mutex<Vec<JobInfo>>,
     pub event_db: Mutex<Option<Db>>,
+    pub foreground_game: AtomicBool,
     /// Held while moving/renaming clip files so the scanner never sees a
     /// half-finished operation.
     pub library_lock: Mutex<()>,

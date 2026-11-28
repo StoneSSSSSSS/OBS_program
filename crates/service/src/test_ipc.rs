@@ -132,6 +132,7 @@ impl TestProfile {
             devices: Mutex::new(Default::default()),
             jobs: Mutex::new(Vec::new()),
             event_db: Mutex::new(None),
+            foreground_game: Default::default(),
             library_lock: Mutex::new(()),
             live_path: Mutex::new(None),
             shutdown: std::sync::atomic::AtomicBool::new(false),

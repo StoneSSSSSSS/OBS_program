@@ -9,6 +9,7 @@ use cv_core::db::Db;
 use cv_core::games::{self, Classifier, WindowInfo};
 use cv_core::util::now_ms;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,7 @@ pub fn run(sh: Arc<Shared>) {
 
         let fg = foreground::foreground(&mut exe_cache);
         let Some((info, _hwnd)) = fg else {
+            sh.foreground_game.store(false, Ordering::Relaxed);
             // Nothing focused (desktop/lock screen): close the span after a grace period.
             if let Some(s) = &span {
                 if now - s.last_seen > 3000 {
@@ -65,11 +67,13 @@ pub fn run(sh: Arc<Shared>) {
             continue;
         };
         if info.exe_path.is_empty() {
+            sh.foreground_game.store(false, Ordering::Relaxed);
             continue; // elevated/protected process we can't inspect
         }
         let key = games::game_key(&info);
         let verdict = classifier.classify(&info);
         let is_game = verdict.is_game();
+        sh.foreground_game.store(is_game, Ordering::Relaxed);
 
         // Resolve the game row (cached).
         let entry = match games_cache.get(&key) {

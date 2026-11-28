@@ -8,26 +8,47 @@
 use crate::shared::Shared;
 use cv_core::db::Db;
 use cv_core::model::ClipFilter;
-use cv_core::waveform::{wave_path, Waveform};
+use cv_core::waveform::wave_path;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
 
-/// Sleep per second of audio decoded (keeps backfill gentle: ~100x realtime).
-const THROTTLE: Duration = Duration::from_millis(10);
+const MAX_TRACK_SPEED: u32 = 50;
+const FOCUS_POLL: Duration = Duration::from_millis(250);
 
 fn gaming(sh: &Shared) -> bool {
-    sh.status.lock().game.current.is_some()
+    sh.foreground_game.load(Ordering::Relaxed)
+}
+
+fn wait_for_archive_slot(
+    span: Duration,
+    mut flags: impl FnMut() -> (bool, bool),
+    mut sleep: impl FnMut(Duration),
+) -> anyhow::Result<()> {
+    let mut throttle = span / MAX_TRACK_SPEED;
+    loop {
+        let (shutting_down, game_focused) = flags();
+        anyhow::ensure!(!shutting_down, "waveform backfill stopped");
+        if game_focused {
+            sleep(FOCUS_POLL);
+        } else if !throttle.is_zero() {
+            sleep(std::mem::take(&mut throttle));
+        } else {
+            return Ok(());
+        }
+    }
 }
 
 pub fn run(sh: Arc<Shared>) {
+    // Limit CPU and I/O priority on this background worker only.
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
     let _ = std::fs::create_dir_all(cv_core::paths::data_dir().join("waves"));
     sleep_unless_shutdown(&sh, Duration::from_secs(20));
     let mut failed: HashSet<String> = HashSet::new();
     let mut last_cleanup = Instant::now() - Duration::from_secs(3600);
-    let never = AtomicBool::new(false);
     while !sh.is_shutting_down() {
         let Ok(db) = Db::open_default() else {
             sleep_unless_shutdown(&sh, Duration::from_secs(60));
@@ -56,12 +77,18 @@ pub fn run(sh: Arc<Shared>) {
                 if wp.exists() || !src.is_file() {
                     continue;
                 }
-                match cv_media::wave::generate(&src, 0.0, Some(THROTTLE), &never) {
+                let archive_slot = |span| {
+                    wait_for_archive_slot(span, || (sh.is_shutting_down(), gaming(&sh)), std::thread::sleep)
+                };
+                match cv_media::wave::generate_archive(&src, archive_slot) {
                     Ok(w) => {
-                        if let Err(e) = w.save(&wp) {
-                            tracing::warn!("saving waveform for {}: {e:#}", src.display());
+                        if archive_slot(Duration::ZERO).is_ok() && src.is_file() && !wp.exists() {
+                            if let Err(e) = w.save(&wp) {
+                                tracing::warn!("saving waveform for {}: {e:#}", src.display());
+                            }
                         }
                     }
+                    Err(_) if sh.is_shutting_down() => break,
                     Err(e) => {
                         tracing::debug!("waveform for {}: {e:#}", src.display());
                         failed.insert(path.clone());
@@ -75,7 +102,8 @@ pub fn run(sh: Arc<Shared>) {
             last_cleanup = Instant::now();
             cleanup(&db);
         }
-        sleep_unless_shutdown(&sh, if did_work { Duration::from_secs(2) } else { Duration::from_secs(30) });
+        let delay = if gaming(&sh) { Duration::from_secs(1) } else if did_work { Duration::from_secs(2) } else { Duration::from_secs(30) };
+        sleep_unless_shutdown(&sh, delay);
     }
 }
 
@@ -112,5 +140,24 @@ fn sleep_unless_shutdown(sh: &Shared, d: Duration) {
     }
 }
 
-#[allow(dead_code)]
-fn _types(_: Waveform) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_chunk_waits_for_focus_and_throttles_before_resuming() {
+        let mut flags = [(false, true), (false, true), (false, false), (false, false)].into_iter();
+        let mut waits = Vec::new();
+        wait_for_archive_slot(Duration::from_millis(200), || flags.next().unwrap(), |delay| waits.push(delay)).unwrap();
+        assert_eq!(waits, [FOCUS_POLL, FOCUS_POLL, Duration::from_millis(4)]);
+        assert_eq!(flags.len(), 0);
+    }
+
+    #[test]
+    fn archive_chunk_stops_while_waiting_for_game_focus_to_clear() {
+        let mut flags = [(false, true), (true, true)].into_iter();
+        let mut waits = Vec::new();
+        assert!(wait_for_archive_slot(Duration::from_millis(200), || flags.next().unwrap(), |delay| waits.push(delay)).is_err());
+        assert_eq!(waits, [FOCUS_POLL]);
+    }
+}
