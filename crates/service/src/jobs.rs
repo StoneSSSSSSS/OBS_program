@@ -5,7 +5,7 @@ use crate::clips::{attribute_game, clip_dir, move_file, plan, probe_and_thumb, t
 use crate::shared::{Footage, Shared};
 use crate::win::ui::{ToastLevel, UiCmd};
 use anyhow::{Context, Result};
-use cv_core::db::Db;
+use cv_core::db::{ClipWrite, Db};
 use cv_core::ipc::{Event, ExportSource, JobInfo};
 use cv_core::mixer::MixSettings;
 use cv_core::model::{rebase_edits, AudioEdit, NewClip};
@@ -13,10 +13,15 @@ use cv_core::naming::{render_template, sanitize_component, unique_path};
 use cv_core::util::now_ms;
 use cv_media::cut::{cut, CutSource, CutSpan};
 use cv_media::export::{bitrate_for_size, export as run_export, ExportJob, VideoOut};
+use cv_media::probe::MediaInfo;
+use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, MoveFileW, BY_HANDLE_FILE_INFORMATION};
 
 #[derive(Debug, Clone)]
 pub enum JobKind {
@@ -215,7 +220,7 @@ fn cut_range(
     cancel: &AtomicBool,
 ) -> Result<(PathBuf, Option<i64>)> {
     let cfg = sh.cfg();
-    let mut db = Db::open_default()?;
+    let db = Db::open_default()?;
     let (gid, game_name, exe) = match game_id {
         Some(g) => {
             let game = db.game(g)?.context("game not found")?;
@@ -228,34 +233,26 @@ fn cut_range(
     let title = if title.trim().is_empty() { render_template(&cfg.clips.name_template, &game_name, &exe, local) } else { sanitize_component(title) };
     let dir = clip_dir(&cfg, &game_name);
     std::fs::create_dir_all(&dir)?;
-    let tmp = temp_beside(&dir);
-    let (dur, start_ms, clip_edits) = cut_recording(sh, from_ms, to_ms, &tmp, edits, progress, cancel)?;
+    let tmp = TemporaryClip(temp_beside(&dir));
+    let (dur, start_ms, clip_edits) = cut_recording(sh, from_ms, to_ms, &tmp.0, edits, progress, cancel)?;
+    let info = cv_media::probe::probe(&tmp.0)?;
     let _lock = sh.library_lock.lock();
-    let dest = unique_path(&dir, &title, "mp4", None);
-    move_file(&tmp, &dest, Duration::from_secs(10))?;
-    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(title);
-    let id = db.insert_clip(&NewClip {
-        path: dest.to_string_lossy().to_string(),
-        title: stem,
-        game_id: Some(gid),
-        created_at: to_ms,
-        source_start_ms: Some(start_ms),
-        size: dest.metadata().map(|m| m.len() as i64).unwrap_or(0),
-        source: "recording".into(),
-        favorite: false,
+    let (id, dest, _) = commit_clip_output(&db, &tmp.0, cancel, |write| {
+        let dest = unique_path(&dir, &title, "mp4", None);
+        let id = write.insert(&NewClip {
+            path: dest.to_string_lossy().into_owned(),
+            title: dest.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(title),
+            game_id: Some(gid),
+            created_at: to_ms,
+            source_start_ms: Some(start_ms),
+            size: info.size as i64,
+            source: "recording".into(),
+            favorite: false,
+        }, category_ids, mix, &clip_edits)?;
+        record_probe(write, id, &info)?;
+        Ok((id, dest, false))
     })?;
     drop(_lock);
-    if !category_ids.is_empty() {
-        db.set_clip_categories(id, category_ids)?;
-    }
-    // Non-destructive: the clip keeps every track; volumes and edits are
-    // remembered with it and can be changed later.
-    if let Some(m) = mix {
-        db.set_clip_mixer(id, Some(m))?;
-    }
-    if !clip_edits.is_empty() {
-        db.set_clip_audio_edits(id, &clip_edits)?;
-    }
     probe_and_thumb(&db, id, &dest, cfg.clips.generate_thumbnails);
     if let Ok(w) = cv_media::wave::generate(&dest, 0.0, None, cancel) {
         let _ = w.save(&cv_core::waveform::wave_path(&dest));
@@ -267,94 +264,166 @@ fn cut_range(
 
 fn trim(sh: &Shared, clip_id: i64, start_s: f64, end_s: f64, replace: bool, progress: &mut dyn FnMut(f32), cancel: &AtomicBool) -> Result<(PathBuf, Option<i64>)> {
     let cfg = sh.cfg();
+    anyhow::ensure!(start_s.is_finite() && end_s.is_finite(), "the trim range is invalid");
+    let start_s = start_s.max(0.0);
     anyhow::ensure!(end_s > start_s + 0.1, "the trim range is empty");
-    let mut db = Db::open_default()?;
+    let db = Db::open_default()?;
     let clip = db.clip(clip_id)?.context("clip not found")?;
     let src = PathBuf::from(&clip.path);
-    anyhow::ensure!(src.is_file(), "the clip file is missing");
+    let original = file_version(&src).context("Could not read the source clip")?;
     let dir = src.parent().map(Path::to_path_buf).unwrap_or_default();
-    let tmp = temp_beside(&dir);
-    let start_ms = clip.source_start_ms.map(|s| s + (start_s * 1000.0) as i64);
-    cut(&[CutSource { path: src.clone(), from_s: start_s.max(0.0), to_s: Some(end_s) }], &tmp, start_ms, progress, cancel).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    let edits = rebase_edits(&clip.audio_edits, start_s, end_s);
+    let tmp = TemporaryClip(temp_beside(&dir));
+    let start_ms = clip.source_start_ms.map(|s| s.saturating_add((start_s * 1000.0) as i64));
+    let cut = cut(&[CutSource { path: src.clone(), from_s: start_s, to_s: Some(end_s) }], &tmp.0, start_ms, progress, cancel)?;
+    let span = cut.spans.first().context("the trim range is empty")?;
+    let info = cv_media::probe::probe(&tmp.0)?;
     let _lock = sh.library_lock.lock();
-    let current = db.clip(clip_id).and_then(|clip| clip.context("clip not found"));
-    if let Err(error) = current.and_then(|current| {
-        anyhow::ensure!(current.path == clip.path && src.is_file(), "The source clip changed during trimming");
-        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
-        Ok(())
-    }) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
+    let (id, dest, backup) = commit_clip_output(&db, &tmp.0, cancel, |write| {
+        let current = write.clip(clip_id)?.context("clip not found")?;
+        anyhow::ensure!(
+            !current.missing && current.path == clip.path && current.created_at == clip.created_at
+                && current.source_start_ms == clip.source_start_ms
+                && file_version(&src)? == original,
+            "The source clip changed during trimming",
+        );
+        let edits = rebase_edits(&current.audio_edits, span.from_s, span.to_s);
+        let (id, dest) = if replace {
+            write.trim(clip_id, start_ms, &edits)?;
+            (clip_id, src.clone())
+        } else {
+            let dest = unique_path(&dir, &format!("{} (trim)", current.title), "mp4", None);
+            let id = write.insert(&NewClip {
+                path: dest.to_string_lossy().into_owned(),
+                title: dest.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+                game_id: current.game_id,
+                created_at: now_ms(),
+                source_start_ms: start_ms,
+                size: info.size as i64,
+                source: "trim".into(),
+                favorite: current.favorite,
+            }, &current.category_ids, current.mixer.as_ref(), &edits)?;
+            (id, dest)
+        };
+        record_probe(write, id, &info)?;
+        Ok((id, dest, replace))
+    })?;
+    drop(_lock);
+    if let Some(backup) = backup {
+        finish_original_backup(&backup, cfg.clips.delete_to_recycle_bin);
     }
     if replace {
-        replace_trimmed_file(&tmp, &src, cfg.clips.delete_to_recycle_bin).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })?;
-        drop(_lock);
         let _ = std::fs::remove_file(cv_core::waveform::wave_path(&src));
-        probe_and_thumb(&db, clip_id, &src, cfg.clips.generate_thumbnails);
-        db.set_clip_audio_edits(clip_id, &edits)?;
-        let _ = db.set_clip_source_start(clip_id, start_ms);
-        let _ = db.set_clip_position(clip_id, 0.0);
-        if let Ok(w) = cv_media::wave::generate(&src, 0.0, None, cancel) {
-            let _ = w.save(&cv_core::waveform::wave_path(&src));
-        }
-        sh.toast(ToastLevel::Success, "Clip trimmed");
-        Ok((src, Some(clip_id)))
-    } else {
-        let dest = unique_path(&dir, &format!("{} (trim)", clip.title), "mp4", None);
-        std::fs::rename(&tmp, &dest)?;
-        let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let id = db.insert_clip(&NewClip {
-            path: dest.to_string_lossy().to_string(),
-            title: stem,
-            game_id: clip.game_id,
-            created_at: now_ms(),
-            source_start_ms: start_ms,
-            size: dest.metadata().map(|m| m.len() as i64).unwrap_or(0),
-            source: "trim".into(),
-            favorite: clip.favorite,
-        })?;
-        drop(_lock);
-        db.set_clip_categories(id, &clip.category_ids)?;
-        db.set_clip_audio_edits(id, &edits)?;
-        if let Some(m) = &clip.mixer {
-            db.set_clip_mixer(id, Some(m))?;
-        }
-        probe_and_thumb(&db, id, &dest, cfg.clips.generate_thumbnails);
-        if let Ok(w) = cv_media::wave::generate(&dest, 0.0, None, cancel) {
-            let _ = w.save(&cv_core::waveform::wave_path(&dest));
-        }
-        sh.toast(ToastLevel::Success, "Trimmed copy saved");
-        Ok((dest, Some(id)))
+    }
+    probe_and_thumb(&db, id, &dest, cfg.clips.generate_thumbnails);
+    if let Ok(w) = cv_media::wave::generate(&dest, 0.0, None, cancel) {
+        let _ = w.save(&cv_core::waveform::wave_path(&dest));
+    }
+    sh.toast(ToastLevel::Success, if replace { "Clip trimmed" } else { "Trimmed copy saved" });
+    Ok((dest, Some(id)))
+}
+
+struct TemporaryClip(PathBuf);
+
+impl Drop for TemporaryClip {
+    fn drop(&mut self) {
+        remove_job_file(&self.0).unwrap_or_else(|error| {
+            tracing::warn!("Temporary clip retained at {}: {error:#}", self.0.display());
+        });
     }
 }
 
-/// Keep the existing path in place until the same-volume rename succeeds.
-fn replace_trimmed_file(replacement: &Path, original: &Path, recycle_original: bool) -> Result<()> {
-    let backup = recycle_original.then(|| original.with_file_name(format!(
-        ".cv_{}_{}", cv_core::util::random_token(12), original.file_name().unwrap_or_default().to_string_lossy()
-    )));
-    if let Some(path) = &backup {
-        std::fs::hard_link(original, path).or_else(|_| std::fs::copy(original, path).map(|_| ()))
-            .inspect_err(|_| { let _ = std::fs::remove_file(path); })
-            .context("Could not preserve the original clip")?;
+fn remove_job_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
-    if let Err(error) = std::fs::rename(replacement, original) {
-        if let Some(path) = &backup {
-            let _ = std::fs::remove_file(path);
+}
+
+fn file_version(path: &Path) -> Result<[u32; 7]> {
+    let file = std::fs::File::open(path)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info)? };
+    Ok([
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow,
+        info.nFileSizeHigh, info.nFileSizeLow,
+        info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime,
+    ])
+}
+
+fn record_probe(write: &ClipWrite<'_>, id: i64, info: &MediaInfo) -> Result<()> {
+    let names = info.audio.iter().map(|track| track.name.clone()).collect::<Vec<_>>();
+    write.probe(id, info.duration, info.size as i64, info.width as i64, info.height as i64, info.fps, &names)
+}
+
+fn finish_original_backup(path: &Path, recycle: bool) {
+    let result = if recycle {
+        crate::win::shell::recycle(&[path])
+    } else {
+        remove_job_file(path).map_err(Into::into)
+    };
+    if let Err(error) = result {
+        tracing::warn!("Original clip retained at {}: {error:#}", path.display());
+    }
+}
+
+/// Keep SQL changes private until the media is in place. Preserve a same-volume
+/// backup through COMMIT so even a deferred constraint can restore the old file.
+fn commit_clip_output<T>(
+    db: &Db,
+    temp: &Path,
+    cancel: &AtomicBool,
+    prepare: impl FnOnce(&ClipWrite<'_>) -> Result<(T, PathBuf, bool)>,
+) -> Result<(T, PathBuf, Option<PathBuf>)> {
+    let mut published = None;
+    let result = db.clip_write(|write| {
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
+        let (value, dest, replace) = prepare(write)?;
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
+        let backup = if replace {
+            let backup = dest.with_file_name(format!(
+                ".cv_{}_{}", cv_core::util::random_token(12),
+                dest.file_name().unwrap_or_default().to_string_lossy(),
+            ));
+            std::fs::hard_link(&dest, &backup)
+                .or_else(|_| std::fs::copy(&dest, &backup).map(|_| ()))
+                .inspect_err(|_| finish_original_backup(&backup, false))
+                .context("Could not preserve the original clip")?;
+            if let Err(error) = move_file(temp, &dest, Duration::from_secs(2)) {
+                finish_original_backup(&backup, false);
+                return Err(error).context("Could not replace the clip");
+            }
+            Some(backup)
+        } else {
+            // Windows rename with overwrite disabled protects against a file
+            // appearing after unique_path checked the output name.
+            let wide = |path: &Path| -> Result<Vec<u16>> {
+                let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                let absolute = parent.canonicalize()?.join(path.file_name().context("Invalid output path")?);
+                Ok(absolute.as_os_str().encode_wide().chain(Some(0)).collect())
+            };
+            let from = wide(temp)?;
+            let to = wide(&dest)?;
+            unsafe { MoveFileW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr())) }
+                .context("Could not publish the clip")?;
+            None
+        };
+        published = Some((dest.clone(), backup.clone()));
+        Ok((value, dest, backup))
+    });
+    if let Err(error) = &result {
+        if let Some((dest, backup)) = published {
+            if let Some(backup) = backup {
+                move_file(&backup, &dest, Duration::from_secs(2)).with_context(|| {
+                    format!("Clip commit failed ({error:#}). Original clip retained at {}", backup.display())
+                })?;
+            } else {
+                remove_job_file(&dest).with_context(|| {
+                    format!("Clip commit failed ({error:#}). Could not remove {}", dest.display())
+                })?;
+            }
         }
-        return Err(error).context("Could not replace the clip");
     }
-    if let Some(path) = backup {
-        if let Err(error) = crate::win::shell::recycle(&[path.as_path()]) {
-            tracing::warn!("Original clip retained at {}: {error:#}", path.display());
-        }
-    }
-    Ok(())
+    result
 }
 
 /// Adjust the retry to the observed overshoot, with a margin for encoder variance.
@@ -497,7 +566,10 @@ mod tests {
         let missing = dir.path().join("missing.mp4");
         std::fs::write(&original, b"original").unwrap();
 
-        assert!(replace_trimmed_file(&missing, &original, true).is_err());
+        let db = Db::open_in_memory().unwrap();
+        assert!(commit_clip_output(&db, &missing, &AtomicBool::new(false), |_| {
+            Ok(((), original.clone(), true))
+        }).is_err());
         assert_eq!(std::fs::read(&original).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
@@ -510,9 +582,103 @@ mod tests {
         std::fs::write(&original, b"original").unwrap();
         std::fs::write(&replacement, b"trimmed").unwrap();
 
-        replace_trimmed_file(&replacement, &original, false).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = db.insert_clip(&NewClip {
+            path: original.to_string_lossy().into_owned(),
+            source_start_ms: Some(9000), ..Default::default()
+        }).unwrap();
+        let mut competing = db.clip(id).unwrap().unwrap();
+        let latest = [AudioEdit::new("mic", 4.0, 8.0, 0.0)];
+        db.set_clip_audio_edits(id, &latest).unwrap();
+        db.set_clip_position(id, 6.0).unwrap();
+        let (_, path, backup) = commit_clip_output(&db, &replacement, &AtomicBool::new(false), |write| {
+            let current = write.clip(id)?.unwrap();
+            assert_ne!(current.audio_edits, competing.audio_edits);
+            competing.audio_edits = rebase_edits(&current.audio_edits, 2.0, 5.0);
+            write.trim(id, Some(11_000), &competing.audio_edits)?;
+            Ok(((), original.clone(), true))
+        }).unwrap();
+        assert_eq!(path, original);
+        let backup = backup.unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"original");
+        finish_original_backup(&backup, false);
         assert_eq!(std::fs::read(&original).unwrap(), b"trimmed");
         assert!(!replacement.exists());
+        let stored = db.clip(id).unwrap().unwrap();
+        assert_eq!(stored.source_start_ms, Some(11_000));
+        assert_eq!(stored.last_position, 0.0);
+        assert_eq!(stored.audio_edits, [AudioEdit::new("mic", 2.0, 3.0, 0.0)]);
+    }
+
+    #[test]
+    fn failed_commit_restores_replaced_media_and_metadata() {
+        let db = Db::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.mp4");
+        let replacement = dir.path().join("replacement.mp4");
+        std::fs::write(&original, b"original").unwrap();
+        std::fs::write(&replacement, b"trimmed").unwrap();
+        let id = db.insert_clip(&NewClip {
+            path: original.to_string_lossy().into_owned(),
+            source_start_ms: Some(9000), ..Default::default()
+        }).unwrap();
+        db.set_clip_position(id, 6.0).unwrap();
+        let original_edits = [AudioEdit::new("mic", 4.0, 8.0, 0.0)];
+        db.set_clip_audio_edits(id, &original_edits).unwrap();
+        db.conn().execute_batch(
+            "CREATE TABLE required (id INTEGER PRIMARY KEY);
+             CREATE TABLE pending (id INTEGER REFERENCES required(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER fail_trim_commit AFTER UPDATE OF source_start_ms ON clips
+             BEGIN INSERT INTO pending VALUES (1); END;"
+        ).unwrap();
+
+        let failed = commit_clip_output(&db, &replacement, &AtomicBool::new(false), |write| {
+            write.trim(id, Some(11_000), &[])?;
+            Ok(((), original.clone(), true))
+        });
+        assert!(failed.is_err());
+        assert!(!replacement.exists(), "the replace happened before the commit failure");
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let stored = db.clip(id).unwrap().unwrap();
+        assert_eq!(stored.source_start_ms, Some(9000));
+        assert_eq!(stored.last_position, 6.0);
+        assert_eq!(stored.audio_edits, original_edits);
+    }
+
+    #[test]
+    fn new_output_rolls_back_on_invalid_metadata_collision_or_commit_failure() {
+        let db = Db::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("output.mp4");
+        let staged = dir.path().join("staged.mp4");
+        std::fs::write(&staged, b"new").unwrap();
+        let clip = NewClip { path: dest.to_string_lossy().into_owned(), ..Default::default() };
+        let cancel = AtomicBool::new(false);
+        let publish = |categories: &[i64]| commit_clip_output(&db, &staged, &cancel, |write| {
+            let id = write.insert(&clip, categories, None, &[])?;
+            Ok((id, dest.clone(), false))
+        });
+        assert!(publish(&[999]).is_err());
+        assert!(!dest.exists());
+        assert!(staged.exists());
+        assert!(db.clip_by_path(&clip.path).unwrap().is_none());
+
+        std::fs::write(&dest, b"existing").unwrap();
+        assert!(publish(&[]).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
+        assert!(db.clip_by_path(&clip.path).unwrap().is_none());
+        std::fs::remove_file(&dest).unwrap();
+        db.conn().execute_batch(
+            "CREATE TABLE required (id INTEGER PRIMARY KEY);
+             CREATE TABLE pending (id INTEGER REFERENCES required(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER fail_insert_commit AFTER INSERT ON clips
+             BEGIN INSERT INTO pending VALUES (1); END;"
+        ).unwrap();
+        assert!(publish(&[]).is_err());
+        assert!(!dest.exists());
+        assert!(!staged.exists(), "the publish happened before the commit failure");
+        assert!(db.clip_by_path(&clip.path).unwrap().is_none());
     }
 
     #[test]

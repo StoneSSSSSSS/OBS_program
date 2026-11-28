@@ -5,11 +5,48 @@
 
 use crate::model::*;
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::Path;
 
 const SCHEMA_VERSION: i64 = 2;
+
+/// Clip writes performed under the same SQLite writer lock as file publication.
+pub struct ClipWrite<'a>(&'a Db);
+
+impl ClipWrite<'_> {
+    pub fn clip(&self, id: i64) -> Result<Option<Clip>> {
+        self.0.clip(id)
+    }
+
+    pub fn insert(&self, clip: &NewClip, categories: &[i64], mix: Option<&crate::mixer::MixSettings>, edits: &[AudioEdit]) -> Result<i64> {
+        let id = self.0.insert_clip(clip)?;
+        for category in categories {
+            self.0.add_clip_category(id, *category)?;
+        }
+        if let Some(mix) = mix {
+            self.0.set_clip_mixer(id, Some(mix))?;
+        }
+        if !edits.is_empty() {
+            self.0.set_clip_audio_edits(id, edits)?;
+        }
+        Ok(id)
+    }
+
+    pub fn trim(&self, id: i64, start_ms: Option<i64>, edits: &[AudioEdit]) -> Result<()> {
+        let changed = self.0.conn.execute(
+            "UPDATE clips SET source_start_ms=?2, audio_edits=?3, last_position=0, thumb='' WHERE id=?1",
+            params![id, start_ms, serde_json::to_string(edits)?],
+        )?;
+        anyhow::ensure!(changed == 1, "clip not found");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe(&self, id: i64, duration: f64, size: i64, width: i64, height: i64, fps: f64, track_names: &[String]) -> Result<()> {
+        self.0.update_clip_probe(id, duration, size, width, height, fps, track_names.len() as i64, track_names)
+    }
+}
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -376,6 +413,15 @@ impl Db {
     }
 
     // ------------------------------------------------------------- clips
+
+    pub fn clip_write<T>(&self, write: impl FnOnce(&ClipWrite<'_>) -> Result<T>) -> Result<T> {
+        // Read the latest edits only once other writers have finished. They
+        // cannot change until publication and its metadata commit together.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let value = write(&ClipWrite(self))?;
+        tx.commit()?;
+        Ok(value)
+    }
 
     fn row_clip(r: &Row) -> rusqlite::Result<Clip> {
         let names: String = r.get("track_names")?;
