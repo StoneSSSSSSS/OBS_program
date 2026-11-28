@@ -31,6 +31,7 @@ fn muxer_hourly_roll_preserves_video_and_straddling_audio() -> Result<()> {
     let (send, receive) = unbounded();
     let epoch = Epoch::now();
     let mut muxer = Muxer::new(Arc::new(Shared {
+        window_test: None,
         cfg: Mutex::new(RecorderConfig {
             folder: folder.path().to_path_buf(),
             segment_secs: HOUR_S as u32,

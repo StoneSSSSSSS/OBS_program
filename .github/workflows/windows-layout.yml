@@ -35,6 +35,8 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup update stable --no-self-update
+      - name: Compile all Windows test targets
+        run: cargo +stable test --locked --workspace --no-run
       - name: Test editor geometry, responsive pages and pointer input
         shell: pwsh
         run: |
