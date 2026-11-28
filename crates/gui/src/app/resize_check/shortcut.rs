@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
 enum Step {
-    OpenSettings, Edit, Input, Save, Saved, Reopen, Verify, Recordings, LastFrame,
+    OpenSettings, Edit, Input, EditAlternate, InputAlternate, Save, Saved, Reopen, Verify, Recordings, LastFrame,
     PreviousFrame, FocusSearch, TypeSearch, PreserveWhileTyping, Blur, UseShortcut,
-    Arrive, Done,
+    Arrive, OpenClip, ClipStep, ClipFocus, ClipType, ClipVerify, ClipBlur, ClipShortcut, ClipArrive, Done,
 }
 
 pub(super) struct ShortcutCheck {
@@ -21,6 +21,8 @@ pub(super) struct ShortcutCheck {
     scale: f32,
     latest: f64,
     before: f64,
+    clip_before: f64,
+    clip_end: f64,
     screenshot: Arc<AtomicBool>,
 }
 
@@ -33,6 +35,8 @@ impl Default for ShortcutCheck {
             scale: 1.0,
             latest: 0.0,
             before: 0.0,
+            clip_before: 0.0,
+            clip_end: 0.0,
             screenshot: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -115,7 +119,7 @@ impl ShortcutCheck {
                 self.next(Step::Edit);
             }
             Step::Edit => {
-                if app.settings.qa_latest_binding().as_deref() == Some("End")
+                if app.settings.qa_latest_binding(0).as_deref() == Some("End")
                     && (ctx.viewport_rect().size() - egui::vec2(1182.0, 771.0)).abs().max_elem() < 3.0
                 {
                     self.click(ctx, "shortcut_latest_primary", Step::Input);
@@ -124,15 +128,25 @@ impl ShortcutCheck {
             Step::Input if ctx.egui_wants_keyboard_input() => {
                 self.key(Key::A, Modifiers::CTRL | Modifiers::COMMAND, None);
                 self.key(Key::Y, Modifiers::NONE, Some("Y"));
+                self.next(Step::EditAlternate);
+            }
+            Step::EditAlternate => {
+                if app.settings.qa_latest_binding(0).as_deref() == Some("Y") {
+                    self.click(ctx, "shortcut_latest_alternate", Step::InputAlternate);
+                }
+            }
+            Step::InputAlternate if ctx.egui_wants_keyboard_input() => {
+                self.key(Key::A, Modifiers::CTRL | Modifiers::COMMAND, None);
+                self.key(Key::X, Modifiers::NONE, Some("X"));
                 self.next(Step::Save);
             }
             Step::Save => {
-                if app.settings.qa_latest_binding().as_deref() == Some("Y") {
+                if app.settings.qa_latest_binding(1).as_deref() == Some("X") {
                     self.click(ctx, "shortcut_settings_save", Step::Saved);
                 }
             }
             Step::Saved => {
-                if persisted_latest().as_deref() == Some("Y") {
+                if persisted_latest().as_ref().is_some_and(|keys| keys[0] == "Y" && keys[1] == "X") {
                     ctx.set_zoom_factor(self.scale);
                     app.navigate(Page::Home);
                     Self::clear_target(ctx, "shortcut_latest_primary");
@@ -147,7 +161,8 @@ impl ShortcutCheck {
             }
             Step::Verify => {
                 if Self::target(ctx, "shortcut_latest_primary").is_some()
-                    && app.settings.qa_latest_binding().as_deref() == Some("Y")
+                    && app.settings.qa_latest_binding(0).as_deref() == Some("Y")
+                    && app.settings.qa_latest_binding(1).as_deref() == Some("X")
                 {
                     self.capture(ctx, dir.join("shortcut-settings-reopened.png"));
                     self.next(Step::Recordings);
@@ -207,14 +222,55 @@ impl ShortcutCheck {
                     && (player.time_pos - self.latest).abs() < 0.002
                 {
                     self.capture(ctx, dir.join("shortcut-jumped-to-latest.png"));
-                    self.next(Step::Done);
+                    self.next(Step::OpenClip);
                 }
+            }
+            Step::OpenClip if self.screenshot.load(Ordering::Acquire) => {
+                let clip = app.c.db().and_then(|db| db.list_clips(&Default::default()).ok())
+                    .and_then(|clips| clips.into_iter().next()).ok_or("Missing synthetic clip")?;
+                Self::clear_target(ctx, "shortcut_clip_title");
+                Self::clear_target(ctx, "next_frame");
+                app.navigate(Page::Clips);
+                crate::views::clips::request_open(clip.id);
+                self.next(Step::ClipStep);
+            }
+            Step::ClipStep if player.loaded && Self::target(ctx, "shortcut_clip_title").is_some() => {
+                self.click(ctx, "next_frame", Step::ClipFocus);
+            }
+            Step::ClipFocus if player.loaded && player.paused && !player.last_frame => {
+                self.clip_before = player.time_pos;
+                self.click(ctx, "shortcut_clip_title", Step::ClipType);
+            }
+            Step::ClipType if ctx.egui_wants_keyboard_input() => {
+                self.key(Key::End, Modifiers::NONE, None);
+                self.key(Key::X, Modifiers::NONE, Some("x"));
+                self.next(Step::ClipVerify);
+            }
+            Step::ClipVerify if app.clips.qa_title_text().ends_with('x') => {
+                if !player.paused || player.last_frame || (self.clip_before - player.time_pos).abs() > 0.001 {
+                    return Err("Typing the alternate key in the clip title changed playback".into());
+                }
+                self.capture(ctx, dir.join("shortcut-clip-title-kept-frame.png"));
+                self.next(Step::ClipBlur);
+            }
+            Step::ClipBlur if self.screenshot.load(Ordering::Acquire) => {
+                self.key(Key::Enter, Modifiers::NONE, None);
+                self.next(Step::ClipShortcut);
+            }
+            Step::ClipShortcut if !ctx.egui_wants_keyboard_input() => {
+                self.key(Key::X, Modifiers::NONE, Some("x"));
+                self.next(Step::ClipArrive);
+            }
+            Step::ClipArrive if player.paused && player.last_frame && player.time_pos > self.clip_before => {
+                self.clip_end = player.time_pos;
+                self.capture(ctx, dir.join("shortcut-clip-alternate-at-end.png"));
+                self.next(Step::Done);
             }
             Step::Done => {
                 if self.screenshot.load(Ordering::Acquire) {
                     std::fs::write(dir.join("shortcut-result.txt"), format!(
-                        "PASS: changed End to Y via Settings, saved and reopened it; typed y into the recording search at {:.3}s without playback, then pressed Y outside the field and jumped to {:.3}s.\n",
-                        self.before, self.latest,
+                        "PASS: changed End to Y via Settings, saved and reopened it; typed y into the recording search at {:.3}s without playback, then pressed Y outside the field and jumped to {:.3}s. Alternate X survived reopening, typed x into the clip title at {:.3}s without changing playback, then X outside the field reached the last frame at {:.3}s.\n",
+                        self.before, self.latest, self.clip_before, self.clip_end,
                     )).map_err(|error| error.to_string())?;
                     return Ok(true);
                 }
@@ -229,6 +285,6 @@ impl ShortcutCheck {
     }
 }
 
-fn persisted_latest() -> Option<String> {
-    Config::load_or_default().player.hotkeys.get("jump_latest").map(|binding| binding[0].clone())
+fn persisted_latest() -> Option<[String; 2]> {
+    Config::load_or_default().player.hotkeys.get("jump_latest").cloned()
 }

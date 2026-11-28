@@ -89,6 +89,10 @@ pub struct ClipsView {
 }
 
 impl ClipsView {
+    pub(crate) fn qa_title_text(&self) -> &str {
+        &self.detail.title_edit
+    }
+
     pub(crate) fn qa_open_library(&mut self, c: &mut Ctx) {
         if self.open.is_some() {
             self.close_clip(c);
@@ -736,6 +740,7 @@ impl ClipsView {
                 ui.set_max_width(420.0);
                 ui.add(egui::Label::new(&clip.title).wrap());
             });
+            editor_layout::remember_interaction_rect(ui, "shortcut_clip_title", r.rect);
             if r.lost_focus() && self.detail.title_edit.trim() != clip.title && !self.detail.title_edit.trim().is_empty() {
                 let title = self.detail.title_edit.trim().to_string();
                 if c.request(Request::RenameClip { clip_id: clip.id, title }).is_some() {

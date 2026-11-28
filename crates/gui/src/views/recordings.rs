@@ -1537,35 +1537,69 @@ impl RecordingsView {
                     ui.label(RichText::new(&day).size(12.0).color(theme::TEXT_FAINT));
                     last_day = day;
                 }
-                ui.horizontal_wrapped(|ui| {
-                    let playing = self.cur == Some(i);
-                    let dur = (self.seg_end(r) - r.start_ms) as f64 / 1000.0;
-                    let text = format!("Play {}  ·  {}", dt.format("%H:%M"), format_duration(dur));
-                    let rt = RichText::new(text).color(if playing { theme::TEXT } else { theme::TEXT_DIM });
-                    if ui.add(egui::Button::selectable(playing, rt)).clicked() {
-                        self.frame_recording(r.start_ms);
-                        self.play_at(c, r.start_ms, true);
-                        self.compact_files = false;
-                    }
-                    if r.is_live() {
-                        theme::pill(ui, theme::LIVE, "LIVE");
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let tip = if r.kept { "Kept forever (click to allow deletion)" } else { "Keep this file forever" };
-                        let resp = theme::icon_button(ui, icon::LOCK, 11.0, tip);
-                        if r.kept {
-                            ui.painter().circle_stroke(resp.rect.center(), 11.0, Stroke::new(1.0, c.accent));
-                        }
-                        if resp.clicked() {
-                            c.service.fire(Request::KeepRecording { recording_id: r.id, keep: !r.kept });
-                            self.dirty = true;
-                        }
-                        ui.label(theme::small(human_bytes(r.size.max(0) as u64)));
-                    });
-                });
+                let duration = (self.seg_end(r) - r.start_ms) as f64 / 1000.0;
+                let label = format!("Play {}  ·  {}", dt.format("%H:%M"), format_duration(duration));
+                let (play, keep) = recording_file_row(ui, label, r, self.cur == Some(i), c.accent);
+                if play.clicked() {
+                    self.frame_recording(r.start_ms);
+                    self.play_at(c, r.start_ms, true);
+                    self.compact_files = false;
+                }
+                if keep.clicked() {
+                    c.service.fire(Request::KeepRecording { recording_id: r.id, keep: !r.kept });
+                    self.dirty = true;
+                }
             }
         });
     }
+}
+
+fn recording_file_row(
+    ui: &mut Ui,
+    play_label: String,
+    recording: &Recording,
+    playing: bool,
+    accent: Color32,
+) -> (egui::Response, egui::Response) {
+    const LOCK_ICON_SIZE: f32 = 11.0;
+
+    ui.horizontal_wrapped(|ui| {
+        let text = RichText::new(play_label).color(if playing { theme::TEXT } else { theme::TEXT_DIM });
+        let play = ui.add(egui::Button::selectable(playing, text).wrap());
+        if recording.is_live() {
+            theme::pill(ui, theme::LIVE, "LIVE");
+        }
+
+        let size = egui::WidgetText::from(theme::small(human_bytes(recording.size.max(0) as u64)))
+            .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+        let lock_size = theme::icon_button_size(LOCK_ICON_SIZE);
+        let metadata_width = lock_size + ui.spacing().item_spacing.x + size.size().x;
+        let remaining = ui.available_size_before_wrap().x;
+        // Reserve the entire right-aligned group. A full-width slot wraps it as a unit.
+        let slot_width = if metadata_width <= remaining {
+            remaining
+        } else {
+            ui.available_width()
+        };
+        let keep = ui.allocate_ui_with_layout(
+            Vec2::new(slot_width, lock_size),
+            egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
+            |ui| {
+                let tip = if recording.kept {
+                    "Kept forever (click to allow deletion)"
+                } else {
+                    "Keep this file forever"
+                };
+                let keep = theme::icon_button(ui, icon::LOCK, LOCK_ICON_SIZE, tip);
+                if recording.kept {
+                    ui.painter().circle_stroke(keep.rect.center(), LOCK_ICON_SIZE, Stroke::new(1.0, accent));
+                }
+                ui.label(size);
+                keep
+            },
+        ).inner;
+        (play, keep)
+    }).inner
 }
 
 /// Merge consecutive activity spans of the same program separated by short
@@ -1633,6 +1667,185 @@ mod tests {
             kept: false,
             probed: true,
             probe_filetime: None,
+        }
+    }
+
+    #[test]
+    fn recording_file_controls_remain_visible_and_separate_while_resizing() {
+        use egui::epaint::Shape;
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, theme::TEXT, 1.0);
+
+        for (status, kept, size, play_label) in [
+            ("recording", false, 616 * 1024, "Play 04:35  ·  0:01"),
+            ("complete", false, 2_621_444, "Play 04:33  ·  0:40"),
+            ("complete", true, 1 << 50, "Play 18:05  ·  24:59:59"),
+        ] {
+            let mut file = recording("fixture.mp4", 1_000, 1.0, status);
+            file.kept = kept;
+            file.size = size;
+            let size_label = human_bytes(size as u64);
+            let mut wrapped = false;
+
+            for width in (130..=300).chain([420, 230, 180, 420]) {
+                let slot = Rect::from_min_size(Pos2::ZERO, Vec2::new(width as f32, 160.0));
+                let mut controls = None;
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(slot),
+                    ..Default::default()
+                }, |ui| {
+                    editor_layout::region(ui, "recording_file", slot, |ui| {
+                        controls = Some(recording_file_row(
+                            ui, play_label.into(), &file, file.is_live(), theme::SUCCESS,
+                        ));
+                    });
+                });
+                output.textures_delta.clear();
+                let (play, keep) = controls.unwrap();
+                let text_rect = |label: &str| {
+                    output.shapes.iter().find_map(|painted| match &painted.shape {
+                        Shape::Text(text) if text.galley.text() == label => Some(text.visual_bounding_rect()),
+                        _ => None,
+                    }).unwrap_or_else(|| panic!("Missing {label:?} at width {width}"))
+                };
+                let size_rect = text_rect(&size_label);
+                let mut rects = vec![play.rect, size_rect, keep.rect];
+                assert!(play.rect.contains_rect(text_rect(play_label)));
+                assert!(keep.rect.contains_rect(text_rect(icon::LOCK)));
+
+                let badge = output.shapes.iter().find_map(|painted| match &painted.shape {
+                    Shape::Rect(rect) if rect.fill == theme::LIVE.gamma_multiply(0.16) => Some(rect.rect),
+                    _ => None,
+                });
+                assert_eq!(badge.is_some(), file.is_live());
+                if let Some(badge) = badge {
+                    assert!(badge.contains_rect(text_rect("LIVE")));
+                    rects.push(badge);
+                    wrapped |= badge.bottom() < size_rect.top();
+                }
+                assert_eq!(output.shapes.iter().any(|painted| matches!(
+                    &painted.shape, Shape::Circle(circle) if circle.stroke.color == theme::SUCCESS
+                )), kept);
+
+                for (index, rect) in rects.iter().enumerate() {
+                    assert!(slot.contains_rect(*rect), "{status} at width {width}: {rect:?} exceeds {slot:?}");
+                    for other in &rects[..index] {
+                        assert!(!rect.intersects(*other), "{status} at width {width}: {rect:?} overlaps {other:?}");
+                    }
+                }
+                assert!((keep.rect.right() - slot.right()).abs() < 1.0);
+                assert!(size_rect.right() < keep.rect.left());
+                if width == 420 {
+                    assert!(rects.iter().all(|rect| rect.y_range().contains(play.rect.center().y)));
+                }
+            }
+            if file.is_live() {
+                assert!(wrapped, "The live row should move metadata to a second line when space runs out");
+            }
+        }
+    }
+
+    #[test]
+    fn recording_actions_are_fully_painted_or_reachable_by_scrolling() {
+        use egui::epaint::Shape;
+
+        for (width, height, initially_visible) in [
+            (370.0, 500.0, false),
+            (500.0, 500.0, true),
+            (685.0, 600.0, true),
+            (768.0, 600.0, true),
+            (938.0, 771.0, true),
+            (1_245.0, 771.0, true),
+        ] {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, theme::TEXT, 1.0);
+            let cfg = cv_core::config::Config::default();
+            let mut c = Ctx {
+                player: crate::player::Player::new(ctx.clone(), &cfg),
+                service: crate::service::Service::disconnected_for_test(),
+                thumbs: crate::thumbs::Thumbs::new(ctx.clone()),
+                waves: Default::default(),
+                db: None,
+                cfg,
+                accent: theme::TEXT,
+                toasts: Vec::new(),
+                goto: None,
+                open_recording_settings: false,
+            };
+            let mut view = RecordingsView {
+                recs: vec![recording("fixture.mp4", 1_000, 40.0, "complete")],
+                in_ms: Some(4_500),
+                out_ms: Some(26_750),
+                ..Default::default()
+            };
+            assert!(view.selection().is_some());
+            let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(width + 40.0, height));
+            let body = Rect::from_min_max(Pos2::new(20.0, 80.0), viewport.max - Vec2::splat(20.0));
+            let mut visible = false;
+            let mut pointer = None;
+            for frame in 0..24 {
+                let events = pointer.map_or_else(Vec::new, |pos| vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        source: egui::MouseWheelSource::Trackpad,
+                        delta: Vec2::new(0.0, -30.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: if frame == 1 { egui::TouchPhase::Start } else { egui::TouchPhase::Move },
+                    },
+                ]);
+                let (mut transport, mut viewport_clip) = (Rect::NOTHING, Rect::NOTHING);
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(viewport),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                }, |ui| {
+                    editor_layout::region(ui, "recording_body", body, |ui| {
+                        let sidebar = (width >= editor_layout::TWO_COLUMN_WIDTH)
+                            .then(|| (width * 0.30).clamp(245.0, 330.0));
+                        let layout = EditorLayout::with_preview(
+                            ui, sidebar, 398.0, true, Some(&view.preview_size),
+                        );
+                        transport = layout.transport;
+                        editor_layout::region(ui, "rec_transport", transport, |ui| {
+                            editor_layout::controls(ui, "rec_transport_scroll", |ui| {
+                                viewport_clip = ui.clip_rect().intersect(transport);
+                                c.player.transport(ui, "Sat 28 Nov 04:29:15  ·  1m ago", &c.cfg.player);
+                                view.cut_bar(ui, &mut c);
+                            });
+                        });
+                    });
+                });
+                output.textures_delta.clear();
+                visible = ["Export", "Marker"].into_iter().all(|label| {
+                    let text = output.shapes.iter().find_map(|painted| match &painted.shape {
+                        Shape::Text(text) if text.galley.text() == label => Some(text.visual_bounding_rect()),
+                        _ => None,
+                    });
+                    let Some(text) = text else { return false };
+                    output.shapes.iter().any(|painted| match &painted.shape {
+                        Shape::Rect(button) if button.rect.width() < 130.0 && button.rect.height() <= 40.0
+                            && button.rect.contains_rect(text) =>
+                        {
+                            let bounds = button.visual_bounding_rect();
+                            painted.clip_rect.contains_rect(bounds) && viewport_clip.contains_rect(bounds)
+                        }
+                        _ => false,
+                    })
+                });
+                if frame == 0 && initially_visible {
+                    assert!(visible, "Export and Marker are clipped at {width}×{height} before scrolling");
+                }
+                if visible {
+                    break;
+                }
+                pointer = Some(transport.right_top() + Vec2::new(-36.0, 28.0));
+            }
+            assert!(visible, "Export and Marker cannot be fully revealed at {width}×{height}");
         }
     }
 

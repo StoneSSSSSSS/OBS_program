@@ -130,7 +130,9 @@ impl EditorLayout {
         preview: Option<&PreviewSize>,
     ) -> Self {
         let rect = ui.available_rect_before_wrap();
-        let row_height = ui.spacing().interact_size.y.max(30.0) + ui.spacing().item_spacing.y;
+        // Recordings mixes standard buttons with larger playback and selection actions.
+        let minimum_row_height = if cut_controls { crate::theme::icon_button_size(20.0) } else { 30.0 };
+        let row_height = ui.spacing().interact_size.y.max(minimum_row_height) + ui.spacing().item_spacing.y;
         let _ = ui.allocate_rect(rect, Sense::hover());
         Self::split(
             rect,
@@ -167,7 +169,7 @@ impl EditorLayout {
             1.0
         };
         let cut_rows = if cut_controls {
-            if player.width() < 670.0 {
+            if player.width() < SINGLE_TRANSPORT_ROW_WIDTH {
                 2.0
             } else {
                 1.0

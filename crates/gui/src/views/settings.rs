@@ -81,11 +81,11 @@ impl SettingsView {
         self.tab = Tab::Hotkeys;
     }
 
-    pub(crate) fn qa_latest_binding(&self) -> Option<String> {
+    pub(crate) fn qa_latest_binding(&self, slot: usize) -> Option<String> {
         let cfg = &self.draft.as_ref()?.player;
         shortcuts::SHORTCUTS.iter()
             .find(|binding| binding.action == shortcuts::Action::JumpLatest)
-            .map(|binding| binding.bindings(cfg)[0].to_owned())
+            .and_then(|binding| binding.bindings(cfg).get(slot).map(|value| (*value).to_owned()))
     }
 
     /// Change only the staged QA draft so the sweep exercises the pinned save bar.
@@ -425,9 +425,10 @@ impl SettingsView {
                         for (slot, hint) in bindings.iter_mut().zip(["Primary", "Alternate"]) {
                             let input = ui.add(egui::TextEdit::singleline(slot).hint_text(hint).desired_width(120.0))
                                 .on_hover_text(format!("{hint} shortcut for {}", def.label));
-                            if def.action == shortcuts::Action::JumpLatest && hint == "Primary" {
-                                super::editor_layout::remember_interaction_rect(ui, "shortcut_latest_primary", input.rect);
-                                if ui.ctx().data_mut(|data| data.remove_temp::<bool>(egui::Id::unique("clipvault-qa-scroll-shortcut"))).unwrap_or(false) {
+                            if def.action == shortcuts::Action::JumpLatest {
+                                let target = if hint == "Primary" { "shortcut_latest_primary" } else { "shortcut_latest_alternate" };
+                                super::editor_layout::remember_interaction_rect(ui, target, input.rect);
+                                if hint == "Primary" && ui.ctx().data_mut(|data| data.remove_temp::<bool>(egui::Id::unique("clipvault-qa-scroll-shortcut"))).unwrap_or(false) {
                                     input.scroll_to_me_animation(Some(egui::Align::Center), egui::style::ScrollAnimation::none());
                                 }
                             }

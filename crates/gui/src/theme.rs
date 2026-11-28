@@ -331,9 +331,13 @@ fn custom_button(ui: &mut Ui, glyph: Option<&str>, text: &str, fill: Color32, fg
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+pub fn icon_button_size(glyph_size: f32) -> f32 {
+    glyph_size + 16.0
+}
+
 /// Round icon-only button.
 pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, tooltip: &str) -> Response {
-    let d = size + 16.0;
+    let d = icon_button_size(size);
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
     if !tooltip.is_empty() {
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tooltip));

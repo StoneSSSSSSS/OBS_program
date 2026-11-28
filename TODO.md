@@ -28,6 +28,9 @@
 - [x] Follow an active native Windows Graphics Capture recording into its next file in the visible player. The isolated test recorded an animated window with silent audio. Playback advanced as fragments were committed and followed rollover within 550 ms of the written edge in the observed run. Loading a new file now invalidates the previous file's playback state.
 - [x] Enlarge the recording or clip preview while retaining both visible trim handles and time labels in a compact timeline. The Windows run checked the painted grip bounds and restoring the full timeline.
 
+- [x] Keep the live row's Play button, LIVE badge, file size and lock readable. Keep Export and Marker fully visible or scrollable after resizing the preview. Native Windows checks passed at 100%, 125% and 150% UI scale.
+- [x] Save and reopen two bindings for the same player action. In native UI tests, typing the primary key into recording search or the alternate into a clip title preserved the paused frame. Each key jumped to the end outside its text field.
+
 ## Next verification
 
 - [ ] Run a sustained live replay-only session on a second Windows setup. Check hotkey capture and rebinding, headset and display reconnects, disk pressure, and waveform backfill while entering and leaving a game.
