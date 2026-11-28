@@ -139,6 +139,8 @@ impl AppNamer for Namer {
 struct Engine {
     sh: Arc<Shared>,
     rec: Option<Recorder>,
+    #[cfg(test)]
+    qa_window: Option<isize>,
     events_tx: crossbeam_channel::Sender<RecEvent>,
     events_rx: Receiver<RecEvent>,
     namer: Arc<Namer>,
@@ -164,6 +166,8 @@ fn new_engine(sh: Arc<Shared>, wanted: bool) -> Engine {
     Engine {
         sh,
         rec: None,
+        #[cfg(test)]
+        qa_window: None,
         events_tx,
         events_rx,
         namer,
@@ -186,7 +190,18 @@ fn new_engine(sh: Arc<Shared>, wanted: bool) -> Engine {
 pub fn run(sh: Arc<Shared>, rx: Receiver<EngineCmd>) {
     cv_media::util::disable_background_throttling();
     let wanted = Db::open_default().ok().and_then(|db| db.meta_get(META_RECORDING_WANTED).ok().flatten()).map(|v| v != "0").unwrap_or(true);
-    let mut e = new_engine(sh, wanted);
+    run_engine(new_engine(sh, wanted), rx);
+}
+
+#[cfg(test)]
+pub(crate) fn run_test_window(sh: Arc<Shared>, rx: Receiver<EngineCmd>, hwnd: isize) {
+    assert!(sh.isolated_test, "window QA requires an isolated test profile");
+    let mut engine = new_engine(sh, true);
+    engine.qa_window = Some(hwnd);
+    run_engine(engine, rx);
+}
+
+fn run_engine(mut e: Engine, rx: Receiver<EngineCmd>) {
     // Give the mic guard a moment to pick the microphone first.
     std::thread::sleep(Duration::from_millis(600));
     let mut pending = Vec::new();
@@ -301,7 +316,15 @@ impl Engine {
         } else if self.mode != RecordingMode::Archive && !internal_buffer_root_ok(&folder) {
             Err(anyhow::anyhow!("ClipVault’s temporary buffer must stay in its profile directory"))
         } else {
-            require_media_path(&folder).and_then(|_| Recorder::start(rc, self.namer.clone(), self.events_tx.clone()))
+            require_media_path(&folder).and_then(|_| {
+                #[cfg(test)]
+                if let Some(hwnd) = self.qa_window {
+                    let mut rc = rc;
+                    rc.segment_secs = 8;
+                    return Recorder::start_test_window(rc, self.namer.clone(), self.events_tx.clone(), hwnd);
+                }
+                Recorder::start(rc, self.namer.clone(), self.events_tx.clone())
+            })
         };
         match capture {
             Ok(r) => {

@@ -630,10 +630,9 @@ fn legacy_video_tracks_wasapi_clock_through_play_pause_and_seek() -> Result<()> 
     let dir = tempfile::tempdir()?;
     let source = dir.path().join("legacy-timing.mp4");
     legacy_fixture(&source)?;
-    let view = Mutex::new(View::default());
     let mut playback = Playback::new();
-    playback.command(Command::Volume(0.0), &view)?;
-    playback.command(Command::Load(source, 0.0, false, true), &view)?;
+    playback.command(Command::Volume(0.0))?;
+    playback.command(Command::Load(1, source, 0.0, false, true))?;
 
     let next_frame = |player: &mut Playback| -> Result<VideoFrame> {
         let deadline = Instant::now() + Duration::from_secs(4);
@@ -646,7 +645,7 @@ fn legacy_video_tracks_wasapi_clock_through_play_pause_and_seek() -> Result<()> 
         anyhow::bail!("timed out waiting for a picture");
     };
     assert_eq!(displayed_frame(&next_frame(&mut playback)?), 0);
-    playback.command(Command::Pause(false), &view)?;
+    playback.command(Command::Pause(false))?;
     let clock = |player: &Playback| -> Result<f64> {
         let output = player.output.as_ref().context("WASAPI did not open")?;
         anyhow::ensure!(output.started, "Windows endpoint never started");
@@ -661,7 +660,7 @@ fn legacy_video_tracks_wasapi_clock_through_play_pause_and_seek() -> Result<()> 
         println!("play: WASAPI {expected:.3}s, frame {video:.3}s");
     }
 
-    playback.command(Command::Pause(true), &view)?;
+    playback.command(Command::Pause(true))?;
     let paused = playback.state.position;
     std::thread::sleep(Duration::from_millis(100));
     assert!(playback.tick()?.is_none());
@@ -669,7 +668,7 @@ fn legacy_video_tracks_wasapi_clock_through_play_pause_and_seek() -> Result<()> 
     assert!(!playback.output.as_ref().unwrap().started);
     assert_eq!(playback.output.as_ref().unwrap().padding()?, 0);
 
-    playback.command(Command::Seek(1.17, true), &view)?;
+    playback.command(Command::Seek(1.17, true))?;
     let exact = next_frame(&mut playback)?;
     assert!((playback.state.position - 1.17).abs() < 0.001);
     assert_eq!(displayed_frame(&exact), 29);
@@ -677,7 +676,7 @@ fn legacy_video_tracks_wasapi_clock_through_play_pause_and_seek() -> Result<()> 
     println!("paused exact seek: requested 1.170s, frame {:.3}s, audio cursor {:.3}s",
         displayed_frame(&exact) as f64 / FPS as f64, playback.next_audio / RATE);
 
-    playback.command(Command::Pause(false), &view)?;
+    playback.command(Command::Pause(false))?;
     for _ in 0..7 {
         let frame = next_frame(&mut playback)?;
         let expected = clock(&playback)?;
@@ -686,7 +685,7 @@ fn legacy_video_tracks_wasapi_clock_through_play_pause_and_seek() -> Result<()> 
         println!("resume: WASAPI {expected:.3}s, frame {video:.3}s");
     }
 
-    playback.command(Command::Seek(2.33, true), &view)?;
+    playback.command(Command::Seek(2.33, true))?;
     let changed = next_frame(&mut playback)?;
     assert_eq!(displayed_frame(&changed), 58);
     let resumed = next_frame(&mut playback)?;
@@ -712,4 +711,21 @@ fn write_synthetic_fixture() -> Result<()> {
     Fixture::make_fragments(fragments)?.write(&path)?;
     println!("Synthetic media fixture: {}", path.display());
     Ok(())
+}
+
+#[test]
+fn new_load_invalidates_the_previous_segment_before_the_worker_opens_it() {
+    let (tx, rx) = unbounded();
+    let old = NativeState { loaded: true, position: 7.95, duration: 8.0, ..Default::default() };
+    let view = Arc::new(Mutex::new(View { generation: 1, ..Default::default() }));
+    assert!(view.lock().publish(1, &old, Some(VideoFrame {
+        serial: 8, width: 2, height: 2, rgba: vec![255; 16],
+    })));
+    let player = NativePlayer { tx, view: view.clone() };
+    player.load(PathBuf::from("next.mp4"), 0.0, true, false);
+    assert!(matches!(rx.try_recv().unwrap(), Command::Load(2, ..)));
+    assert!(!view.lock().publish(1, &old, None));
+    assert!(!player.state().loaded);
+    assert_eq!(player.state().position, 0.0);
+    assert!(player.frame().is_none());
 }

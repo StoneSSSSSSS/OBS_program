@@ -226,6 +226,7 @@ pub(crate) enum MuxMsg {
 
 pub(crate) struct Shared {
     pub cfg: Mutex<RecorderConfig>,
+    pub window_test: Option<isize>,
     pub status: Mutex<RecorderStatus>,
     pub stop: AtomicBool,
     pub force_key: AtomicBool,
@@ -244,9 +245,23 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn start(cfg: RecorderConfig, namer: Arc<dyn AppNamer>, events: Sender<RecEvent>) -> Result<Recorder> {
+        Self::start_with(cfg, namer, events, None)
+    }
+
+    /// Synthetic QA window with silent audio; cannot select a display or another process.
+    #[cfg(feature = "qa-window")]
+    pub fn start_test_window(mut cfg: RecorderConfig, namer: Arc<dyn AppNamer>, events: Sender<RecEvent>, hwnd: isize) -> Result<Recorder> {
+        cfg.mic = None;
+        cfg.record_apps = false;
+        cfg.cursor = false;
+        Self::start_with(cfg, namer, events, Some(hwnd))
+    }
+
+    fn start_with(cfg: RecorderConfig, namer: Arc<dyn AppNamer>, events: Sender<RecEvent>, window_test: Option<isize>) -> Result<Recorder> {
         std::fs::create_dir_all(&cfg.folder).with_context(|| format!("creating {}", cfg.folder.display()))?;
         let shared = Arc::new(Shared {
             cfg: Mutex::new(cfg),
+            window_test,
             status: Mutex::new(RecorderStatus { running: true, ..Default::default() }),
             stop: AtomicBool::new(false),
             force_key: AtomicBool::new(false),

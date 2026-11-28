@@ -78,7 +78,13 @@ fn pipeline(sh: &Arc<Shared>, tx: &Sender<MuxMsg>) -> Result<()> {
     .context("no monitor found")?
     .clone();
     let gpu = Arc::new(Gpu::on_adapter(out.adapter_index)?);
-    let mut cap = DisplayCapture::open(gpu.clone(), out.output_index, cfg.capture_method)?;
+    let mut cap = match sh.window_test {
+        #[cfg(feature = "qa-window")]
+        Some(hwnd) => DisplayCapture::Wgc(crate::capture::wgc::WgcCapture::new_owned_window(gpu.clone(), hwnd)?),
+        #[cfg(not(feature = "qa-window"))]
+        Some(_) => anyhow::bail!("owned-window QA capture is unavailable"),
+        None => DisplayCapture::open(gpu.clone(), out.output_index, cfg.capture_method)?,
+    };
     let (w, h) = fit_size(cap.size(), cfg.max_height);
     let mut conv = Converter::new(&gpu, cap.size(), (w, h), true)?;
     let fps = cfg.fps.clamp(10, 240);

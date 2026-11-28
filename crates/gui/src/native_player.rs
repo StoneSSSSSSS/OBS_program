@@ -70,7 +70,7 @@ pub struct VideoFrame {
 }
 
 enum Command {
-    Load(PathBuf, f64, bool, bool),
+    Load(u64, PathBuf, f64, bool, bool),
     Seek(f64, bool),
     Step(bool),
     Latest,
@@ -78,13 +78,27 @@ enum Command {
     Speed(f64),
     Volume(f64),
     Mix(PreviewMix),
-    Clear,
+    Clear(u64),
 }
 
 #[derive(Default)]
 struct View {
+    generation: u64,
     state: NativeState,
     frame: Option<Arc<VideoFrame>>,
+}
+
+impl View {
+    fn publish(&mut self, generation: u64, state: &NativeState, frame: Option<VideoFrame>) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.state = state.clone();
+        if let Some(frame) = frame {
+            self.frame = Some(Arc::new(frame));
+        }
+        true
+    }
 }
 
 pub struct NativePlayer {
@@ -106,7 +120,7 @@ impl NativePlayer {
     }
 
     pub fn load(&self, path: PathBuf, start: f64, live: bool, paused: bool) {
-        let _ = self.tx.send(Command::Load(path, start, live, paused));
+        self.reset_and_send(paused, |generation| Command::Load(generation, path, start, live, paused));
     }
 
     pub fn seek(&self, t: f64, exact: bool) {
@@ -142,7 +156,19 @@ impl NativePlayer {
     }
 
     pub fn clear(&self) {
-        let _ = self.tx.send(Command::Clear);
+        self.reset_and_send(true, Command::Clear);
+    }
+
+    fn reset_and_send(&self, paused: bool, command: impl FnOnce(u64) -> Command) {
+        // The UI updates its path synchronously. Do not expose old media
+        // state or a stale texture under that next path while opening it.
+        let mut view = self.view.lock();
+        view.generation = view.generation.wrapping_add(1);
+        view.frame = None;
+        view.state = NativeState { paused, ..Default::default() };
+        if self.tx.send(command(view.generation)).is_err() {
+            view.state.error = Some("The native playback worker is unavailable".into());
+        }
     }
 
     pub fn state(&self) -> NativeState {
@@ -521,6 +547,7 @@ impl Media {
 }
 
 struct Playback {
+    generation: u64,
     state: NativeState,
     media: Option<Media>,
     output: Option<AudioOutput>,
@@ -536,6 +563,7 @@ struct Playback {
 impl Playback {
     fn new() -> Self {
         Self {
+            generation: 0,
             state: NativeState { paused: true, ..Default::default() },
             media: None, output: None, next_audio: 0.0, last_tick: Instant::now(),
             output_retry: Instant::now(), speed: 1.0, volume: 1.0,
@@ -551,12 +579,12 @@ impl Playback {
         self.last_tick = Instant::now();
     }
 
-    fn command(&mut self, cmd: Command, view: &Mutex<View>) -> Result<()> {
+    fn command(&mut self, cmd: Command) -> Result<()> {
         match cmd {
-            Command::Load(path, start, live, paused) => {
+            Command::Load(generation, path, start, live, paused) => {
+                self.generation = generation;
                 self.media = None;
                 self.state = NativeState { paused, ..Default::default() };
-                view.lock().frame = None;
                 self.reset_audio();
                 let mut media = Media::open(path, live, &self.mix)?;
                 let start = if start == f64::MAX { media.frame_seconds(media.last_frame) } else { start };
@@ -631,10 +659,10 @@ impl Playback {
                 self.reset_audio();
             }
             Command::Mix(_) => {}
-            Command::Clear => {
+            Command::Clear(generation) => {
+                self.generation = generation;
                 self.media = None;
                 self.state = NativeState { paused: true, ..Default::default() };
-                view.lock().frame = None;
                 self.reset_audio();
             }
         }
@@ -777,7 +805,7 @@ fn run(rx: Receiver<Command>, view: Arc<Mutex<View>>, ctx: egui::Context) {
                     let replace = matches!((&pending, &next), (Some(Command::Seek(..)), Command::Seek(..)));
                     if !replace {
                         if let Some(cmd) = pending.take() {
-                            if let Err(e) = playback.command(cmd, &view) {
+                            if let Err(e) = playback.command(cmd) {
                                 playback.state.error = Some(format!("{e:#}"));
                             }
                         }
@@ -785,7 +813,7 @@ fn run(rx: Receiver<Command>, view: Arc<Mutex<View>>, ctx: egui::Context) {
                     pending = Some(next);
                 }
                 if let Some(cmd) = pending {
-                    if let Err(e) = playback.command(cmd, &view) {
+                    if let Err(e) = playback.command(cmd) {
                         playback.state.error = Some(format!("{e:#}"));
                     }
                 }
@@ -816,12 +844,9 @@ fn run(rx: Receiver<Command>, view: Arc<Mutex<View>>, ctx: egui::Context) {
         };
         let repaint = changed || refreshed || frame.is_some() || (active && last_paint.elapsed() >= REFRESH);
         if changed || active || frame.is_some() || refreshed {
-            let mut data = view.lock();
-            data.state = playback.state.clone();
-            if let Some(frame) = frame {
-                data.frame = Some(Arc::new(frame));
+            if !view.lock().publish(playback.generation, &playback.state, frame) {
+                continue;
             }
-            drop(data);
             if repaint {
                 last_paint = Instant::now();
                 ctx.request_repaint();

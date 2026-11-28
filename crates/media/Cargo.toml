@@ -61,5 +61,8 @@ features = [
     "Win32_UI_Shell_PropertiesSystem",
 ]
 
+[features]
+qa-window = []
+
 [dev-dependencies]
 tempfile.workspace = true

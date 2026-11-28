@@ -22,6 +22,9 @@ mod hourly_split;
 #[path = "test_ipc/short_history.rs"]
 mod short_history;
 
+#[path = "test_ipc/window_capture.rs"]
+mod window_capture;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const JOB_TIMEOUT: Duration = Duration::from_secs(120);
 

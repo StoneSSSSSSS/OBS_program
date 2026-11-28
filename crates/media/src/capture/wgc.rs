@@ -65,13 +65,34 @@ impl WgcCapture {
             let desc = output.GetDesc()?;
             let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().context("screen capture is not available")?;
             let item: GraphicsCaptureItem = interop.CreateForMonitor(desc.Monitor).context("capturing this monitor")?;
+            Self::open_item(gpu, output_index, item, true)
+        }
+    }
+
+    #[cfg(feature = "qa-window")]
+    pub(crate) fn new_owned_window(gpu: Arc<Gpu>, raw_window: isize) -> Result<WgcCapture> {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+        let hwnd = HWND(raw_window as *mut std::ffi::c_void);
+        let mut owner = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut owner));
+            anyhow::ensure!(owner == std::process::id(), "the QA capture window must belong to this process");
+            let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+            let item = interop.CreateForWindow(hwnd).context("capturing the owned QA window")?;
+            Self::open_item(gpu, 0, item, false)
+        }
+    }
+
+    fn open_item(gpu: Arc<Gpu>, output_index: u32, item: GraphicsCaptureItem, cursor: bool) -> Result<WgcCapture> {
+        unsafe {
             let dxgi: IDXGIDevice = gpu.device.cast()?;
             let device: IDirect3DDevice = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?.cast()?;
             let s = item.Size()?;
             let size = (s.Width.max(2) as u32, s.Height.max(2) as u32);
             let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, s)?;
             let session = pool.CreateCaptureSession(&item)?;
-            let _ = session.SetIsCursorCaptureEnabled(true);
+            let _ = session.SetIsCursorCaptureEnabled(cursor);
             // Windows 11: no yellow "being captured" border.
             let _ = session.SetIsBorderRequired(false);
             let event = Arc::new(Event(CreateEventW(None, false, false, None)?));
@@ -91,7 +112,7 @@ impl WgcCapture {
             }))?;
             session.StartCapture()?;
             let desktop = gpu.texture(size.0, size.1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, D3D11_CPU_ACCESS_FLAG(0))?;
-            Ok(WgcCapture { gpu, output_index, item, device, pool, session, event, size, desktop, cursor: true, has_image: false, new_frames: 0, content_size: size, closed })
+            Ok(WgcCapture { gpu, output_index, item, device, pool, session, event, size, desktop, cursor, has_image: false, new_frames: 0, content_size: size, closed })
         }
     }
 

@@ -182,7 +182,7 @@ fn run_inner(sh: &Arc<Shared>, tx: &Sender<MuxMsg>, namer: Arc<dyn AppNamer>, mi
         // Microphone changes (mic guard) and recovery after unplugging.
         while let Ok((m, g)) = mic_rx.try_recv() {
             mic_gain = g;
-            if m != mic_choice {
+            if sh.window_test.is_none() && m != mic_choice {
                 mic_choice = m;
                 drop(mic.take());
                 hub.remove(MIC_ID);
@@ -200,7 +200,7 @@ fn run_inner(sh: &Arc<Shared>, tx: &Sender<MuxMsg>, namer: Arc<dyn AppNamer>, mi
         sh.status.lock().mic_ok = mic.as_ref().map(|m| !m.failed()).unwrap_or(false);
 
         // Which programs are playing sound?
-        if !stopping && loopback.is_none() && last_scan.elapsed() >= Duration::from_millis(300) {
+        if sh.window_test.is_none() && !stopping && loopback.is_none() && last_scan.elapsed() >= Duration::from_millis(300) {
             last_scan = Instant::now();
             let sessions = sound_sessions();
             let procs = processes();

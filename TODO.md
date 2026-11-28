@@ -25,6 +25,9 @@
 - [x] Compare 10,080 one-minute archive segments against the previous retention algorithm. All 10,070 expiry decisions matched. Three release-mode runs of the in-memory planner took 0.5–0.6 ms, compared with 7.97–8.11 s previously. These timings exclude file operations.
 - [x] Benchmark the native player on the same 25 fps synthetic file. Each paired five-second playing interval presented 125 frames. The paused static player eliminated all 24 periodic worker wakeups seen in the prior five-second samples. Active CPU varied and resident memory during playback stayed near 32 MiB.
 
+- [x] Follow an active native Windows Graphics Capture recording into its next file in the visible player. The isolated test recorded an animated window with silent audio. Playback advanced as fragments were committed and followed rollover within 550 ms of the written edge in the observed run. Loading a new file now invalidates the previous file's playback state.
+- [x] Enlarge the recording or clip preview while retaining both visible trim handles and time labels in a compact timeline. The Windows run checked the painted grip bounds and restoring the full timeline.
+
 ## Next verification
 
 - [ ] Run a sustained live replay-only session on a second Windows setup. Check hotkey capture and rebinding, headset and display reconnects, disk pressure, and waveform backfill while entering and leaving a game.

@@ -61,4 +61,5 @@ features = [
 embed-resource = "2"
 
 [dev-dependencies]
+clipvault-media = { path = "../media", features = ["qa-window"] }
 tempfile.workspace = true
