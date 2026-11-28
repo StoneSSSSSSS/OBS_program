@@ -10,7 +10,7 @@ use cv_core::ipc::{ExportSource, Request};
 use cv_core::mixer::MixSettings;
 use cv_core::model::{apply_edit, rebase_edits, ActivitySpan, AudioEdit, Category, Clip, Game, Marker, Recording};
 use cv_core::timeline::{locate, plan_cut, plan_duration_s, Segment};
-use cv_core::util::{format_duration, human_bytes, now_ms};
+use cv_core::util::{format_duration, format_duration_precise, human_bytes, now_ms};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +113,7 @@ pub struct RecordingsView {
     lane_state: LaneState,
     /// Playhead when the player was last showing our file.
     resume_ms: Option<i64>,
+    compact_files: bool,
 }
 
 fn timeline_mix_file() -> PathBuf {
@@ -323,12 +324,20 @@ impl RecordingsView {
         }
     }
 
-    fn set_start(&mut self, at: i64) {
-        self.in_ms = Some(self.out_ms.map_or(at, |end| at.min(end.saturating_sub(101))));
+    fn set_start(&mut self, at: i64) -> Result<(), &'static str> {
+        if self.out_ms.is_some_and(|end| end.saturating_sub(at) <= 100) {
+            return Err("Choose a start more than 0.1 seconds before the end.");
+        }
+        self.in_ms = Some(at);
+        Ok(())
     }
 
-    fn set_end(&mut self, at: i64) {
-        self.out_ms = Some(self.in_ms.map_or(at, |start| at.max(start.saturating_add(101))));
+    fn set_end(&mut self, at: i64) -> Result<(), &'static str> {
+        if self.in_ms.is_some_and(|start| at.saturating_sub(start) <= 100) {
+            return Err("Choose an end more than 0.1 seconds after the start.");
+        }
+        self.out_ms = Some(at);
+        Ok(())
     }
 
     fn frame_recording(&mut self, at:i64) {
@@ -387,11 +396,13 @@ impl RecordingsView {
             }
         }
         if GO_LIVE.swap(false, Ordering::SeqCst) {
+            self.compact_files = false;
             self.stop_preview(c);
             self.go_live(c);
         }
         let jump = PLAY_AT.swap(0, Ordering::SeqCst);
         if jump != 0 {
+            self.compact_files = false;
             self.stop_preview(c);
             self.refresh(c);
             self.follow_live = false;
@@ -447,27 +458,38 @@ impl RecordingsView {
         let hits = c.player.shortcuts(ui, &c.cfg.player);
         if hits.mark_in {
             self.stop_preview(c);
-            if let Some(at)=self.playhead(c){self.set_start(at);}
+            if let Some(at) = self.playhead(c) { c.report_mark(self.set_start(at)); }
         }
         if hits.mark_out {
             self.stop_preview(c);
-            if let Some(at)=self.playhead(c){self.set_end(at);}
+            if let Some(at) = self.playhead(c) { c.report_mark(self.set_end(at)); }
         }
 
         let fullscreen = c.player.fullscreen;
         if !fullscreen {
-            self.header(ui, c);
-            ui.add_space(10.0);
-            egui::Panel::right("rec_side")
-                .exact_size(330.0)
-                .resizable(false)
-                .frame(egui::Frame::NONE.inner_margin(Margin { left: 18, right: 0, top: 0, bottom: 0 }))
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical().id_salt("rec_side_scroll").auto_shrink(false).show(ui, |ui| {
-                        ui.set_max_width(ui.available_width());
-                        self.side(ui, c);
-                    });
+            let compact = ui.available_width() < 840.0;
+            if compact {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(theme::heading("24/7 Recordings"));
+                    ui.selectable_value(&mut self.compact_files, false, "Timeline");
+                    ui.selectable_value(&mut self.compact_files, true, "Files & jobs");
                 });
+                ui.add_space(6.0);
+                if self.compact_files {
+                    self.files_inspector(ui, c);
+                    return;
+                }
+                ui.horizontal_wrapped(|ui| self.header_controls(ui, c, false));
+            } else {
+                self.header(ui, c);
+                let side_width = (ui.available_width() * 0.30).clamp(245.0, 330.0);
+                egui::Panel::right("rec_side")
+                    .exact_size(side_width)
+                    .resizable(false)
+                    .frame(egui::Frame::NONE.inner_margin(Margin { left: 18, right: 0, top: 0, bottom: 0 }))
+                    .show(ui, |ui| self.files_inspector(ui, c));
+            }
+            ui.add_space(10.0);
         }
 
         if self.recs.is_empty() {
@@ -495,9 +517,18 @@ impl RecordingsView {
             return;
         }
 
-        // Controls live in a bottom panel so they're never pushed off screen;
-        // the video gets whatever space is left.
         let bottom_margin = if fullscreen { Margin::symmetric(16, 8) } else { Margin::ZERO };
+        egui::Panel::bottom("rec_transport")
+            .resizable(false)
+            .frame(egui::Frame::NONE.inner_margin(bottom_margin).fill(if fullscreen { theme::BG } else { Color32::TRANSPARENT }))
+            .show(ui, |ui| {
+                let label = self.time_label(c);
+                c.player.transport(ui, &label, &c.cfg.player);
+                if !fullscreen {
+                    self.cut_bar(ui, c);
+                }
+            });
+        let lane_budget = ui.available_height() - 220.0;
         egui::Panel::bottom("rec_controls")
             .resizable(false)
             .frame(egui::Frame::NONE.inner_margin(bottom_margin).fill(if fullscreen { theme::BG } else { Color32::TRANSPARENT }))
@@ -506,64 +537,83 @@ impl RecordingsView {
                 self.timeline(ui, c);
                 if c.player.show_mixer && !fullscreen {
                     ui.add_space(4.0);
-                    self.audio_lanes(ui, c);
-                }
-                let label = self.time_label(c);
-                c.player.transport(ui, &label, &c.cfg.player);
-                if !fullscreen {
-                    self.cut_bar(ui, c);
+                    self.audio_lanes(ui, c, lane_budget);
                 }
             });
         let avail = ui.available_size();
-        let h = if fullscreen { avail.y } else { (avail.x * 9.0 / 16.0).min(avail.y).max(120.0) };
+        let h = if fullscreen { avail.y } else { (avail.x * 9.0 / 16.0).min(avail.y).max(0.0) };
         c.player.video(ui, Vec2::new(avail.x, h));
         self.cut_dialog(ui, c);
     }
 
-    fn header(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        ui.horizontal(|ui| {
-            ui.label(theme::heading("24/7 Recordings"));
-            let total = self.recs.iter().filter(|r| !r.kept).fold(0.0, |seconds, r| {
-                seconds + (self.seg_end(r) - r.start_ms) as f64 / 1000.0
-            });
-            let stored = cv_core::util::format_span_short(total as i64);
-            let history = if c.cfg.recording.rolling_seconds().is_some() {
-                format!("{stored} archived · Replay only is on")
-            } else {
-                format!("{stored} stored · keeps {} h", c.cfg.recording.retention_hours)
-            };
-            ui.label(theme::label_dim(history));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let live = self.written_live.is_some();
-                if ui.add_enabled_ui(live, |ui| theme::accent_button(ui, Some(icon::LIVE), "Go live", theme::LIVE))
-                    .inner.on_hover_text("Jump to the current recording").on_disabled_hover_text("Available while recording full history.").clicked() {
-                    self.stop_preview(c);
-                    self.go_live(c);
-                }
-                ui.add_space(6.0);
-                for (label, span) in [("All", 0i64), ("3d", 72 * HOUR), ("24h", 24 * HOUR), ("6h", 6 * HOUR), ("1h", HOUR), ("10m", 10 * MIN)] {
-                    let span = if span == 0 {
-                        let (a, b) = self.extent();
-                        (b - a).max(HOUR) + HOUR / 2
-                    } else {
-                        span
-                    };
-                    let sel = (self.view_span - span).abs() < MIN;
-                    if ui.add(egui::Button::selectable(sel, label)).clicked() {
-                        let center = self.playhead(c).unwrap_or(self.view_end - self.view_span / 2);
-                        self.view_span = span;
-                        if label == "All" {
-                            self.view_end = self.extent().1 + span / 40;
-                            self.follow_live = false;
-                        } else if self.follow_live {
-                            self.view_end = now_ms() + span / 20;
-                        } else {
-                            self.view_end = center + span / 2;
-                        }
-                    }
-                }
-            });
+    fn files_inspector(&mut self, ui: &mut Ui, c: &mut Ctx) {
+        egui::ScrollArea::vertical().id_salt("rec_side_scroll").auto_shrink(false).show(ui, |ui| {
+            ui.set_max_width(ui.available_width());
+            self.side(ui, c);
         });
+    }
+
+    fn header(&mut self, ui: &mut Ui, c: &mut Ctx) {
+        let total = self.recs.iter().filter(|r| !r.kept).fold(0.0, |seconds, r| {
+            seconds + (self.seg_end(r) - r.start_ms) as f64 / 1000.0
+        });
+        let stored = cv_core::util::format_span_short(total as i64);
+        let history = if c.cfg.recording.rolling_seconds().is_some() {
+            format!("{stored} archived · Replay only is on")
+        } else {
+            format!("{stored} stored · keeps {} h", c.cfg.recording.retention_hours)
+        };
+        let compact = ui.available_width() < 920.0;
+        if compact {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(theme::heading("24/7 Recordings"));
+                ui.label(theme::label_dim(&history));
+            });
+            ui.horizontal_wrapped(|ui| self.header_controls(ui, c, false));
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(theme::heading("24/7 Recordings"));
+                ui.label(theme::label_dim(history));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.header_controls(ui, c, true));
+            });
+        }
+    }
+
+    fn header_controls(&mut self, ui: &mut Ui, c: &mut Ctx, right_aligned: bool) {
+        let live = self.written_live.is_some();
+        if ui.add_enabled_ui(live, |ui| theme::accent_button(ui, Some(icon::LIVE), "Go live", theme::LIVE))
+            .inner
+            .on_hover_text("Jump to the current recording")
+            .on_disabled_hover_text("Available while recording full history.")
+            .clicked()
+        {
+            self.stop_preview(c);
+            self.go_live(c);
+        }
+        ui.add_space(6.0);
+        let ranges = [("10m", 10 * MIN), ("1h", HOUR), ("6h", 6 * HOUR), ("24h", 24 * HOUR), ("3d", 72 * HOUR), ("All", 0)];
+        for i in 0..ranges.len() {
+            let (label, span) = ranges[if right_aligned { ranges.len() - i - 1 } else { i }];
+            let span = if span == 0 {
+                let (a, b) = self.extent();
+                (b - a).max(HOUR) + HOUR / 2
+            } else {
+                span
+            };
+            let selected = (self.view_span - span).abs() < MIN;
+            if ui.add(egui::Button::selectable(selected, label)).clicked() {
+                let center = self.playhead(c).unwrap_or(self.view_end - self.view_span / 2);
+                self.view_span = span;
+                if label == "All" {
+                    self.view_end = self.extent().1 + span / 40;
+                    self.follow_live = false;
+                } else if self.follow_live {
+                    self.view_end = now_ms() + span / 20;
+                } else {
+                    self.view_end = center + span / 2;
+                }
+            }
+        }
     }
 
     fn time_label(&self, c: &Ctx) -> String {
@@ -603,7 +653,7 @@ impl RecordingsView {
         gp.text(Pos2::new(gx, act_band.bottom() + 9.0), Align2::LEFT_CENTER, "what was on screen", FontId::proportional(10.5), theme::TEXT_FAINT);
 
         let p = ui.painter_at(rect.expand2(Vec2::new(lanes::AXIS_INSET, 0.0)));
-        p.rect_filled(Rect::from_x_y_ranges(rect.x_range(), row.y_range()), CornerRadius::same(8), theme::SURFACE);
+        p.rect(Rect::from_x_y_ranges(rect.x_range(), row.y_range()), 5.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
 
         // Ticks.
         let steps = [MIN, 2 * MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR];
@@ -629,7 +679,7 @@ impl RecordingsView {
                 continue;
             }
             let sr = Rect::from_x_y_ranges(x_of(a).max(rect.left())..=x_of(b).min(rect.right()).max(x_of(a) + 1.0), seg_band.y_range());
-            let fill = if r.kept { theme::blend(theme::SURFACE3, c.accent, 0.25) } else { theme::SURFACE3 };
+            let fill = if r.kept { theme::blend(theme::SURFACE3, c.accent, 0.43) } else { theme::BORDER_STRONG };
             p.rect_filled(sr.shrink2(Vec2::new(0.5, 0.0)), CornerRadius::same(4), fill);
             if r.is_live() {
                 p.rect_filled(Rect::from_x_y_ranges(sr.right() - 3.0..=sr.right(), sr.y_range()), CornerRadius::same(1), theme::LIVE);
@@ -669,14 +719,16 @@ impl RecordingsView {
         if let (Some(a), Some(b)) = (self.in_ms, self.out_ms) {
             let (a, b) = (a.min(b), a.max(b));
             let sr = Rect::from_x_y_ranges(x_of(a)..=x_of(b), seg_band.top() - 2.0..=act_band.bottom() + 2.0);
-            p.rect_filled(sr, CornerRadius::same(4), c.accent.gamma_multiply(0.22));
-            p.rect_stroke(sr, CornerRadius::same(4), Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
+            p.rect_filled(sr, CornerRadius::same(3), c.accent.gamma_multiply(0.16));
+            p.rect_stroke(sr, CornerRadius::same(3), Stroke::new(1.5, c.accent), egui::StrokeKind::Inside);
         }
-        for (pt, label) in [(self.in_ms, "IN"), (self.out_ms, "OUT")] {
+        for (pt, label) in [(self.in_ms, "START"), (self.out_ms, "END")] {
             if let Some(t) = pt {
                 let x = x_of(t);
                 p.line_segment([Pos2::new(x, seg_band.top() - 4.0), Pos2::new(x, act_band.bottom() + 4.0)], Stroke::new(2.0, c.accent));
-                p.text(Pos2::new(x, row.bottom() - 2.0), Align2::CENTER_BOTTOM, label, FontId::new(9.0, theme::semibold()), c.accent);
+                let align = if label == "START" { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM };
+                let offset = if label == "START" { -4.0 } else { 4.0 };
+                p.text(Pos2::new(x + offset, row.bottom() - 2.0), align, label, FontId::new(10.0, theme::semibold()), c.accent);
             }
         }
         // Markers.
@@ -784,10 +836,10 @@ impl RecordingsView {
                 self.stop_preview(c);
                 let t = t_of(pos.x);
                 if ui.input(|i| i.modifiers.shift) {
-                    match (self.in_ms, self.out_ms) {
+                    c.report_mark(match (self.in_ms, self.out_ms) {
                         (Some(a), _) if t > a => self.set_end(t),
                         _ => self.set_start(t),
-                    }
+                    });
                 } else {
                     self.play_at(c, t, true);
                 }
@@ -814,7 +866,7 @@ impl RecordingsView {
         });
     }
 
-    fn audio_lanes(&mut self, ui: &mut Ui, c: &mut Ctx) {
+    fn audio_lanes(&mut self, ui: &mut Ui, c: &mut Ctx, height_budget: f32) {
         let bounds = self.extent();
         self.waveform_media.retain(|path, _| self.recs.iter().any(|recording| recording.path == *path));
         let span = self.view_span.max(MIN);
@@ -850,7 +902,7 @@ impl RecordingsView {
         let default_range = self.selection().or_else(|| {
             self.cur.and_then(|i| self.recs.get(i)).map(|r| (r.start_ms, self.seg_end(r)))
         }).map(|(start, end)| (start as f64 / 1000.0, end as f64 / 1000.0)).unwrap_or(edit_bounds);
-        let acts = lanes::lanes(ui, &mut c.player, t0, t1, true, &sources, &self.edits, playhead, &mut self.lane_state, c.accent, self.edit_history.can_undo(), None, edit_bounds, default_range);
+        let acts = lanes::lanes(ui, &mut c.player, t0, t1, true, &sources, &self.edits, playhead, &mut self.lane_state, c.accent, self.edit_history.can_undo(), None, edit_bounds, default_range, height_budget);
         let mut region_saved = false;
         for a in acts {
             match a {
@@ -904,15 +956,15 @@ impl RecordingsView {
     fn cut_bar(&mut self, ui: &mut Ui, c: &mut Ctx) {
         ui.horizontal_wrapped(|ui| {
             let ph = self.playhead(c);
-            let fmt = |t: Option<i64>| t.and_then(|t| Local.timestamp_millis_opt(t).single()).map(|d| d.format("%H:%M:%S").to_string()).unwrap_or("—".into());
+            let fmt = |t: Option<i64>| t.and_then(|t| Local.timestamp_millis_opt(t).single()).map(|d| d.format("%H:%M:%S%.3f").to_string()).unwrap_or("—".into());
             ui.add_enabled_ui(ph.is_some(), |ui| {
                 if ui.button(format!("Set start  {}", fmt(self.in_ms))).on_hover_text("Use the current frame as the start (I)").clicked() {
                     self.stop_preview(c);
-                    if let Some(at)=ph{self.set_start(at);}
+                    if let Some(at) = ph { c.report_mark(self.set_start(at)); }
                 }
                 if ui.button(format!("Set end  {}", fmt(self.out_ms))).on_hover_text("Use the current frame as the end (O)").clicked() {
                     self.stop_preview(c);
-                    if let Some(at)=ph{self.set_end(at);}
+                    if let Some(at) = ph { c.report_mark(self.set_end(at)); }
                 }
             });
             if theme::icon_button(ui, icon::CLOSE, 12.0, "Clear selection").clicked() {
@@ -922,7 +974,7 @@ impl RecordingsView {
             }
             let selection = self.selection();
             if let Some((a, b)) = selection {
-                ui.label(theme::label_dim(format_duration((b - a) as f64 / 1000.0)));
+                ui.label(theme::label_dim(format_duration_precise((b - a) as f64 / 1000.0)));
                 let previewing = self.preview.is_some();
                 if ui.button(if previewing { "Stop preview" } else { "Preview" }).clicked() {
                     if previewing {
@@ -1101,6 +1153,7 @@ impl RecordingsView {
                             self.view_span = (dur * 12 / 10).max(10 * MIN);
                             self.view_end = s.start_ms - (self.view_span - dur) / 2 + self.view_span;
                             self.play_at(c, s.start_ms, true);
+                            self.compact_files = false;
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(theme::small(cv_core::util::format_span_short((s.end_ms - s.start_ms) / 1000)));
@@ -1122,6 +1175,7 @@ impl RecordingsView {
                         if ui.link(dt.format("%a %H:%M:%S").to_string()).clicked() {
                             self.stop_preview(c);
                             self.play_at(c, m.at_ms, true);
+                            self.compact_files = false;
                         }
                         let editing = matches!(&self.rename_marker, Some((id, _)) if *id == m.id);
                         if editing {
@@ -1185,6 +1239,7 @@ impl RecordingsView {
                     if ui.add(egui::Button::selectable(playing, rt)).clicked() {
                         self.frame_recording(r.start_ms);
                         self.play_at(c, r.start_ms, true);
+                        self.compact_files = false;
                     }
                     if r.is_live() {
                         theme::pill(ui, theme::LIVE, "LIVE");
@@ -1286,4 +1341,16 @@ mod tests {
 
     #[allow(dead_code)]
     fn _types(_: Option<Pos2>) {}
+
+    #[test]
+    fn reversed_or_equal_mark_does_not_create_a_short_clip() {
+        let mut view = RecordingsView::default();
+        view.set_end(2_000).unwrap();
+        assert!(view.set_start(3_000).is_err());
+        assert!(view.set_start(2_000).is_err());
+        assert_eq!((view.in_ms, view.out_ms), (None, Some(2_000)));
+        view.set_start(1_800).unwrap();
+        assert!(view.set_end(1_850).is_err());
+        assert_eq!((view.in_ms, view.out_ms), (Some(1_800), Some(2_000)));
+    }
 }

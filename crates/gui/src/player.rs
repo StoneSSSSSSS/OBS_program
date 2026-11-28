@@ -290,7 +290,7 @@ impl Player {
     }
     pub fn video(&mut self, ui: &mut Ui, size: Vec2) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-        ui.painter().rect_filled(rect, CornerRadius::same(8), Color32::BLACK);
+        ui.painter().rect_filled(rect, CornerRadius::same(5), Color32::BLACK);
         let state = self.native.state();
         if self.path.is_some() {
             if let Some(frame) = self.native.frame() {
@@ -322,8 +322,13 @@ impl Player {
             None
         };
         if let Some(msg) = message {
+            let center = rect.center();
             ui.painter()
-                .text(rect.center(), Align2::CENTER_CENTER, msg, FontId::proportional(14.0), Color32::WHITE);
+                .text(center, Align2::CENTER_CENTER, msg, FontId::new(15.0, theme::semibold()), theme::TEXT);
+        }
+        if !self.fullscreen {
+            let border = if response.has_focus() { theme::TEXT } else { theme::BORDER_STRONG };
+            ui.painter().rect_stroke(rect, 5.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
         }
         if response.double_clicked() {
             self.fullscreen = !self.fullscreen;
@@ -331,7 +336,7 @@ impl Player {
         } else if response.clicked() {
             self.toggle_pause();
         }
-        response
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
     /// Keyboard shortcuts (only when no text field has focus).
     pub fn shortcuts(&mut self, ui: &Ui, cfg: &PlayerConfig) -> ShortcutHits {
@@ -406,7 +411,8 @@ impl Player {
     /// Play/pause, skip buttons, time, speed, volume, mixer toggle.
     pub fn transport(&mut self, ui: &mut Ui, time_label: &str, cfg: &PlayerConfig) {
         let st = self.state();
-        ui.horizontal(|ui| {
+        let compact = ui.available_width() < 770.0;
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if theme::icon_button(ui, icon::REWIND, 16.0, &format!("Back {}s (Shift+←)", cfg.seek_large_secs)).clicked() {
                 self.seek_relative(-(cfg.seek_large_secs as f64));
@@ -427,56 +433,67 @@ impl Player {
             ui.add_space(8.0);
             ui.label(RichText::new(time_label).monospace().color(theme::TEXT_DIM));
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let fs_glyph = if self.fullscreen { icon::EXIT_FULLSCREEN } else { icon::FULLSCREEN };
-                if theme::icon_button(ui, fs_glyph, 15.0, "Fullscreen (F)").clicked() {
-                    self.fullscreen = !self.fullscreen;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-                }
-                let mixer_tip = if self.show_mixer {
-                    "Hide audio tracks".to_string()
-                } else {
-                    format!("Show audio tracks ({})", self.track_count.max(1))
-                };
-                let mresp = theme::icon_button(ui, icon::MIXER, 15.0, &mixer_tip);
-                if self.show_mixer {
-                    ui.painter()
-                        .rect_stroke(mresp.rect, CornerRadius::same(20), Stroke::new(1.0, theme::TEXT_DIM), egui::StrokeKind::Inside);
-                }
-                if mresp.clicked() {
-                    self.show_mixer = !self.show_mixer;
-                }
-                // Speed
-                let speed = st.speed.max(0.01);
-                egui::ComboBox::from_id_salt("speed")
-                    .width(64.0)
-                    .selected_text(format!("{}x", trim_float(speed)))
-                    .show_ui(ui, |ui| {
-                        for s in self.speeds {
-                            if ui.selectable_label((speed - s).abs() < 0.01, format!("{}x", trim_float(s))).clicked() {
-                                {
-                                    self.speed = s;
-                                    self.native.set_speed(s);
-                                }
-                            }
+            if !compact {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.transport_options(ui, st.speed);
+                });
+            }
+        });
+        if compact {
+            ui.horizontal_wrapped(|ui| self.transport_options(ui, st.speed));
+        }
+    }
+
+    fn transport_options(&mut self, ui: &mut Ui, speed: f64) {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let fs_glyph = if self.fullscreen { icon::EXIT_FULLSCREEN } else { icon::FULLSCREEN };
+        if theme::icon_button(ui, fs_glyph, 15.0, "Fullscreen (F)").clicked() {
+            self.fullscreen = !self.fullscreen;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        let mixer_tip = if self.show_mixer {
+            "Hide audio tracks".to_string()
+        } else {
+            format!("Show audio tracks ({})", self.track_count.max(1))
+        };
+        let mresp = theme::icon_button(ui, icon::MIXER, 15.0, &mixer_tip);
+        if self.show_mixer {
+            ui.painter()
+                .rect_stroke(mresp.rect, CornerRadius::same(20), Stroke::new(1.0, theme::TEXT_DIM), egui::StrokeKind::Inside);
+        }
+        if mresp.clicked() {
+            self.show_mixer = !self.show_mixer;
+        }
+        // Speed
+        let speed = speed.max(0.01);
+        egui::ComboBox::from_id_salt("speed")
+            .width(64.0)
+            .selected_text(format!("{}x", trim_float(speed)))
+            .show_ui(ui, |ui| {
+                for s in self.speeds {
+                    if ui.selectable_label((speed - s).abs() < 0.01, format!("{}x", trim_float(s))).clicked() {
+                        {
+                            self.speed = s;
+                            self.native.set_speed(s);
                         }
-                    });
-                // Volume
-                let mut vol = self.volume;
-                let r = ui.add(egui::Slider::new(&mut vol, 0.0..=1.5).show_value(false).trailing_fill(true));
-                if r.changed() {
-                    self.volume = vol;
-                    self.muted = false;
-                    self.apply_volume();
-                }
-                let vglyph = if self.muted || self.volume == 0.0 { icon::MUTE } else { icon::VOLUME };
-                if theme::icon_button(ui, vglyph, 15.0, "Mute (M)").clicked() {
-                    self.muted = !self.muted;
-                    self.apply_volume();
+                    }
                 }
             });
-        });
+        // Volume
+        let slider_width = ui.spacing().slider_width.min(104.0);
+        ui.spacing_mut().slider_width = slider_width;
+        let mut vol = self.volume;
+        let r = ui.add(egui::Slider::new(&mut vol, 0.0..=1.5).show_value(false).trailing_fill(true));
+        if r.changed() {
+            self.volume = vol;
+            self.muted = false;
+            self.apply_volume();
+        }
+        let vglyph = if self.muted || self.volume == 0.0 { icon::MUTE } else { icon::VOLUME };
+        if theme::icon_button(ui, vglyph, 15.0, "Mute (M)").clicked() {
+            self.muted = !self.muted;
+            self.apply_volume();
+        }
     }
 }
 

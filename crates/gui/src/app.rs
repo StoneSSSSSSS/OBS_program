@@ -41,6 +41,11 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    pub fn report_mark(&mut self, result: Result<(), &'static str>) {
+        if let Err(message) = result {
+            self.toast("info", message);
+        }
+    }
     pub fn toast(&mut self, level: &str, text: impl Into<String>) {
         self.toasts.push(Toast { level: level.into(), text: text.into(), at: Instant::now() });
         if self.toasts.len() > 5 {
@@ -185,18 +190,21 @@ impl App {
         self.page = page;
     }
 
-    fn sidebar(&mut self, ui: &mut Ui) {
+    fn sidebar(&mut self, ui: &mut Ui, icon_only: bool) {
         ui.add_space(18.0);
         ui.horizontal(|ui| {
-            ui.add_space(18.0);
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-            ui.painter().rect_filled(r, CornerRadius::same(8), theme::SURFACE3);
-            ui.painter().circle_stroke(r.center(), 8.0, Stroke::new(2.4, theme::TEXT));
-            ui.painter().circle_filled(r.center(), 3.6, self.c.accent);
-            ui.add_space(4.0);
-            ui.label(RichText::new("ClipVault").font(FontId::new(18.0, theme::bold())).color(theme::TEXT));
+            ui.add_space(if icon_only { 14.0 } else { 16.0 });
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+            ui.painter().rect(r, 6.0, theme::SURFACE2, Stroke::new(1.0, theme::BORDER_STRONG), egui::StrokeKind::Inside);
+            ui.painter().circle_stroke(r.center(), 8.5, Stroke::new(1.75, theme::TEXT));
+            ui.painter().circle_filled(r.center(), 3.3, self.c.accent);
+            if !icon_only {
+                ui.label(RichText::new("ClipVault").font(FontId::new(20.0, theme::bold())).color(theme::TEXT));
+            }
         });
-        ui.add_space(24.0);
+        ui.add_space(15.0);
+        ui.separator();
+        ui.add_space(10.0);
         let items = [
             (Page::Home, icon::HOME, "Home"),
             (Page::Recordings, icon::HISTORY, "24/7 Recordings"),
@@ -206,29 +214,32 @@ impl App {
         for (page, glyph, label) in items {
             let selected = self.page == page;
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
             let rect = rect.shrink2(Vec2::new(10.0, 2.0));
             let bg = if selected {
-                theme::SURFACE3
+                self.c.accent
             } else if resp.hovered() {
-                theme::SURFACE2
+                theme::SURFACE3
             } else {
                 Color32::TRANSPARENT
             };
-            ui.painter().rect_filled(rect, CornerRadius::same(9), bg);
-            if selected {
-                let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(0.0, 10.0), egui::vec2(3.0, rect.height() - 20.0));
-                ui.painter().rect_filled(bar, CornerRadius::same(2), self.c.accent);
+            ui.painter().rect_filled(rect, 5.0, bg);
+            if resp.has_focus() {
+                ui.painter().rect_stroke(rect.expand(2.0), 7.0, Stroke::new(1.5, theme::TEXT), egui::StrokeKind::Outside);
             }
-            let fg = if selected { theme::TEXT } else { theme::TEXT_DIM };
-            ui.painter().text(rect.left_center() + egui::vec2(20.0, 0.0), Align2::CENTER_CENTER, glyph, FontId::new(15.0, theme::icons_family()), fg);
-            ui.painter().text(
-                rect.left_center() + egui::vec2(40.0, 0.0),
-                Align2::LEFT_CENTER,
-                label,
-                FontId::new(14.0, if selected { theme::semibold() } else { egui::FontFamily::Proportional }),
-                fg,
-            );
-            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            let fg = if selected { theme::on_fill(bg) } else { theme::TEXT_DIM };
+            let glyph_pos = if icon_only { rect.center() } else { rect.left_center() + egui::vec2(20.0, 0.0) };
+            ui.painter().text(glyph_pos, Align2::CENTER_CENTER, glyph, FontId::new(15.0, theme::icons_family()), fg);
+            if !icon_only {
+                ui.painter().text(
+                    rect.left_center() + egui::vec2(40.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::new(14.0, if selected { theme::semibold() } else { egui::FontFamily::Proportional }),
+                    fg,
+                );
+            }
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label).clicked() {
                 self.navigate(page);
             }
         }
@@ -238,10 +249,18 @@ impl App {
             ui.add_space(16.0);
             let status = self.c.service.status();
             let connected = self.c.service.connected();
+            let enabled = connected && status.as_ref().is_some_and(|s| s.replay.active);
+            if icon_only {
+                if ui.add_enabled_ui(enabled, |ui| theme::icon_button(ui, icon::RECORD, 18.0, "Save replay"))
+                    .inner.on_disabled_hover_text("Available while the replay buffer is recording").clicked()
+                {
+                    self.c.service.fire(Request::SaveClip { short: false });
+                }
+                return;
+            }
             let w = ui.available_width() - 28.0;
             ui.allocate_ui(Vec2::new(w, 40.0), |ui| {
                 ui.set_width(w);
-                let enabled = connected && status.as_ref().map(|s| s.replay.active).unwrap_or(false);
                 ui.add_enabled_ui(enabled, |ui| {
                     if theme::accent_button(ui, Some(icon::RECORD), "Save replay", self.c.accent)
                         .on_disabled_hover_text("Available while the replay buffer is recording")
@@ -271,11 +290,11 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 for t in self.c.toasts.iter().rev() {
-                    let color = match t.level.as_str() {
-                        "error" => theme::DANGER,
-                        "warning" => theme::WARNING,
-                        "success" => theme::SUCCESS,
-                        _ => self.c.accent,
+                    let (glyph, color) = match t.level.as_str() {
+                        "error" => (icon::CLOSE, theme::DANGER),
+                        "warning" => (icon::WARNING, theme::WARNING),
+                        "success" => (icon::CHECK, theme::SUCCESS),
+                        _ => (icon::INFO, self.c.accent),
                     };
                     egui::Frame::NONE
                         .fill(theme::SURFACE2)
@@ -286,8 +305,7 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_max_width(380.0);
                             ui.horizontal(|ui| {
-                                let (r, _) = ui.allocate_exact_size(Vec2::new(3.0, 18.0), Sense::hover());
-                                ui.painter().rect_filled(r, CornerRadius::same(2), color);
+                                ui.label(theme::icon_text(glyph, 15.0).color(color));
                                 ui.label(RichText::new(&t.text).color(theme::TEXT));
                             });
                         });
@@ -411,14 +429,16 @@ impl eframe::App for App {
         }
 
         let fullscreen = self.c.player.fullscreen && matches!(self.page, Page::Recordings | Page::Clips);
+        let compact = ui.available_width() < 1120.0;
+        let icon_only = ui.available_width() < 840.0;
         if !fullscreen {
             egui::Panel::left("nav")
-                .exact_size(232.0)
+                .exact_size(if icon_only { 62.0 } else if compact { 174.0 } else { 196.0 })
                 .resizable(false)
                 .frame(egui::Frame::NONE.fill(theme::SIDEBAR).stroke(Stroke::new(1.0, theme::BORDER)))
-                .show(ui, |ui| self.sidebar(ui));
+                .show(ui, |ui| self.sidebar(ui, icon_only));
         }
-        let margin = if fullscreen { Margin::ZERO } else { Margin::symmetric(28, 22) };
+        let margin = if fullscreen { Margin::ZERO } else if compact { Margin::symmetric(18, 14) } else { Margin::symmetric(24, 20) };
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::BG).inner_margin(margin))
             .show(ui, |ui| match self.page {

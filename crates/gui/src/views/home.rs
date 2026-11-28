@@ -43,7 +43,7 @@ impl HomeView {
         let status = c.service.status();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(theme::heading("Overview"));
+                ui.label(theme::heading("Home"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let live = status.as_ref().is_some_and(|s| {
                         s.recording.active && s.recording.written_until_ms > s.recording.started_ms
@@ -80,18 +80,21 @@ impl HomeView {
                 warning_banner(ui, "Connecting to the ClipVault service…");
             }
 
-            let cols = if ui.available_width() > 1100.0 { 4 } else { 2 };
-            let gap = 14.0;
+            let gap = 12.0;
+            self.recent_footage(ui, c, status.as_ref());
+            ui.add_space(gap);
+
+            let cols = if ui.available_width() >= 960.0 { 4 } else { 2 };
             let w = (ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32;
             let cards: [&dyn Fn(&mut Ui, &mut Ctx, Option<&Status>, f64); 4] = [&recording_card, &replay_card, &mic_card, &storage_card];
             for row in cards.chunks(cols) {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     for card in row {
-                        ui.allocate_ui_with_layout(Vec2::new(w, 170.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                            theme::card().show(ui, |ui| {
-                                ui.set_width(w - 34.0);
-                                ui.set_min_height(140.0);
+                        ui.allocate_ui_with_layout(Vec2::new(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            theme::card().inner_margin(egui::Margin::same(13)).show(ui, |ui| {
+                                ui.set_width(w - 28.0);
+                                ui.set_min_height(130.0);
                                 ui.vertical(|ui| card(ui, c, status.as_ref(), self.footage_s));
                             });
                         });
@@ -100,66 +103,23 @@ impl HomeView {
                 ui.add_space(gap);
             }
 
-            self.recent_footage(ui, c, status.as_ref());
-            ui.add_space(gap);
-            // Live audio + recent clips side by side.
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                let left_w = (ui.available_width() * 0.34).max(300.0);
-                ui.allocate_ui_with_layout(Vec2::new(left_w, 300.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    theme::card().show(ui, |ui| {
-                        ui.set_width(left_w - 34.0);
-                        ui.label(theme::title("Live audio"));
-                        ui.label(theme::small("Sound reaching the recorder"));
-                        ui.add_space(8.0);
-                        let meters = c.service.shared.lock().meters.clone();
-                        if meters.is_empty() {
-                            ui.label(theme::label_dim("No audio levels yet."));
-                        }
-                        let mut names: Vec<_> = meters.keys().cloned().collect();
-                        names.sort_by_key(|n| order_key(n));
-                        egui::Grid::new("meters").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
-                            for n in names {
-                                ui.label(RichText::new(&n).color(theme::TEXT_DIM));
-                                theme::meter(ui, meters[&n], (left_w - 190.0).max(80.0));
-                                ui.end_row();
-                            }
-                        });
+            if ui.available_width() >= 660.0 {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    let audio_w = (ui.available_width() * 0.27).clamp(230.0, 340.0);
+                    let clips_w = ui.available_width() - audio_w - gap;
+                    ui.allocate_ui_with_layout(Vec2::new(clips_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        self.recent_clips(ui, c);
+                    });
+                    ui.allocate_ui_with_layout(Vec2::new(audio_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        live_audio(ui, c);
                     });
                 });
-                let right_w = ui.available_width();
-                ui.allocate_ui_with_layout(Vec2::new(right_w, 300.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    theme::card().show(ui, |ui| {
-                        ui.set_width(right_w - 34.0);
-                        ui.horizontal(|ui| {
-                            ui.label(theme::title("Recent clips"));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.link("View all").clicked() {
-                                    c.goto = Some(Page::Clips);
-                                }
-                            });
-                        });
-                        ui.add_space(6.0);
-                        if self.recent.is_empty() {
-                            ui.label(theme::label_dim(format!(
-                                "No clips yet. Press {} in game to save one.",
-                                c.cfg.hotkeys.save_clip
-                            )));
-                        }
-                        let tw = 200.0;
-                        egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for clip in self.recent.clone() {
-                                    if recent_tile(ui, c, &clip, tw).clicked() {
-                                        crate::views::clips::request_open(clip.id);
-                                        c.goto = Some(Page::Clips);
-                                    }
-                                }
-                            });
-                        });
-                    });
-                });
-            });
+            } else {
+                self.recent_clips(ui, c);
+                ui.add_space(gap);
+                live_audio(ui, c);
+            }
             ui.add_space(gap);
 
             theme::card().show(ui, |ui| {
@@ -196,14 +156,45 @@ impl HomeView {
 }
 
 impl HomeView {
+    fn recent_clips(&self, ui: &mut Ui, c: &mut Ctx) {
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(theme::title("Recent clips"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.link("View all clips").clicked() {
+                        c.goto = Some(Page::Clips);
+                    }
+                });
+            });
+            if self.recent.is_empty() {
+                ui.label(theme::label_dim(format!("No clips yet. Press {} in game to save one.", c.cfg.hotkeys.save_clip)));
+                return;
+            }
+            egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for clip in &self.recent {
+                        if recent_tile(ui, c, clip, 200.0).clicked() {
+                            crate::views::clips::request_open(clip.id);
+                            c.goto = Some(Page::Clips);
+                        }
+                    }
+                });
+            });
+        });
+    }
+
     fn recent_footage(&self, ui: &mut Ui, c: &mut Ctx, status: Option<&Status>) {
         let mut spans: Vec<_> = self.recordings.iter().filter(|r| !r.is_live()).map(|r| (r.start_ms, r.end_ms())).collect();
-        if let Some(s) = status.filter(|s| s.recording.active) {
+        if let Some(s) = status.filter(|s| c.cfg.recording.rolling_seconds().is_none() && s.recording.active) {
             spans.push((s.recording.started_ms, s.recording.written_until_ms));
         }
         spans.retain(|(a, b)| b > a);
         spans.sort_unstable();
         let latest_recording = spans.last().copied();
+        let finalized = self.recordings.iter().find(|r| {
+            !r.is_live() && latest_recording == Some((r.start_ms, r.end_ms()))
+        });
         let mut joined: Vec<(i64, i64)> = Vec::new();
         for (start, end) in spans {
             if let Some(last) = joined.last_mut().filter(|s| start <= s.1 + 100) {
@@ -214,84 +205,133 @@ impl HomeView {
         }
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(theme::title("Recent footage"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let rolling = status.filter(|s| s.replay.rolling_minutes.is_some());
-                    let available = rolling.map_or_else(
-                        || joined.last().is_some_and(|(a, b)| b - a >= 30_000),
-                        |s| s.replay.active && s.replay.available_seconds >= 30,
-                    );
-                    let save = ui.add_enabled(available && c.service.connected(), egui::Button::new("Clip last 30 seconds"));
-                    if save
-                        .on_disabled_hover_text("Requires 30 seconds of continuous footage and the recorder service.")
-                        .clicked()
-                    {
-                        if rolling.is_some() {
-                            c.service.fire(Request::SaveRecentRolling { seconds: 30 });
-                        } else if let Some(&(_, end)) = joined.last() {
-                            c.service.fire(Request::CutRange {
-                                from_ms: end - 30_000,
-                                to_ms: end,
-                                title: String::new(),
-                                game_id: None,
-                                category_ids: vec![],
-                                mix: None,
-                                audio_edits: vec![],
-                            });
-                        }
-                    }
-                    if let Some((start, end)) = latest_recording {
-                        let duration = format_duration((end - start) as f64 / 1000.0);
-                        if ui.button(format!("Open latest recording · {duration}")).clicked() {
-                            crate::views::recordings::request_play_at(start);
+            ui.label(theme::title("Recent footage"));
+            ui.horizontal_top(|ui| {
+                if let Some(recording) = finalized.filter(|_| ui.available_width() >= 760.0) {
+                    if let Some(texture) = c.thumbs.recording(recording) {
+                        let size = Vec2::new(216.0, 121.5);
+                        let (frame, response) = ui.allocate_exact_size(size, Sense::click());
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "Open latest recording preview"));
+                        ui.painter().rect_filled(frame, 5.0, theme::SIDEBAR);
+                        let image_size = texture.size_vec2();
+                        let fit = (size.x / image_size.x).min(size.y / image_size.y);
+                        let image = egui::Rect::from_center_size(frame.center(), image_size * fit);
+                        egui::Image::new(&texture).corner_radius(egui::CornerRadius::same(5)).paint_at(ui, image);
+                        ui.painter().rect_stroke(frame, 5.0, Stroke::new(1.0, if response.hovered() || response.has_focus() { theme::TEXT } else { theme::BORDER_STRONG }), egui::StrokeKind::Inside);
+                        if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            crate::views::recordings::request_play_at(recording.start_ms);
                             c.goto = Some(Page::Recordings);
                         }
+                        ui.add_space(8.0);
                     }
+                }
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    self.footage_controls(ui, c, status, latest_recording, &joined);
                 });
             });
-            if let Some(minutes) = status.and_then(|s| s.replay.rolling_minutes) {
-                ui.label(theme::label_dim(format!("Replay only keeps the last {minutes} min temporarily. Open Clips to edit a saved replay.")));
-            }
-            let Some(&(_, end)) = joined.last() else {
-                if status.is_none_or(|s| s.replay.rolling_minutes.is_none()) {
-                    ui.label(theme::label_dim("Recorded footage will appear here."));
+        });
+    }
+
+    fn footage_controls(&self, ui: &mut Ui, c: &mut Ctx, status: Option<&Status>, latest_recording: Option<(i64, i64)>, joined: &[(i64, i64)]) {
+        let rolling_minutes = c.cfg.recording.rolling_seconds().map(|seconds| seconds / 60);
+        ui.horizontal_wrapped(|ui| {
+            if let Some((start, end)) = latest_recording {
+                let duration = format_duration((end - start) as f64 / 1000.0);
+                if theme::primary_button(ui, Some(icon::PLAY), &format!("Open latest recording · {duration}")).clicked() {
+                    crate::views::recordings::request_play_at(start);
+                    c.goto = Some(Page::Recordings);
                 }
-                return;
-            };
-            let begin = end - 3_600_000;
-            let label = |ms| {
-                chrono::DateTime::from_timestamp_millis(ms)
-                    .unwrap_or_default()
-                    .with_timezone(&chrono::Local)
-                    .format("%b %d  %H:%M")
-                    .to_string()
-            };
-            ui.label(theme::small(format!(
-                "{}  –  {}    ·    Select a recorded section to play",
-                label(begin),
-                label(end)
-            )));
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
-            ui.painter().rect_filled(rect, 4.0, theme::SURFACE3);
-            let x = |t: i64| rect.left() + ((t - begin) as f32 / 3_600_000.0).clamp(0.0, 1.0) * rect.width();
-            for &(a, b) in joined.iter().filter(|(_, b)| *b > begin) {
-                ui.painter()
-                    .rect_filled(egui::Rect::from_x_y_ranges(x(a)..=x(b), rect.y_range()), 3.0, c.accent);
             }
-            if response.clicked() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let t = begin + ((pos.x - rect.left()) / rect.width() * 3_600_000.0) as i64;
-                    if joined.iter().any(|&(a, b)| a <= t && t <= b) {
-                        crate::views::recordings::request_play_at(t);
-                        c.goto = Some(Page::Recordings);
-                    } else {
-                        c.toast("info", "There is no recording at that time.");
+            {
+                let available = if rolling_minutes.is_some() {
+                    status.is_some_and(|s| s.replay.rolling_minutes == rolling_minutes
+                        && s.replay.active && s.replay.available_seconds >= 30)
+                } else {
+                    joined.last().is_some_and(|(a, b)| b - a >= 30_000)
+                };
+                let save = ui.add_enabled(available && c.service.connected(), egui::Button::new("Clip last 30 seconds"));
+                if save
+                    .on_disabled_hover_text("Requires 30 seconds of continuous footage and the recorder service.")
+                    .clicked()
+                {
+                    if rolling_minutes.is_some() {
+                        c.service.fire(Request::SaveRecentRolling { seconds: 30 });
+                    } else if let Some(&(_, end)) = joined.last() {
+                        c.service.fire(Request::CutRange {
+                            from_ms: end - 30_000,
+                            to_ms: end,
+                            title: String::new(),
+                            game_id: None,
+                            category_ids: vec![],
+                            mix: None,
+                            audio_edits: vec![],
+                        });
                     }
+                }
+                if latest_recording.is_none() && ui.link("Recording settings").clicked() {
+                    c.open_recording_settings = true;
                 }
             }
         });
+        if let Some(minutes) = rolling_minutes {
+            ui.label(theme::label_dim(format!("Replay only keeps the last {minutes} min temporarily. Open Clips to edit a saved replay.")));
+        }
+        let Some(&(_, end)) = joined.last() else {
+            if rolling_minutes.is_none() {
+                ui.label(theme::label_dim("Recorded footage will appear here."));
+            }
+            return;
+        };
+        let begin = end - 3_600_000;
+        let label = |ms| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .unwrap_or_default()
+                .with_timezone(&chrono::Local)
+                .format("%b %d  %H:%M")
+                .to_string()
+        };
+        ui.label(theme::small(format!(
+            "{}  –  {}    ·    Select a recorded section to play",
+            label(begin),
+            label(end)
+        )));
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+        ui.painter().rect(rect, 4.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER_STRONG), egui::StrokeKind::Inside);
+        let x = |t: i64| rect.left() + ((t - begin) as f32 / 3_600_000.0).clamp(0.0, 1.0) * rect.width();
+        for &(a, b) in joined.iter().filter(|(_, b)| *b > begin) {
+            ui.painter()
+                .rect_filled(egui::Rect::from_x_y_ranges(x(a)..=x(b), rect.shrink2(Vec2::new(0.0, 5.0)).y_range()), 2.0, c.accent);
+        }
+        if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let t = begin + ((pos.x - rect.left()) / rect.width() * 3_600_000.0) as i64;
+                if joined.iter().any(|&(a, b)| a <= t && t <= b) {
+                    crate::views::recordings::request_play_at(t);
+                    c.goto = Some(Page::Recordings);
+                } else {
+                    c.toast("info", "There is no recording at that time.");
+                }
+            }
+        }
     }
+}
+
+fn live_audio(ui: &mut Ui, c: &mut Ctx) {
+    theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(theme::title("Live audio"));
+        let meters = c.service.shared.lock().meters.clone();
+        if meters.is_empty() {
+            ui.label(theme::label_dim("No audio levels yet."));
+        }
+        let mut names: Vec<_> = meters.keys().collect();
+        names.sort_by_key(|name| order_key(name));
+        for name in names {
+            ui.label(theme::small(name));
+            theme::meter(ui, meters[name], ui.available_width());
+        }
+    });
 }
 
 fn order_key(name: &str) -> (u8, String) {
@@ -314,9 +354,9 @@ fn order_key(name: &str) -> (u8, String) {
 
 fn warning_banner(ui: &mut Ui, text: &str) {
     egui::Frame::NONE
-        .fill(theme::WARNING.gamma_multiply(0.10))
-        .stroke(Stroke::new(1.0, theme::WARNING.gamma_multiply(0.45)))
-        .corner_radius(CornerRadius::same(10))
+        .fill(theme::SURFACE2)
+        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+        .corner_radius(CornerRadius::same(5))
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -342,16 +382,16 @@ fn card_header(ui: &mut Ui, glyph: &str, title: &str) {
 
 fn recording_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, footage_s: f64) {
     card_header(ui, icon::HISTORY, "24/7 recording");
-    let Some(s) = s else {
-        big(ui, "—", theme::TEXT_FAINT);
-        return;
-    };
-    if let Some(minutes)=s.replay.rolling_minutes {
+    if let Some(minutes) = c.cfg.recording.rolling_seconds().map(|seconds| seconds / 60) {
         big(ui,"Replay only",theme::TEXT);
         ui.label(theme::label_dim(format!("Keep the last {minutes} min. Saved clips stay in your library.")));
         if ui.button("Change recording mode").clicked() { c.open_recording_settings=true; }
         return;
     }
+    let Some(s) = s else {
+        big(ui, "—", theme::TEXT_FAINT);
+        return;
+    };
     if s.recording.active {
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
@@ -475,13 +515,14 @@ fn storage_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, _: f64) {
 fn recent_tile(ui: &mut Ui, c: &mut Ctx, clip: &Clip, w: f32) -> egui::Response {
     let h = w * 9.0 / 16.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h + 42.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), &clip.title));
     let img = egui::Rect::from_min_size(rect.min, Vec2::new(w, h));
     let p = ui.painter();
     p.rect_filled(img, CornerRadius::same(10), theme::SURFACE2);
     if let Some(tex) = c.thumbs.get(&clip.thumb) {
         egui::Image::new(&tex).corner_radius(CornerRadius::same(10)).paint_at(ui, img);
     }
-    if resp.hovered() {
+    if resp.hovered() || resp.has_focus() {
         ui.painter()
             .rect_stroke(img, CornerRadius::same(10), Stroke::new(1.5, theme::TEXT_DIM), egui::StrokeKind::Inside);
     }
@@ -500,5 +541,8 @@ fn recent_tile(ui: &mut Ui, c: &mut Ctx, clip: &Clip, w: f32) -> egui::Response 
         egui::FontId::proportional(12.0),
         theme::TEXT_FAINT,
     );
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_ui(|ui| {
+        ui.set_max_width(420.0);
+        ui.add(egui::Label::new(&clip.title).wrap());
+    })
 }

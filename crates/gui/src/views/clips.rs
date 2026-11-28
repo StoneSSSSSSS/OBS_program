@@ -58,6 +58,7 @@ struct Detail {
     edit_history: lanes::EditHistory,
     timeline: timeline::ClipTimeline,
     preview: Option<RangePreview>,
+    compact_inspector: bool,
     game_search: String,
     /// Where this clip was when the player was last showing it.
     resume_pos: f64,
@@ -465,7 +466,9 @@ impl ClipsView {
     fn delete(&mut self, c: &mut Ctx, ids: Vec<i64>) {
         if let Some(v) = c.request(Request::DeleteClips { clip_ids: ids }) {
             let n = v["deleted"].as_u64().unwrap_or(0);
-            let where_ = if c.cfg.clips.delete_to_recycle_bin { " (moved to the Recycle Bin)" } else { "" };
+            let where_ = if !c.cfg.clips.delete_to_recycle_bin { "" }
+                else if cv_core::paths::uses_local_storage() { " (moved to project Trash)" }
+                else { " (moved to the Recycle Bin)" };
             c.toast("info", format!("Deleted {n} clip{}{where_}", if n == 1 { "" } else { "s" }));
         }
         self.selected.clear();
@@ -482,7 +485,10 @@ impl ClipsView {
         egui::Modal::new(egui::Id::unique("bulk_delete")).show(ui.ctx(), |ui| {
             ui.set_width(360.0);
             ui.label(theme::title(format!("Delete {n} clip{}?", if n == 1 { "" } else { "s" })));
-            ui.label(theme::label_dim(if c.cfg.clips.delete_to_recycle_bin { "They'll go to the Recycle Bin." } else { "This can't be undone." }));
+            let destination = if !c.cfg.clips.delete_to_recycle_bin { "This permanently deletes the selected files." }
+                else if cv_core::paths::uses_local_storage() { "The files will move to the trash folder in this project’s profile." }
+                else { "The files will move to the Recycle Bin." };
+            ui.label(theme::label_dim(destination));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if theme::accent_button(ui, Some(icon::DELETE), "Delete", theme::DANGER).clicked() {
@@ -553,12 +559,12 @@ impl ClipsView {
             ui.painter().rect_filled(cb, CornerRadius::same(6), if selected { c.accent } else { Color32::from_black_alpha(150) });
             ui.painter().rect_stroke(cb, CornerRadius::same(6), Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
             if selected {
-                ui.painter().text(cb.center(), Align2::CENTER_CENTER, icon::CHECK, FontId::new(12.0, theme::icons_family()), Color32::WHITE);
+                ui.painter().text(cb.center(), Align2::CENTER_CENTER, icon::CHECK, FontId::new(12.0, theme::icons_family()), theme::on_fill(c.accent));
             }
         }
         let title_pos = egui::pos2(rect.left() + 2.0, img.bottom() + 10.0);
         let max_chars = ((w / 7.5) as usize).max(10);
-        ui.painter().text(title_pos, Align2::LEFT_TOP, truncate(&clip.title, max_chars), FontId::new(14.0, theme::semibold()), theme::TEXT);
+        ui.painter_at(rect).text(title_pos, Align2::LEFT_TOP, truncate(&clip.title, max_chars), FontId::new(14.0, theme::semibold()), theme::TEXT);
         let meta = format!(
             "{} · {}",
             clip.game_name.clone().unwrap_or_else(|| "Unknown".into()),
@@ -572,7 +578,11 @@ impl ClipsView {
             action = if cb.contains(pos) || ctrl || !self.selected.is_empty() { Some(CardAction::Toggle) } else { Some(CardAction::Open) };
             self.highlight = None;
         }
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_ui(|ui| {
+                ui.set_max_width(420.0);
+                ui.add(egui::Label::new(&clip.title).wrap());
+            });
         resp.context_menu(|ui| {
             if ui.button("Open").clicked() {
                 action = Some(CardAction::Open);
@@ -633,11 +643,11 @@ impl ClipsView {
         let duration = self.media_duration(c, &clip);
         if hits.mark_in {
             self.stop_preview(c);
-            self.mark_in(st.time_pos, duration);
+            c.report_mark(self.mark_in(st.time_pos, duration));
         }
         if hits.mark_out {
             self.stop_preview(c);
-            self.mark_out(st.time_pos, duration);
+            c.report_mark(self.mark_out(st.time_pos, duration));
         }
         if let Some(preview) = &mut self.detail.preview {
             match preview.progress(st.loaded.then_some(st.time_pos), st.paused, st.eof) {
@@ -665,8 +675,12 @@ impl ClipsView {
                 egui::TextEdit::singleline(&mut self.detail.title_edit)
                     .font(FontId::new(20.0, theme::bold()))
                     .frame(egui::Frame::NONE)
-                    .desired_width(ui.available_width() - 260.0),
-            );
+                    .desired_width((ui.available_width() - 50.0).max(1.0))
+                    .clip_text(true),
+            ).on_hover_ui(|ui| {
+                ui.set_max_width(420.0);
+                ui.add(egui::Label::new(&clip.title).wrap());
+            });
             if r.lost_focus() && self.detail.title_edit.trim() != clip.title && !self.detail.title_edit.trim().is_empty() {
                 let title = self.detail.title_edit.trim().to_string();
                 if c.request(Request::RenameClip { clip_id: clip.id, title }).is_some() {
@@ -691,30 +705,49 @@ impl ClipsView {
             return;
         }
 
-        let side_w = 340.0;
-        egui::Panel::right("clip_side")
-            .exact_size(side_w)
-            .resizable(false)
-            .frame(egui::Frame::NONE.inner_margin(Margin { left: 18, right: 0, top: 0, bottom: 0 }))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("clip_side_scroll").auto_shrink(false).show(ui, |ui| self.side_ui(ui, c, &clip));
+        let compact = ui.available_width() < 840.0;
+        if compact {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.detail.compact_inspector, false, "Player");
+                ui.selectable_value(&mut self.detail.compact_inspector, true, "Trim & export");
             });
+            ui.add_space(6.0);
+            if self.detail.compact_inspector {
+                self.clip_inspector(ui, c, &clip);
+                self.persist_audio(c, &clip);
+                return;
+            }
+        } else {
+            let side_w = (ui.available_width() * 0.31).clamp(265.0, 340.0);
+            egui::Panel::right("clip_side")
+                .exact_size(side_w)
+                .resizable(false)
+                .frame(egui::Frame::NONE.inner_margin(Margin { left: 18, right: 0, top: 0, bottom: 0 }))
+                .show(ui, |ui| self.clip_inspector(ui, c, &clip));
+        }
 
-        // Controls in a bottom panel so they always fit; video takes the rest.
+        egui::Panel::bottom("clip_transport").resizable(false).frame(egui::Frame::NONE).show(ui, |ui| {
+            let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
+            c.player.transport(ui, &label, &c.cfg.player);
+        });
+        let lane_budget = ui.available_height() - 155.0;
         egui::Panel::bottom("clip_controls").resizable(false).frame(egui::Frame::NONE).show(ui, |ui| {
             ui.add_space(4.0);
             let lanes_on = c.player.show_mixer;
             self.timeline_controls(ui, c, duration, lanes_on);
             if lanes_on {
-                self.clip_lanes(ui, c, &clip);
+                self.clip_lanes(ui, c, &clip, lane_budget);
             }
-            let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
-            c.player.transport(ui, &label, &c.cfg.player);
         });
         let avail = ui.available_size();
-        let vh = (avail.x * 9.0 / 16.0).min(avail.y).max(120.0);
+        let vh = (avail.x * 9.0 / 16.0).min(avail.y).max(0.0);
         c.player.video(ui, Vec2::new(avail.x, vh));
         self.persist_audio(c, &clip);
+    }
+
+    fn clip_inspector(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
+        self.trim_controls(ui, c, clip);
+        egui::ScrollArea::vertical().id_salt("clip_side_scroll").auto_shrink(false).show(ui, |ui| self.side_ui(ui, c, clip));
     }
 
     fn media_duration(&self, c: &Ctx, clip: &Clip) -> f64 {
@@ -733,7 +766,7 @@ impl ClipsView {
         }
     }
 
-    fn clip_lanes(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
+    fn clip_lanes(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip, height_budget: f32) {
         let dur = self.media_duration(c, clip);
         let (t0, t1) = self.detail.timeline.range(dur);
         let wave = c.waves.get(&clip.path);
@@ -744,7 +777,7 @@ impl ClipsView {
         }).collect();
         let ph = Some(c.player.state().time_pos);
         let default_range = self.selection(dur).unwrap_or((0.0, dur));
-        let acts = lanes::lanes(ui, &mut c.player, t0, t1, false, &sources, &self.detail.edits, ph, &mut self.detail.lanes, c.accent, self.detail.edit_history.can_undo(), Some(&mut self.detail.lane_display), (0.0, dur), default_range);
+        let acts = lanes::lanes(ui, &mut c.player, t0, t1, false, &sources, &self.detail.edits, ph, &mut self.detail.lanes, c.accent, self.detail.edit_history.can_undo(), Some(&mut self.detail.lane_display), (0.0, dur), default_range, height_budget);
         let mut region_saved = false;
         for action in acts {
             match action {
@@ -858,27 +891,7 @@ impl ClipsView {
         c.player.video(ui, avail);
     }
 
-    fn side_ui(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
-        ui.set_max_width(ui.available_width());
-        if !self.detail.edits.is_empty() {
-            theme::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(theme::title("Audio edits"));
-                let n = self.detail.edits.len();
-                ui.label(theme::small(format!(
-                    "{n} part{} of the audio muted or changed. The original audio is untouched; exports and shares use these edits.",
-                    if n == 1 { "" } else { "s" }
-                )));
-                if ui.button("Remove all edits").clicked() {
-                    self.detail.edit_history.save(&self.detail.edits, c.player.mix.clone());
-                    self.detail.edits.clear();
-                    c.player.set_edits(Vec::new());
-                    self.detail.edits_dirty = Some(Instant::now());
-                }
-            });
-            ui.add_space(12.0);
-        }
-
+    fn trim_controls(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
         // Trim / cut.
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -887,14 +900,14 @@ impl ClipsView {
             ui.add_space(4.0);
             let pos = c.player.state().time_pos;
             let duration = self.media_duration(c, clip);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button(format!("Set start  {}", self.detail.in_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text("Start here (I)").clicked() {
                     self.stop_preview(c);
-                    self.mark_in(pos, duration);
+                    c.report_mark(self.mark_in(pos, duration));
                 }
                 if ui.button(format!("Set end  {}", self.detail.out_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text("End here (O)").clicked() {
                     self.stop_preview(c);
-                    self.mark_out(pos, duration);
+                    c.report_mark(self.mark_out(pos, duration));
                 }
                 if theme::icon_button(ui, icon::CLOSE, 12.0, "Clear").clicked() {
                     self.stop_preview(c);
@@ -923,7 +936,10 @@ impl ClipsView {
                             c.toast("info", "Trimming…");
                         }
                     }
-                    if theme::ghost_button(ui, None, "Trim original").on_hover_text("Replaces this clip (the original goes to the Recycle Bin)").clicked()
+                    let replacement_help = if !c.cfg.clips.delete_to_recycle_bin { "Replaces the original with the selected range." }
+                        else if cv_core::paths::uses_local_storage() { "Replaces this clip and keeps the original in project Trash." }
+                        else { "Replaces this clip and moves the original to the Recycle Bin." };
+                    if theme::ghost_button(ui, None, "Trim original").on_hover_text(replacement_help).clicked()
                         && self.flush_audio(c, clip.id)
                     {
                         self.close_clip(c);
@@ -937,6 +953,28 @@ impl ClipsView {
             }
         });
         ui.add_space(12.0);
+    }
+
+    fn side_ui(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
+        ui.set_max_width(ui.available_width());
+        if !self.detail.edits.is_empty() {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::title("Audio edits"));
+                let n = self.detail.edits.len();
+                ui.label(theme::small(format!(
+                    "{n} part{} of the audio muted or changed. The original audio is untouched; exports and shares use these edits.",
+                    if n == 1 { "" } else { "s" }
+                )));
+                if ui.button("Remove all edits").clicked() {
+                    self.detail.edit_history.save(&self.detail.edits, c.player.mix.clone());
+                    self.detail.edits.clear();
+                    c.player.set_edits(Vec::new());
+                    self.detail.edits_dirty = Some(Instant::now());
+                }
+            });
+            ui.add_space(12.0);
+        }
 
         // Export / share.
         theme::card().show(ui, |ui| {
@@ -959,7 +997,7 @@ impl ClipsView {
                         c.toast("info", "Exporting…");
                     }
                 };
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Limit");
                     ui.add(egui::DragValue::new(&mut self.detail.share_mb).range(1..=4000).suffix(" MB"));
                     if theme::primary_button(ui, Some(icon::SHARE), "Export to size limit").on_hover_text("Re-encode to fit the selected file size").clicked() {
@@ -1089,7 +1127,7 @@ impl ClipsView {
             egui::Modal::new(egui::Id::unique("del_one")).show(ui.ctx(), |ui| {
                 ui.set_width(340.0);
                 ui.label(theme::title("Delete this clip?"));
-                ui.label(theme::label_dim(&clip.title));
+                ui.add(egui::Label::new(theme::label_dim(&clip.title)).wrap());
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if theme::accent_button(ui, Some(icon::DELETE), "Delete", theme::DANGER).clicked() {
@@ -1179,16 +1217,20 @@ fn show_jobs(ui:&mut Ui,c:&mut Ctx,exports_only:bool){
                 }
             }
         });
-        let name = j.output.as_deref().and_then(|path| std::path::Path::new(path).file_name())
-            .and_then(|name| name.to_str()).unwrap_or(&j.title);
-        let filename = ui.add(egui::Label::new(RichText::new(name).size(12.5).color(theme::TEXT_DIM))
-            .wrap().selectable(true));
-        if let Some(path) = &j.output {
-            filename.on_hover_ui(|ui| {
-                ui.set_max_width(360.0);
-                ui.add(egui::Label::new(path).wrap().selectable(true));
+        let name = if j.clip_id.is_some() {
+            &j.title
+        } else {
+            j.output.as_deref().and_then(|path| std::path::Path::new(path).file_name())
+                .and_then(|name| name.to_str()).unwrap_or(&j.title)
+        };
+        ui.add(egui::Label::new(RichText::new(name).size(12.5).color(theme::TEXT_DIM)).truncate())
+            .on_hover_ui(|ui| {
+                ui.set_max_width(420.0);
+                ui.add(egui::Label::new(name).wrap().selectable(true));
+                if let Some(path) = &j.output {
+                    ui.add(egui::Label::new(path).wrap().selectable(true));
+                }
             });
-        }
         if j.state == "running" {
             ui.add(egui::ProgressBar::new(j.progress).desired_height(4.0));
         }
@@ -1254,17 +1296,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn marks_clamp_without_moving_the_opposite_boundary() {
+    fn reversed_marks_preserve_the_prior_selection() {
         let mut view = ClipsView::default();
         assert_eq!(view.selection(10.0), None);
-        view.mark_in(-2.0, 10.0);
-        view.mark_out(20.0, 10.0);
+        view.mark_in(-2.0, 10.0).unwrap();
+        view.mark_out(20.0, 10.0).unwrap();
         assert_eq!(view.selection(10.0), Some((0.0, 10.0)));
-        view.mark_in(8.0, 10.0);
-        view.mark_out(5.0, 10.0);
-        assert_eq!(view.selection(10.0), Some((8.0, 8.101)));
-        view.mark_in(10.0,10.0);
-        assert!((view.detail.in_pt.unwrap()-8.0).abs()<1e-6);
+        view.mark_in(8.0, 10.0).unwrap();
+        assert!(view.mark_out(5.0, 10.0).is_err());
+        assert!(view.mark_in(10.0, 10.0).is_err());
+        assert_eq!(view.selection(10.0), Some((8.0, 10.0)));
+        view.mark_out(8.16, 10.0).unwrap();
+        assert_eq!(view.selection(10.0), Some((8.0, 8.16)));
         assert_eq!(view.selection(0.0), None);
     }
 }

@@ -10,7 +10,7 @@ use cv_core::ipc::{AudioDevices, MonitorInfo, Request};
 use cv_core::model::Game;
 use eframe::egui::{self, Color32, Key, Margin, RichText, Ui, Vec2};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Tab {
     General,
     Recording,
@@ -27,8 +27,8 @@ enum Tab {
 
 const TABS: [(Tab, &str, &str); 11] = [
     (Tab::General, icon::SETTINGS, "General"),
-    (Tab::Recording, icon::HISTORY, "24/7 recording"),
-    (Tab::Clips, icon::LIBRARY, "Clips & replay"),
+    (Tab::Recording, icon::HISTORY, "Recording & storage"),
+    (Tab::Clips, icon::LIBRARY, "Saved clips"),
     (Tab::Hotkeys, icon::KEYBOARD, "Hotkeys"),
     (Tab::Overlay, icon::BOLT, "Overlay & alerts"),
     (Tab::Audio, icon::MIC, "Audio & mic"),
@@ -111,7 +111,21 @@ impl SettingsView {
                 .frame(egui::Frame::NONE.inner_margin(Margin { left: 0, right: 0, top: 10, bottom: 0 }))
                 .show(ui, |ui| self.save_bar(ui, c));
         }
-        egui::Panel::left("settings_tabs")
+        if ui.available_width() < 740.0 {
+            let mut selected = self.tab;
+            let label = TABS.iter().find(|(tab, _, _)| *tab == selected).map(|(_, _, label)| *label).unwrap_or("General");
+            egui::ComboBox::from_id_salt("settings_section").selected_text(label).show_ui(ui, |ui| {
+                for (tab, _, label) in TABS {
+                    ui.selectable_value(&mut selected, tab, label);
+                }
+            });
+            if selected != self.tab {
+                self.leave(c);
+                self.tab = selected;
+            }
+            ui.add_space(8.0);
+        } else {
+            egui::Panel::left("settings_tabs")
             .exact_size(210.0)
             .resizable(false)
             .frame(egui::Frame::NONE.inner_margin(Margin { left: 0, right: 16, top: 0, bottom: 0 }))
@@ -132,9 +146,10 @@ impl SettingsView {
                     }
                 }
             });
+        }
 
-        egui::ScrollArea::vertical().id_salt("settings_scroll").auto_shrink(false).show(ui, |ui| {
-            ui.set_max_width(820.0);
+        egui::ScrollArea::vertical().id_salt(("settings_scroll", self.tab)).auto_shrink(false).show(ui, |ui| {
+            ui.set_max_width(ui.available_width().min(820.0));
             let mut d = self.draft.take().unwrap();
             match self.tab {
                 Tab::General => self.general(ui, c, &mut d),
@@ -164,11 +179,15 @@ impl SettingsView {
         let restart = self.saved.as_ref().zip(self.draft.as_ref()).map(|(s, d)| s.recorder_restart_needed(d)).unwrap_or(false);
         theme::card().inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
             ui.set_width(ui.available_width());
+            let compact = ui.available_width() < 570.0;
+            let status = if restart { "Unsaved changes · recording will restart" } else { "Unsaved changes" };
+            if compact {
+                ui.label(theme::label_dim(status));
+            }
             ui.horizontal(|ui| {
-                ui.label(theme::icon_text(icon::INFO, 14.0).color(theme::TEXT_DIM));
-                ui.label(RichText::new("You have unsaved changes").color(theme::TEXT));
-                if restart {
-                    ui.label(theme::label_dim("· recording will restart"));
+                if !compact {
+                    ui.label(theme::icon_text(icon::INFO, 14.0).color(theme::TEXT_DIM));
+                    ui.label(RichText::new(status).color(theme::TEXT));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::primary_button(ui, Some(icon::CHECK), "Save").clicked() {
@@ -214,6 +233,10 @@ impl SettingsView {
     fn save(&mut self, ctx: &egui::Context, c: &mut Ctx, restart_recorder: bool) {
         let Some(mut d) = self.draft.clone() else { return };
         d.sanitize();
+        if let Err(error) = d.validate_media_folders() {
+            c.toast("error", format!("Check your storage folders: {error}"));
+            return;
+        }
         if let Err(e) = d.save() {
             c.toast("error", format!("Couldn't save settings: {e:#}"));
             return;
@@ -233,7 +256,11 @@ impl SettingsView {
 
     fn general(&mut self, ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
         group(ui, "Startup", |ui| {
-            toggle_row(ui, c, "Start with Windows", "Starts the ClipVault background service when you sign in.", &mut d.general.start_with_windows);
+            if cv_core::paths::uses_local_storage() {
+                ui.label(theme::small("This project profile starts when you open ClipVault."));
+            } else {
+                toggle_row(ui, c, "Start with Windows", "Starts the ClipVault background service when you sign in.", &mut d.general.start_with_windows);
+            }
             toggle_row(ui, c, "Show tray icon", "A small icon next to the clock: red when recording, amber when something needs attention.", &mut d.general.show_tray_icon);
             toggle_row(ui, c, "Windows notifications", "Pop-ups for microphone, recording, and storage alerts.", &mut d.general.notifications);
             row(ui, "Open on", "Which page ClipVault opens on.", |ui| {
@@ -267,10 +294,18 @@ impl SettingsView {
     }
 
     fn clips(&mut self, ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
-        group(ui, "Clip length", |ui| {
-            if let Some(seconds) = d.recording.rolling_seconds() {
-                ui.label(theme::small(format!("Replay only caps both clip hotkeys at {} minutes.", seconds / 60)));
-            }
+        group(ui, "Saved clip length", |ui| {
+            let policy = match d.recording.rolling_seconds() {
+                Some(seconds) => format!("Replay only keeps the last {} min of unsaved footage.", seconds / 60),
+                None if d.recording.enabled => format!("Full history keeps up to {} h of footage.", d.recording.retention_hours),
+                None => "Full-history recording is turned off.".to_owned(),
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(theme::label_dim(policy));
+                if ui.link("Change recording history").clicked() {
+                    self.tab = Tab::Recording;
+                }
+            });
             row(ui, "Default clip length", "How far back the Save clip hotkey reaches.", |ui| {
                 ui.add(egui::DragValue::new(&mut d.clips.clip_length_secs).range(5..=3600).suffix(" s"));
                 ui.label(theme::small(cv_core::util::format_duration(d.clips.clip_length_secs as f64)));
@@ -293,7 +328,12 @@ impl SettingsView {
         group(ui, "Library", |ui| {
             toggle_row(ui, c, "Thumbnails", "Generate preview images for clips.", &mut d.clips.generate_thumbnails);
             toggle_row(ui, c, "Import files added by hand", "Videos you copy into the clips folder show up in the library.", &mut d.clips.import_untracked_files);
-            toggle_row(ui, c, "Delete to Recycle Bin", "Deleted clips can be restored from the Recycle Bin.", &mut d.clips.delete_to_recycle_bin);
+            let (label, help) = if cv_core::paths::uses_local_storage() {
+                ("Move deleted clips to project Trash", "Deleted files stay in the profile’s trash folder.")
+            } else {
+                ("Delete to Recycle Bin", "Deleted clips can be restored from the Recycle Bin.")
+            };
+            toggle_row(ui, c, label, help, &mut d.clips.delete_to_recycle_bin);
             row(ui, "Double-press protection", "Ignore a second save within this time.", |ui| {
                 ui.add(egui::DragValue::new(&mut d.clips.save_cooldown_ms).range(0..=10000).suffix(" ms"));
             });
@@ -563,12 +603,12 @@ impl SettingsView {
 
 fn recording(ui: &mut Ui, c: &mut Ctx, d: &mut Config, monitors: &mut Option<Vec<MonitorInfo>>) {
     group(ui, "Recording history", |ui| {
-        row(ui, "History mode", "Choose how ClipVault keeps new footage.", |ui| {
+        row(ui, "History mode", "Keep an archive or automatically discard older unsaved footage.", |ui| {
             ui.selectable_value(&mut d.recording.history_mode, HistoryMode::Archive, "Full history");
             ui.selectable_value(&mut d.recording.history_mode, HistoryMode::Rolling, "Replay only");
         });
         if d.recording.history_mode == HistoryMode::Rolling {
-            row(ui, "Replay window", "Save this much recent footage at most. Unsaved footage expires automatically.", |ui| {
+            row(ui, "Keep the last", "How much unsaved footage stays on disk while recording.", |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal_wrapped(|ui| {
                         for minutes in [1, 2, 5, 10] {
@@ -754,7 +794,12 @@ fn player(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
 
 fn export(ui: &mut Ui, c: &mut Ctx, d: &mut Config, new_preset_mb: &mut u32) {
     group(ui, "Exports", |ui| {
-        folder_row(ui, "Export folder", "Empty = <clips folder>\\_Exports.", &mut d.export.folder);
+        let help = if cv_core::paths::uses_local_storage() {
+            "Leave empty to use the profile’s exports folder."
+        } else {
+            "Leave empty to use the _Exports subfolder of your clips folder."
+        };
+        folder_row(ui, "Export folder", help, &mut d.export.folder);
         row(ui, "Default share limit", "Maximum file size for a Share export.", |ui| {
             ui.add(egui::DragValue::new(&mut d.export.target_size_mb).range(1..=4096).suffix(" MB"));
         });
@@ -871,6 +916,17 @@ fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
 }
 
 fn row(ui: &mut Ui, label: &str, help: &str, add: impl FnOnce(&mut Ui)) {
+    if ui.available_width() < 610.0 {
+        if !label.is_empty() {
+            ui.label(RichText::new(label).color(theme::TEXT));
+        }
+        if !help.is_empty() {
+            ui.add(egui::Label::new(theme::small(help)).wrap());
+        }
+        ui.horizontal_wrapped(add);
+        ui.add_space(10.0);
+        return;
+    }
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(Vec2::new(300.0, 20.0), egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_width(300.0);
@@ -895,9 +951,11 @@ fn toggle_row(ui: &mut Ui, c: &Ctx, label: &str, help: &str, v: &mut bool) {
 
 fn folder_row(ui: &mut Ui, label: &str, help: &str, v: &mut String) {
     row(ui, label, help, |ui| {
-        ui.add(egui::TextEdit::singleline(v).desired_width(300.0));
+        let field_width = (ui.available_width() - 38.0).clamp(80.0, 300.0);
+        ui.add(egui::TextEdit::singleline(v).desired_width(field_width));
         if theme::icon_button(ui, icon::FOLDER, 13.0, "Browse").clicked() {
-            if let Some(p) = rfd::FileDialog::new().set_directory(if v.is_empty() { "C:\\" } else { v.as_str() }).pick_folder() {
+            let start = if v.is_empty() { cv_core::paths::data_dir() } else { std::path::PathBuf::from(&*v) };
+            if let Some(p) = rfd::FileDialog::new().set_directory(start).pick_folder() {
                 *v = p.display().to_string();
             }
         }

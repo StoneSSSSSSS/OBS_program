@@ -22,12 +22,17 @@ pub fn keyframe_at(r: &Mp4Reader, at_s: f64) -> Result<DecodedFrame> {
     frames.into_iter().next().context("the decoder returned no picture")
 }
 
-/// Save a JPEG `width` pixels wide of the picture at `at_s`.
-pub fn thumbnail(path: &Path, at_s: f64, out: &Path, width: u32) -> Result<()> {
+/// Decode a downscaled picture at `at_s` without writing a file.
+pub fn picture(path: &Path, at_s: f64, width: u32) -> Result<image::RgbImage> {
     let r = Mp4Reader::open(path)?;
     let dur = r.duration_secs();
     let f = keyframe_at(&r, at_s.min((dur - 0.5).max(0.0))).or_else(|_| keyframe_at(&r, 0.0))?;
-    let img = nv12_to_rgb(&f, width);
+    Ok(nv12_to_rgb(&f, width))
+}
+
+/// Save a JPEG `width` pixels wide of the picture at `at_s`.
+pub fn thumbnail(path: &Path, at_s: f64, out: &Path, width: u32) -> Result<()> {
+    let img = picture(path, at_s, width)?;
     if let Some(p) = out.parent() {
         std::fs::create_dir_all(p)?;
     }

@@ -305,7 +305,9 @@ pub fn lanes(
     mut display: Option<&mut LaneDisplay>,
     edit_bounds: (f64, f64),
     default_range: (f64, f64),
+    height_budget: f32,
 ) -> Vec<LaneAction> {
+    let top = ui.cursor().top();
     let mut actions = Vec::new();
     let lane_ids = player.lane_ids.clone();
     let n = lane_ids.len();
@@ -523,7 +525,9 @@ pub fn lanes(
     }
 
     let span = (t1 - t0).max(1e-6);
-    egui::ScrollArea::vertical().id_salt("audio_lane_rows").max_height(210.0).show(ui, |ui| {
+    let header_height = ui.cursor().top() - top;
+    let rows_height = (height_budget - header_height).clamp(LANE_H, 210.0);
+    egui::ScrollArea::vertical().id_salt("audio_lane_rows").max_height(rows_height).show(ui, |ui| {
         for (i, lane) in lane_ids.iter().enumerate() {
             if !visible_lanes.contains(&lane) {
                 continue;

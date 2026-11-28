@@ -49,7 +49,7 @@ impl DragHarness {
                 tracks: Some(&self.tracks),
             };
             result = lanes(ui, &mut self.player, WINDOW.0, WINDOW.1, false, &[source],
-                &[], None, &mut self.state, Color32::LIGHT_BLUE, false, None, WINDOW, WINDOW);
+                &[], None, &mut self.state, Color32::LIGHT_BLUE, false, None, WINDOW, WINDOW, 300.0);
         });
         output.textures_delta.clear();
         result

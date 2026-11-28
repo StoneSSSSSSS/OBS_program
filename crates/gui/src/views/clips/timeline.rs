@@ -5,7 +5,7 @@ use crate::app::Ctx;
 use crate::lanes::GUTTER;
 use crate::theme;
 use cv_core::util::format_duration_precise;
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use std::time::{Duration, Instant};
 
 mod viewport;
@@ -58,14 +58,22 @@ impl ClipsView {
         });
     }
 
-    pub(super) fn mark_in(&mut self, at: f64, duration: f64) {
-        let upper = (self.detail.out_pt.unwrap_or(duration)-0.101).max(0.0);
-        self.detail.in_pt = Some(at.clamp(0.0,upper));
+    pub(super) fn mark_in(&mut self, at: f64, duration: f64) -> Result<(), &'static str> {
+        let at = at.clamp(0.0, duration);
+        if self.detail.out_pt.unwrap_or(duration) - at <= 0.1 {
+            return Err("Choose a start at least 0.1 seconds before the end.");
+        }
+        self.detail.in_pt = Some(at);
+        Ok(())
     }
 
-    pub(super) fn mark_out(&mut self, at: f64, duration: f64) {
-        let lower = (self.detail.in_pt.unwrap_or(0.0)+0.101).min(duration);
-        self.detail.out_pt = Some(at.clamp(lower,duration));
+    pub(super) fn mark_out(&mut self, at: f64, duration: f64) -> Result<(), &'static str> {
+        let at = at.clamp(0.0, duration);
+        if at - self.detail.in_pt.unwrap_or(0.0) <= 0.1 {
+            return Err("Choose an end at least 0.1 seconds after the start.");
+        }
+        self.detail.out_pt = Some(at);
+        Ok(())
     }
 
     pub(super) fn selection(&self, duration: f64) -> Option<(f64, f64)> {
@@ -86,13 +94,11 @@ impl ClipsView {
         let fraction_of = |x: f32| f64::from((x - rect.left()) / rect.width());
         let t_of = |x| window.time_at(fraction_of(x));
         let p = ui.painter_at(rect);
-        p.rect_filled(rect, CornerRadius::same(5), theme::SURFACE);
+        p.rect(rect, 5.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
         if let Some((a, b)) = self.selection(duration) {
             if a < end && b > start {
-                p.rect_filled(
-                    Rect::from_x_y_ranges(x_of(a)..=x_of(b), rect.top()..=rect.bottom()),
-                    CornerRadius::same(3), c.accent.gamma_multiply(0.3),
-                );
+                let selection = Rect::from_x_y_ranges(x_of(a)..=x_of(b), rect.top() + 13.0..=rect.bottom());
+                p.rect(selection, 2.0, c.accent.gamma_multiply(0.18), Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
             }
         }
         for i in 0..=4 {
@@ -101,7 +107,7 @@ impl ClipsView {
             let align = match i { 0 => Align2::LEFT_TOP, 4 => Align2::RIGHT_TOP, _ => Align2::CENTER_TOP };
             p.text(Pos2::new(x, rect.top() + 2.0), align, format_duration_precise(at), FontId::monospace(10.0), theme::TEXT_DIM);
         }
-        for (mark, label) in [(self.detail.in_pt, "In"), (self.detail.out_pt, "Out")] {
+        for (mark, label) in [(self.detail.in_pt, "Start"), (self.detail.out_pt, "End")] {
             if let Some(at) = mark.filter(|at| (start..=end).contains(at)) {
                 let x = x_of(at);
                 p.line_segment(
@@ -123,9 +129,9 @@ impl ClipsView {
                 self.stop_preview(c);
                 if ui.input(|i| i.modifiers.shift) {
                     if self.detail.in_pt.is_some_and(|a| a < at) {
-                        self.mark_out(at, duration);
+                        c.report_mark(self.mark_out(at, duration));
                     } else {
-                        self.mark_in(at, duration);
+                        c.report_mark(self.mark_in(at, duration));
                     }
                 } else {
                     c.player.seek(at, true);

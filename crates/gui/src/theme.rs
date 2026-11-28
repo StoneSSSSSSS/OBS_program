@@ -7,24 +7,24 @@ use eframe::egui::{
 };
 use std::sync::Arc;
 
-pub const BG: Color32 = Color32::from_rgb(13, 13, 15);
-pub const SIDEBAR: Color32 = Color32::from_rgb(17, 17, 19);
-pub const SURFACE: Color32 = Color32::from_rgb(23, 23, 26);
-pub const SURFACE2: Color32 = Color32::from_rgb(31, 31, 35);
-pub const SURFACE3: Color32 = Color32::from_rgb(40, 40, 45);
-pub const BORDER: Color32 = Color32::from_rgb(40, 40, 45);
-pub const BORDER_STRONG: Color32 = Color32::from_rgb(58, 58, 64);
-pub const TEXT: Color32 = Color32::from_rgb(236, 236, 239);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(161, 161, 170);
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(107, 107, 115);
-pub const SUCCESS: Color32 = Color32::from_rgb(70, 194, 122);
-pub const WARNING: Color32 = Color32::from_rgb(245, 166, 35);
-pub const DANGER: Color32 = Color32::from_rgb(229, 72, 77);
-pub const LIVE: Color32 = Color32::from_rgb(229, 72, 77);
+pub const BG: Color32 = Color32::from_gray(19);
+pub const SIDEBAR: Color32 = Color32::from_gray(12);
+pub const SURFACE: Color32 = Color32::from_gray(26);
+pub const SURFACE2: Color32 = Color32::from_gray(36);
+pub const SURFACE3: Color32 = Color32::from_gray(48);
+pub const BORDER: Color32 = Color32::from_gray(51);
+pub const BORDER_STRONG: Color32 = Color32::from_gray(88);
+pub const TEXT: Color32 = Color32::from_gray(246);
+pub const TEXT_DIM: Color32 = Color32::from_gray(187);
+pub const TEXT_FAINT: Color32 = Color32::from_gray(151);
+pub const SUCCESS: Color32 = Color32::from_gray(209);
+pub const WARNING: Color32 = Color32::from_gray(214);
+pub const DANGER: Color32 = Color32::from_gray(236);
+pub const LIVE: Color32 = Color32::from_gray(248);
 
 pub fn accent(a: Accent) -> Color32 {
     match a {
-        Accent::Mono => Color32::from_rgb(220, 220, 225),
+        Accent::Mono => Color32::from_gray(226),
         Accent::Red => Color32::from_rgb(229, 72, 77),
         Accent::Blue => Color32::from_rgb(59, 130, 246),
         Accent::Green => Color32::from_rgb(34, 197, 94),
@@ -156,10 +156,10 @@ pub fn apply(ctx: &egui::Context, accent_color: Color32, scale: f32) {
     ctx.style_mut_of(egui::Theme::Dark, |style| {
         use egui::TextStyle::*;
         style.text_styles = [
-            (Heading, FontId::new(22.0, bold())),
+            (Heading, FontId::new(26.0, bold())),
             (Name("title".into()), FontId::new(17.0, semibold())),
             (Body, FontId::new(14.0, FontFamily::Proportional)),
-            (Button, FontId::new(14.0, FontFamily::Proportional)),
+            (Button, FontId::new(14.0, semibold())),
             (Small, FontId::new(12.0, FontFamily::Proportional)),
             (Monospace, FontId::new(13.0, FontFamily::Monospace)),
         ]
@@ -180,7 +180,7 @@ pub fn apply(ctx: &egui::Context, accent_color: Color32, scale: f32) {
         *v = egui::Visuals::dark();
         v.panel_fill = BG;
         v.window_fill = SURFACE;
-        v.extreme_bg_color = Color32::from_rgb(10, 10, 12);
+        v.extreme_bg_color = Color32::from_gray(12);
         v.faint_bg_color = SURFACE;
         v.code_bg_color = SURFACE2;
         v.window_stroke = Stroke::new(1.0, BORDER_STRONG);
@@ -195,7 +195,7 @@ pub fn apply(ctx: &egui::Context, accent_color: Color32, scale: f32) {
         v.slider_trailing_fill = true;
         v.handle_shape = egui::style::HandleShape::Circle;
         v.striped = false;
-        let r = CornerRadius::same(8);
+        let r = CornerRadius::same(5);
         let w = &mut v.widgets;
         w.noninteractive.bg_fill = SURFACE;
         w.noninteractive.weak_bg_fill = SURFACE;
@@ -207,15 +207,15 @@ pub fn apply(ctx: &egui::Context, accent_color: Color32, scale: f32) {
         w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
         w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
         w.inactive.corner_radius = r;
-        w.hovered.bg_fill = Color32::from_rgb(52, 52, 58);
+        w.hovered.bg_fill = Color32::from_gray(63);
         w.hovered.weak_bg_fill = SURFACE3;
         w.hovered.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
         w.hovered.fg_stroke = Stroke::new(1.5, TEXT);
         w.hovered.corner_radius = r;
         w.hovered.expansion = 0.0;
-        w.active.bg_fill = Color32::from_rgb(64, 64, 70);
-        w.active.weak_bg_fill = Color32::from_rgb(48, 48, 54);
-        w.active.bg_stroke = Stroke::new(1.0, TEXT_FAINT);
+        w.active.bg_fill = Color32::from_gray(73);
+        w.active.weak_bg_fill = Color32::from_gray(54);
+        w.active.bg_stroke = Stroke::new(1.0, TEXT);
         w.active.fg_stroke = Stroke::new(2.0, TEXT);
         w.active.corner_radius = r;
         w.open = w.active;
@@ -233,7 +233,7 @@ pub fn title(text: impl Into<String>) -> RichText {
 }
 
 pub fn heading(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).font(FontId::new(24.0, bold())).color(TEXT)
+    RichText::new(text.into()).font(FontId::new(28.0, bold())).color(TEXT)
 }
 
 pub fn label_dim(text: impl Into<String>) -> RichText {
@@ -254,18 +254,27 @@ pub fn card() -> egui::Frame {
     egui::Frame::NONE
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(7))
         .inner_margin(Margin::same(16))
 }
 
 /// Solid light "primary" button (monochrome look).
 pub fn primary_button(ui: &mut Ui, glyph: Option<&str>, text: &str) -> Response {
-    custom_button(ui, glyph, text, TEXT, Color32::from_rgb(18, 18, 20), true)
+    custom_button(ui, glyph, text, TEXT, BG, true)
 }
 
 /// Accent-coloured button (used for record-ish actions).
 pub fn accent_button(ui: &mut Ui, glyph: Option<&str>, text: &str, color: Color32) -> Response {
-    custom_button(ui, glyph, text, color, Color32::WHITE, true)
+    custom_button(ui, glyph, text, color, on_fill(color), true)
+}
+
+pub fn on_fill(fill: Color32) -> Color32 {
+    let linear = |value: u8| {
+        let value = f32::from(value) / 255.0;
+        if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+    };
+    let luminance = 0.2126 * linear(fill.r()) + 0.7152 * linear(fill.g()) + 0.0722 * linear(fill.b());
+    if luminance >= 0.179 { Color32::BLACK } else { Color32::WHITE }
 }
 
 pub fn ghost_button(ui: &mut Ui, glyph: Option<&str>, text: &str) -> Response {
@@ -279,6 +288,7 @@ fn custom_button(ui: &mut Ui, glyph: Option<&str>, text: &str, fill: Color32, fg
     let pad = Vec2::new(14.0, 8.0);
     let size = Vec2::new(galley.size().x + icon_w + pad.x * 2.0, (galley.size().y + pad.y * 2.0).max(34.0));
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), text));
     if ui.is_rect_visible(rect) {
         let hovered = resp.hovered();
         let pressed = resp.is_pointer_button_down_on();
@@ -295,7 +305,11 @@ fn custom_button(ui: &mut Ui, glyph: Option<&str>, text: &str, fill: Color32, fg
             bg = SURFACE3;
         }
         let stroke = if solid { Stroke::NONE } else { Stroke::new(1.0, if hovered { BORDER_STRONG } else { BORDER }) };
-        ui.painter().rect(rect, CornerRadius::same(9), bg, stroke, StrokeKind::Inside);
+        let color = if solid { on_fill(bg) } else { fg };
+        ui.painter().rect(rect, CornerRadius::same(5), bg, stroke, StrokeKind::Inside);
+        if resp.has_focus() {
+            ui.painter().rect_stroke(rect.expand(2.0), 7.0, Stroke::new(1.5, TEXT), StrokeKind::Outside);
+        }
         let mut x = rect.left() + pad.x;
         if let Some(g) = glyph {
             ui.painter().text(
@@ -303,11 +317,16 @@ fn custom_button(ui: &mut Ui, glyph: Option<&str>, text: &str, fill: Color32, fg
                 egui::Align2::CENTER_CENTER,
                 g,
                 FontId::new(14.0, icons_family()),
-                fg,
+                color,
             );
             x += icon_w;
         }
-        ui.painter().galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, fg);
+        let galley = if color == fg {
+            galley
+        } else {
+            ui.painter().layout_no_wrap(text.to_owned(), FontId::new(14.0, semibold()), color)
+        };
+        ui.painter().galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, color);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -316,6 +335,9 @@ fn custom_button(ui: &mut Ui, glyph: Option<&str>, text: &str, fill: Color32, fg
 pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, tooltip: &str) -> Response {
     let d = size + 16.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
+    if !tooltip.is_empty() {
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tooltip));
+    }
     if ui.is_rect_visible(rect) {
         let bg = if resp.is_pointer_button_down_on() {
             SURFACE3
@@ -325,6 +347,9 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, tooltip: &str) -> Respon
             Color32::TRANSPARENT
         };
         ui.painter().rect_filled(rect, CornerRadius::same((d / 2.0) as u8), bg);
+        if resp.has_focus() {
+            ui.painter().rect_stroke(rect, CornerRadius::same((d / 2.0) as u8), Stroke::new(1.5, TEXT), StrokeKind::Inside);
+        }
         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, FontId::new(size, icons_family()), TEXT);
     }
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -347,7 +372,7 @@ pub fn toggle(ui: &mut Ui, on: &mut bool, accent_color: Color32) -> Response {
     let bg = blend(SURFACE3, accent_color, t);
     ui.painter().rect_filled(rect, CornerRadius::same(11), bg);
     let x = egui::lerp(rect.left() + 11.0..=rect.right() - 11.0, t);
-    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 8.0, Color32::WHITE);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 8.0, on_fill(bg));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -369,11 +394,9 @@ pub fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgba_premultiplied(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()), l(a.a(), b.a()))
 }
 
-/// Muted, distinct colour for a game id (used for timeline bands).
+/// Distinct neutral values for activity regions on the timeline.
 pub fn game_color(id: i64) -> Color32 {
-    let h = ((id.wrapping_mul(2654435761) as u64 % 360) as f32) / 360.0;
-    let c = egui::ecolor::Hsva::new(h, 0.38, 0.62, 1.0);
-    Color32::from(c)
+    Color32::from_gray(130 + (id.wrapping_mul(2654435761) as u64 % 55) as u8)
 }
 
 /// A horizontal level meter (0..1 linear peak).
