@@ -645,6 +645,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipvault-media"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "clipvault-core",
+ "crossbeam-channel",
+ "image",
+ "once_cell",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "windows 0.58.0",
+ "windows-core 0.58.0",
+]
+
+[[package]]
 name = "clipvault-service"
 version = "2.0.0"
 dependencies = [
