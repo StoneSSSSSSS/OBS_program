@@ -61,6 +61,13 @@ pub(crate) fn isolate_config(mut config: Config, dir: &Path) -> Config {
 
 impl TestProfile {
     fn new() -> Result<Self> {
+        Self::with_wave_worker(false, waves::run)
+    }
+
+    fn with_wave_worker(
+        game_focused: bool,
+        run_waves: impl FnOnce(Arc<Shared>) + Send + 'static,
+    ) -> Result<Self> {
         let dir = cv_core::paths::data_dir();
         let explicit = std::env::var_os("CLIPVAULT_DATA_DIR").map(PathBuf::from);
         ensure!(
@@ -145,7 +152,7 @@ impl TestProfile {
             devices: Mutex::new(Default::default()),
             jobs: Mutex::new(Vec::new()),
             event_db: Mutex::new(None),
-            foreground_game: Default::default(),
+            foreground_game: game_focused.into(),
             library_lock: Mutex::new(()),
             live_path: Mutex::new(None),
             shutdown: std::sync::atomic::AtomicBool::new(false),
@@ -174,7 +181,7 @@ impl TestProfile {
         });
         let waves = spawn("isolated-waves", {
             let shared = shared.clone();
-            move || waves::run(shared)
+            move || run_waves(shared)
         });
 
         let deadline = Instant::now() + REQUEST_TIMEOUT;

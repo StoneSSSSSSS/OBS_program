@@ -3,6 +3,9 @@
 #[path = "retention_soak.rs"]
 mod retention_soak;
 
+#[path = "backfill_bench.rs"]
+mod backfill_bench;
+
 use super::*;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -138,22 +141,7 @@ fn serve_owned_window_capture() -> Result<()> {
     let qa = SyntheticWindow::open()?;
     let hwnd = qa.hwnd;
     window.replace(qa);
-    let mut config = profile.shared.cfg();
-    config.recording.enabled = true;
-    config.recording.history_mode = HistoryMode::Archive;
-    config.recording.max_height = 360;
-    config.recording.fps = 20;
-    config.recording.keyframe_interval_secs = 1;
-    config.recording.encoder = "software".into();
-    config.recording.app_tracks = false;
-    config.recording.show_cursor = false;
-    config.audio.record_mic = false;
-    config.audio.mic_guard = false;
-    *profile.shared.cfg.write() = config;
-
-    let rx = profile.engine_rx.take().context("test window engine channel")?;
-    let shared = profile.shared.clone();
-    profile.engine = Some(spawn("window-capture-engine", move || engine::run_test_window(shared, rx, hwnd)));
+    start_owned_recorder(&mut profile, hwnd)?;
     let mut status_log = Vec::new();
     let mut segments = BTreeMap::<String, (i64, i64)>::new();
     let run = Instant::now();
@@ -206,5 +194,24 @@ fn serve_owned_window_capture() -> Result<()> {
     std::fs::write(profile.dir.join("qa-window-ipc.txt"), status_log.join("\n"))?;
     println!("{}", status_log.join("\n"));
     profile.shutdown()?;
+    Ok(())
+}
+fn start_owned_recorder(profile: &mut TestProfile, hwnd: isize) -> Result<()> {
+    let mut config = profile.shared.cfg();
+    config.recording.enabled = true;
+    config.recording.history_mode = HistoryMode::Archive;
+    config.recording.max_height = 360;
+    config.recording.fps = 20;
+    config.recording.keyframe_interval_secs = 1;
+    config.recording.encoder = "software".into();
+    config.recording.app_tracks = false;
+    config.recording.show_cursor = false;
+    config.audio.record_mic = false;
+    config.audio.mic_guard = false;
+    *profile.shared.cfg.write() = config;
+
+    let rx = profile.engine_rx.take().context("test window engine channel")?;
+    let shared = profile.shared.clone();
+    profile.engine = Some(spawn("window-capture-engine", move || engine::run_test_window(shared, rx, hwnd)));
     Ok(())
 }

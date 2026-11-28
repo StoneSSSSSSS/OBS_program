@@ -741,3 +741,6 @@ fn new_load_invalidates_the_previous_segment_before_the_worker_opens_it() {
     assert_eq!(player.state().position, 0.0);
     assert!(player.frame().is_none());
 }
+
+#[path = "backfill_bench.rs"]
+mod backfill_bench;

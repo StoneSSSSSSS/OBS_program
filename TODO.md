@@ -43,7 +43,7 @@
 ## Next verification
 
 - [ ] Run a sustained live replay-only session on a second Windows setup. Check hotkey capture and rebinding, headset and display reconnects, disk pressure, and waveform backfill while entering and leaving a game.
-- [ ] Measure backfill on long, multitrack archives alongside recording and playback. Check CPU and disk usage, actual pause and resume latency, and recorder dropped frames. The scheduling tests do not measure hardware or OS behavior.
+- [x] Measure waveform backfill alongside native capture and playback on this Windows machine. A 30-minute, three-track recording produced 18,000 peaks on each track. During eight seconds of owned-window recording, backfill added about 9.6 percentage points of one logical CPU core and six megabytes of service reads. Both recording windows reported zero dropped frames. During muted playback, the player delivered 199 frames without backfill and 200 with it. Simulated focus changes paused work within 1.5 ms and resumed it within 229 ms. The archive was warm in the Windows cache. Reproduce with `scripts/check-backfill.ps1`.
 - [ ] Verify trim recovery after a real power interruption on a disposable Windows setup.
 
 The previous handoff reported 1728 × 1080 at 60 fps and a roughly 28-second hotkey clip. Those figures came from that machine. See [README.md](README.md) for the current workflow.

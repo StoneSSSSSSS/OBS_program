@@ -33,6 +33,8 @@ fn wait_for_archive_slot(
         let (shutting_down, game_focused) = flags();
         anyhow::ensure!(!shutting_down, "waveform backfill stopped");
         if game_focused {
+            #[cfg(test)]
+            measure::waiting_for_focus();
             sleep(FOCUS_POLL);
         } else if !throttle.is_zero() {
             sleep(std::mem::take(&mut throttle));
@@ -78,7 +80,12 @@ pub fn run(sh: Arc<Shared>) {
                     continue;
                 }
                 let archive_slot = |span| {
-                    wait_for_archive_slot(span, || (sh.is_shutting_down(), gaming(&sh)), std::thread::sleep)
+                    wait_for_archive_slot(span, || (sh.is_shutting_down(), gaming(&sh)), std::thread::sleep)?;
+                    #[cfg(test)]
+                    if !span.is_zero() {
+                        measure::starting_chunk();
+                    }
+                    Ok(())
                 };
                 match cv_media::wave::generate_archive(&src, archive_slot) {
                     Ok(w) => {
@@ -139,6 +146,10 @@ fn sleep_unless_shutdown(sh: &Shared, d: Duration) {
         std::thread::sleep(Duration::from_millis(500));
     }
 }
+
+#[cfg(test)]
+#[path = "waves_measure.rs"]
+pub(crate) mod measure;
 
 #[cfg(test)]
 mod tests {

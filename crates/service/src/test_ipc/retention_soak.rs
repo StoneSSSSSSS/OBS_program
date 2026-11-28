@@ -26,6 +26,11 @@ fn owned_window_full_history_retention_soak() -> Result<()> {
         std::env::var("CLIPVAULT_QA_CAPTURE_WINDOW").as_deref() == Ok("1"),
         "Set CLIPVAULT_QA_CAPTURE_WINDOW=1 for the isolated owned-window test"
     );
+    // Leave the normal regression at ten minutes. A day run keeps the same rolling disk budget.
+    let requested = std::env::var("CLIPVAULT_QA_SOAK_SECONDS").ok()
+        .map(|value| value.parse::<u64>()).transpose()?.unwrap_or(0);
+    ensure!(requested == 0 || (600..=86_400).contains(&requested), "Choose 600 through 86400 wall-clock seconds");
+    let target = requested as f64;
     let qa = std::env::current_dir()?.join(".clipvault-local").join("qa").canonicalize()?;
     let dir = cv_core::paths::data_dir();
     ensure!(dir.parent().context("QA profile parent")?.canonicalize()?.starts_with(&qa),
@@ -71,7 +76,7 @@ fn owned_window_full_history_retention_soak() -> Result<()> {
     let shared = profile.shared.clone();
     let armed_wall = now_ms();
     let armed = Instant::now();
-    note(&mut log, format_args!("Armed native WGC hwnd={hwnd:#x}; budget=600s, segment=8s, mic and loopback disabled"))?;
+    note(&mut log, format_args!("Armed native WGC hwnd={hwnd:#x}; budget=600s, segment=8s, requested wall time={requested}s, mic and loopback disabled"))?;
     profile.engine = Some(spawn("retention-soak-engine", move || engine::run_test_window(shared, rx, hwnd)));
 
     let mut kept = None;
@@ -80,17 +85,33 @@ fn owned_window_full_history_retention_soak() -> Result<()> {
     let mut following = None;
     let mut expired = None;
     let mut next_report = 0.0;
+    let mut last_written = 0;
+    let mut last_progress = armed;
+    let mut last_rollover = 0;
+    let mut rollovers = 0_u64;
+    let mut peak_drops = 0;
     loop {
         let s = status(&profile)?;
         let rows = db.list_recordings()?;
         let elapsed = armed.elapsed().as_secs_f64();
-        ensure!(elapsed < 680.0, "Soak did not converge after {elapsed:.1}s; engine={:?}", s.engine);
+        while profile.events.try_recv().is_ok() {}
+        ensure!(elapsed < target.max(BUDGET) + 80.0, "Soak did not converge after {elapsed:.1}s; engine={:?}", s.engine);
         if !s.recording.active || s.recording.written_until_ms <= s.recording.started_ms {
             ensure!(elapsed < 25.0 || s.recording.active,
                 "Native WGC recorder is inactive at {elapsed:.1}s; engine={:?}", s.engine);
             thread::sleep(Duration::from_millis(150));
             continue;
         }
+        if s.recording.written_until_ms > last_written {
+            last_progress = Instant::now();
+            last_written = s.recording.written_until_ms;
+        }
+        ensure!(last_progress.elapsed() < Duration::from_secs(30), "Recorder stopped advancing its durable output at {elapsed:.2}s");
+        if s.recording.started_ms != last_rollover {
+            rollovers += u64::from(last_rollover != 0);
+            last_rollover = s.recording.started_ms;
+        }
+        peak_drops = peak_drops.max(s.engine.dropped_frames);
         ensure!(s.engine.capture == "Windows Graphics Capture" && s.mic.state == "disabled",
             "Unexpected capture path or microphone state: {} / {}", s.engine.capture, s.mic.state);
         let ordinary: Vec<_> = rows.iter().filter(|r| r.probed && !r.is_live() && !r.kept).collect();
@@ -98,10 +119,14 @@ fn owned_window_full_history_retention_soak() -> Result<()> {
 
         if elapsed >= next_report {
             note(&mut log, format_args!(
-                "Elapsed {elapsed:.2}s; {} ordinary finalized segments ({total:.3}s), live durable {:.3}s, written_until_ms={}",
+                "Elapsed {elapsed:.2}s; {} ordinary finalized segments ({total:.3}s), live durable {:.3}s, written_until_ms={}, rollovers={rollovers}, peak reported drops={peak_drops}",
                 ordinary.len(), (s.recording.written_until_ms - s.recording.started_ms) as f64 / 1000.0,
                 s.recording.written_until_ms,
             ))?;
+            if elapsed >= BUDGET + 60.0 {
+                ensure!((BUDGET - 2.0 * SEGMENT..=BUDGET + 2.0 * SEGMENT).contains(&total),
+                    "Rolling archive had {total:.3}s after {elapsed:.2}s");
+            }
             next_report += 60.0;
         }
 
@@ -151,7 +176,7 @@ fn owned_window_full_history_retention_soak() -> Result<()> {
                 expired = Some(s.recording.started_ms);
             }
             if let (Some(first_expiry_live_start), Some(next)) = (expired, &following) {
-                if s.recording.started_ms > first_expiry_live_start
+                if elapsed >= target && s.recording.started_ms > first_expiry_live_start
                     && db.recording(next.id)?.is_none() && !Path::new(&next.path).exists()
                 {
                     ensure!(total >= BUDGET - SEGMENT - 0.25 && total < BUDGET + SEGMENT + 0.25,
@@ -188,6 +213,6 @@ fn owned_window_full_history_retention_soak() -> Result<()> {
             }
         }
 
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(if elapsed > 650.0 { 750 } else { 150 }));
     }
 }
