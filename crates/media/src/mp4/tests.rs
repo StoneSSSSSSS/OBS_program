@@ -237,3 +237,26 @@ fn ffprobe_accepts_our_files() {
     assert!(s.contains("nb_read_packets=30"), "{s}");
     assert!(s.contains("nb_read_packets=47"), "{s}");
 }
+
+#[test]
+fn corrupt_tail_keeps_good_part_and_refresh_never_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rec.mp4");
+    let mut w = FragWriter::create(&path, &tracks()[..1], 0, None).unwrap();
+    let vs: Vec<Vec<u8>> = (0..30).map(vsample).collect();
+    let v: Vec<SampleRef> = vs.iter().enumerate().map(|(k, d)| SampleRef { data: d, duration: 3000, sync: k == 0, cts: 0 }).collect();
+    for f in 0..3u64 {
+        w.write_fragment(&[TrackRun { track_id: 1, base_time: f * 90_000, samples: &v }]).unwrap();
+    }
+    w.finish().unwrap();
+    // Junk after the good fragments (e.g. a crash mid-write of a header).
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&[0, 0, 0, 3, b'j', b'u', b'n', b'k', 1, 2, 3, 4]);
+    std::fs::write(&path, &bytes).unwrap();
+    let mut r = Mp4Reader::open(&path).expect("readable part still opens");
+    assert_eq!(r.samples(0, 0, u64::MAX).unwrap().len(), 90);
+    for _ in 0..3 {
+        let _ = r.refresh();
+        assert_eq!(r.samples(0, 0, u64::MAX).unwrap().len(), 90, "refresh must not add fragments again");
+    }
+}

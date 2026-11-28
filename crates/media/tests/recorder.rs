@@ -70,6 +70,8 @@ fn records_screen_and_app_sound() {
     eprintln!("{}: {:.2} s, {} tracks", path.display(), dur, r.tracks.len());
     assert!((5.0..7.5).contains(&dur), "duration {dur}");
     let v = r.samples(0, 0, u64::MAX).unwrap();
+    // Frame durations add up exactly: one continuous video range, no gaps.
+    assert_eq!(r.coverage(0).len(), 1, "video has gaps: {:?}", r.coverage(0));
     eprintln!("video frames: {}", v.len());
     assert!(v.len() as f64 > dur * 30.0 * 0.85, "too few frames: {}", v.len());
     let full = r.samples(1, 0, u64::MAX).unwrap();

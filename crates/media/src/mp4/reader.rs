@@ -247,10 +247,11 @@ impl Mp4Reader {
     /// samples became available.
     pub fn refresh(&mut self) -> Result<bool> {
         let len = self.file.metadata()?.len();
-        let mut pos = self.scan_pos;
         let mut changed = false;
         loop {
-            let Some((typ, hdr, size)) = self.box_header(pos, len)? else { break };
+            let pos = self.scan_pos;
+            // A corrupt or incomplete header ends the usable part of the file.
+            let Ok(Some((typ, hdr, size))) = self.box_header(pos, len) else { break };
             if pos + size > len {
                 break; // still being written
             }
@@ -264,9 +265,9 @@ impl Mp4Reader {
                 b"moof" if self.have_moov => {
                     // Only accept the fragment once its mdat is complete too.
                     let next = pos + size;
-                    match self.box_header(next, len)? {
-                        Some((t, _, s)) if &t == b"mdat" && next + s <= len => {}
-                        Some((t, _, _)) if &t != b"mdat" => {}
+                    match self.box_header(next, len) {
+                        Ok(Some((t, _, s))) if &t == b"mdat" && next + s <= len => {}
+                        Ok(Some((t, _, _))) if &t != b"mdat" => {}
                         _ => break,
                     }
                     let body = self.read_vec(pos + hdr, (size - hdr) as usize)?;
@@ -282,9 +283,10 @@ impl Mp4Reader {
                 }
                 _ => {}
             }
-            pos += size;
+            // Advance only after the box is fully handled, so an error above
+            // never makes us add the same fragment twice.
+            self.scan_pos = pos + size;
         }
-        self.scan_pos = pos;
         Ok(changed)
     }
 
@@ -487,6 +489,7 @@ impl Mp4Reader {
 
     fn parse_moof(&self, moof_offset: u64, body: &[u8]) -> Result<HashMap<u32, Vec<Sample>>> {
         let mut out: HashMap<u32, Vec<Sample>> = HashMap::new();
+        let mut prev_traf_end: Option<u64> = None;
         for (t, traf) in children(body) {
             if &t != b"traf" {
                 continue;
@@ -496,7 +499,14 @@ impl Mp4Reader {
             let (_, fl) = r.full()?;
             let track_id = r.u32()?;
             let trex = self.trex.get(&track_id).copied().unwrap_or_default();
-            let base_offset = if fl & 0x01 != 0 { r.u64()? } else { moof_offset };
+            let base_offset = if fl & 0x01 != 0 {
+                r.u64()?
+            } else if fl & 0x02_0000 != 0 {
+                moof_offset
+            } else {
+                // Legacy: data follows the previous track fragment's data.
+                prev_traf_end.unwrap_or(moof_offset)
+            };
             if fl & 0x02 != 0 {
                 r.u32()?;
             }
@@ -549,6 +559,7 @@ impl Mp4Reader {
                     dts += duration as u64;
                 }
             }
+            prev_traf_end = Some(data_pos);
         }
         Ok(out)
     }
@@ -563,7 +574,20 @@ impl Mp4Reader {
         let f = self.frags.get(frag as usize).context("bad fragment")?.clone();
         let raw = self.read_vec(f.offset, f.size as usize)?;
         let hdr = if u32::from_be_bytes(raw[0..4].try_into().unwrap()) == 1 { 16 } else { 8 };
-        let parsed = self.parse_moof(f.offset, &raw[hdr..])?;
+        let mut parsed = self.parse_moof(f.offset, &raw[hdr..])?;
+        // Fragments without `tfdt` were timed from the previous fragment at
+        // scan time; restore those times.
+        for (tid, list) in parsed.iter_mut() {
+            let Some(ti) = self.tracks.iter().position(|t| t.id == *tid) else { continue };
+            if let (Some(fr), Some(first)) = (self.track_frags[ti].iter().find(|x| x.frag == frag), list.first()) {
+                let shift = fr.start as i64 - first.dts as i64;
+                if shift != 0 {
+                    for s in list.iter_mut() {
+                        s.dts = (s.dts as i64 + shift).max(0) as u64;
+                    }
+                }
+            }
+        }
         let out = parsed.get(&track_id).cloned().unwrap_or_default();
         let mut c = self.cache.lock();
         c.push((frag, parsed));
@@ -827,6 +851,9 @@ fn parse_sample_tables(stbl: &[u8], video: bool) -> Result<Vec<Sample>> {
         r.full()?;
         let uniform = r.u32()?;
         let count = r.u32()? as usize;
+        if count > n {
+            bail!("sample size table larger than the sample list");
+        }
         if uniform != 0 {
             sizes.resize(count, uniform);
         } else {
@@ -840,6 +867,9 @@ fn parse_sample_tables(stbl: &[u8], video: bool) -> Result<Vec<Sample>> {
         r.u24()?;
         let field = r.u8()?;
         let count = r.u32()? as usize;
+        if count > n {
+            bail!("sample size table larger than the sample list");
+        }
         let mut i = 0;
         while i < count {
             match field {

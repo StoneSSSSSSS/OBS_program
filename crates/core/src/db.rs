@@ -905,8 +905,8 @@ mod tests {
         assert!(clip.probed);
         assert_eq!(clip.track_names, vec!["Full mix", "Game"]);
         assert_eq!(clip.mixer, Some(vec![1.0, 0.5]));
-        db.set_clip_audio_edits(c, &[AudioEdit { track: 2, start: 1.0, end: 2.5, gain: 0.0 }]).unwrap();
-        assert_eq!(db.clip(c).unwrap().unwrap().audio_edits, vec![AudioEdit { track: 2, start: 1.0, end: 2.5, gain: 0.0 }]);
+        db.set_clip_audio_edits(c, &[AudioEdit::new("cat:voice", 1.0, 2.5, 0.0)]).unwrap();
+        assert_eq!(db.clip(c).unwrap().unwrap().audio_edits, vec![AudioEdit::new("cat:voice", 1.0, 2.5, 0.0)]);
         db.set_clip_audio_edits(c, &[]).unwrap();
         assert!(db.clip(c).unwrap().unwrap().audio_edits.is_empty());
         db.set_clip_mixer(c, None).unwrap();

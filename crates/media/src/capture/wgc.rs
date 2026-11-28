@@ -25,6 +25,15 @@ struct Event(HANDLE);
 unsafe impl Send for Event {}
 unsafe impl Sync for Event {}
 
+impl Drop for Event {
+    fn drop(&mut self) {
+        // Closed only once nothing (including the frame callback) uses it.
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 pub struct WgcCapture {
     gpu: Arc<Gpu>,
     output_index: u32,
@@ -38,6 +47,9 @@ pub struct WgcCapture {
     cursor: bool,
     pub has_image: bool,
     pub new_frames: u64,
+    /// Size Windows reported for the latest frame (differs after a mode change).
+    content_size: (u32, u32),
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 unsafe impl Send for WgcCapture {}
@@ -68,9 +80,18 @@ impl WgcCapture {
                 let _ = SetEvent(ev.0);
                 Ok(())
             }))?;
+            // The monitor went away (unplugged, disabled).
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let c2 = closed.clone();
+            let ev2 = event.clone();
+            item.Closed(&TypedEventHandler::new(move |_, _| {
+                c2.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = SetEvent(ev2.0);
+                Ok(())
+            }))?;
             session.StartCapture()?;
             let desktop = gpu.texture(size.0, size.1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, D3D11_CPU_ACCESS_FLAG(0))?;
-            Ok(WgcCapture { gpu, output_index, item, device, pool, session, event, size, desktop, cursor: true, has_image: false, new_frames: 0 })
+            Ok(WgcCapture { gpu, output_index, item, device, pool, session, event, size, desktop, cursor: true, has_image: false, new_frames: 0, content_size: size, closed })
         }
     }
 
@@ -79,13 +100,19 @@ impl WgcCapture {
     }
 
     pub fn poll(&mut self, timeout_ms: u32) -> Result<bool, CaptureError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(CaptureError::Other(anyhow::anyhow!("the monitor is no longer available")));
+        }
         let mut got = false;
         // Take every queued frame (keep the newest).
         loop {
             match self.pool.TryGetNextFrame() {
                 Ok(frame) => {
                     let cs = frame.ContentSize().map_err(|e| CaptureError::Other(e.into()))?;
-                    if (cs.Width as u32, cs.Height as u32) != self.size && cs.Width > 0 {
+                    if cs.Width > 0 && cs.Height > 0 {
+                        self.content_size = (cs.Width as u32, cs.Height as u32);
+                    }
+                    if self.content_size != self.size {
                         let _ = frame.Close();
                         return Err(CaptureError::Lost); // monitor resolution changed
                     }
@@ -115,8 +142,9 @@ impl WgcCapture {
     pub fn reopen(&mut self) -> Result<()> {
         let s = self.item.Size()?;
         let size = (s.Width.max(2) as u32, s.Height.max(2) as u32);
-        if size != self.size {
-            anyhow::bail!("monitor size changed to {}x{}", size.0, size.1);
+        // The item's size can be stale; the frames' content size is not.
+        if size != self.size || self.content_size != self.size {
+            anyhow::bail!("monitor size changed to {}x{}", self.content_size.0, self.content_size.1);
         }
         self.pool.Recreate(&self.device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, s)?;
         Ok(())
@@ -135,8 +163,5 @@ impl Drop for WgcCapture {
     fn drop(&mut self) {
         let _ = self.session.Close();
         let _ = self.pool.Close();
-        unsafe {
-            let _ = CloseHandle(self.event.0);
-        }
     }
 }

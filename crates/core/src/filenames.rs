@@ -1,7 +1,11 @@
-//! Parsing the timestamps OBS puts in file names (`%CCYY-%MM-%DD %hh-%mm-%ss`).
+//! Video file names: which files are videos, and the timestamps ClipVault (and
+//! OBS before it) put in file names (`%CCYY-%MM-%DD %hh-%mm-%ss`).
 
 use chrono::{Local, NaiveDateTime, TimeZone};
 use std::path::Path;
+
+/// Name prefix of old OBS replay-buffer saves.
+pub const REPLAY_PREFIX: &str = "Replay";
 
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "flv", "ts", "m4v", "webm"];
 
@@ -16,7 +20,7 @@ pub fn is_video_file(path: &Path) -> bool {
 pub fn is_replay_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n.to_lowercase().starts_with(&super::files::REPLAY_PREFIX.to_lowercase()))
+        .map(|n| n.to_lowercase().starts_with(&REPLAY_PREFIX.to_lowercase()))
         .unwrap_or(false)
 }
 

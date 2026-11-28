@@ -2,6 +2,7 @@
 
 pub mod aac;
 pub mod h264;
+pub mod h264dec;
 
 use anyhow::{bail, Context, Result};
 use std::sync::Once;

@@ -18,7 +18,10 @@ pub(crate) fn run(sh: Arc<Shared>, tx: Sender<MuxMsg>) {
     crate::util::boost_thread();
     let mut attempt = 0u32;
     while !sh.stop.load(Ordering::SeqCst) {
-        match pipeline(&sh, &tx) {
+        let r = pipeline(&sh, &tx);
+        // Close the open stretch of video so it isn't stretched over the outage.
+        let _ = tx.send(MuxMsg::VideoEnd);
+        match r {
             Ok(()) => break,
             Err(e) => {
                 attempt += 1;
@@ -80,7 +83,7 @@ fn pipeline(sh: &Arc<Shared>, tx: &Sender<MuxMsg>) -> Result<()> {
     let mut conv = Converter::new(&gpu, cap.size(), (w, h), true)?;
     let fps = cfg.fps.clamp(10, 240);
     let gop = ((fps as f32 * cfg.keyframe_secs).round() as u32).max(1);
-    let mut enc = VideoEncoder::new(Some(gpu.clone()), EncoderConfig { width: w, height: h, fps, rate: cfg.rate, gop, choice: cfg.encoder })?;
+    let mut enc = VideoEncoder::new(Some(gpu.clone()), EncoderConfig { width: w, height: h, fps, rate: cfg.rate, gop, choice: cfg.encoder, realtime: true })?;
     {
         let mut st = sh.status.lock();
         st.width = w;
@@ -92,7 +95,10 @@ fn pipeline(sh: &Arc<Shared>, tx: &Sender<MuxMsg>) -> Result<()> {
     tracing::info!("screen {}x{} -> {w}x{h} @ {fps} fps via {} + {}", cap.size().0, cap.size().1, cap.method_name(), enc.info.name);
     let pool: Vec<_> = (0..8).map(|_| gpu.nv12_target(w, h)).collect::<Result<_>>()?;
     let frame_hns = 10_000_000 / fps as i64;
+    // Exact tick times (no accumulated rounding).
+    let tick_at = |start: i64, n: i64| start + (n as i128 * 10_000_000 / fps as i128) as i64;
     let start = now_hns();
+    let mut submitted: usize = 0;
     let mut n: i64 = 0;
     let mut params = Sps { sps: None, pps: None };
     let mut encoded = 0u64;
@@ -104,7 +110,7 @@ fn pipeline(sh: &Arc<Shared>, tx: &Sender<MuxMsg>) -> Result<()> {
         if sh.stop.load(Ordering::SeqCst) {
             break;
         }
-        let tick = start + n * frame_hns;
+        let tick = tick_at(start, n);
         // Take in screen updates until it's time for the next frame.
         loop {
             let now = now_hns();
@@ -148,7 +154,10 @@ fn pipeline(sh: &Arc<Shared>, tx: &Sender<MuxMsg>) -> Result<()> {
         }
         let force = sh.force_key.swap(false, Ordering::SeqCst);
         let src = cap.frame(cfg.cursor).clone();
-        let dst = &pool[(n as usize) % pool.len()];
+        // Rotate through the pool per submitted frame, so a frame still
+        // queued in the encoder is never overwritten after skipped ticks.
+        let dst = &pool[submitted % pool.len()];
+        submitted += 1;
         conv.blit(&src, dst)?;
         let frames = enc.encode_texture(dst, tick, force)?;
         send(tx, frames, &mut params, (w, h));

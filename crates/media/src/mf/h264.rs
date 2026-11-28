@@ -34,6 +34,9 @@ pub struct EncoderConfig {
     /// Keyframe every this many frames.
     pub gop: u32,
     pub choice: EncoderChoice,
+    /// Live capture: drop frames rather than fall behind. Exports set this to
+    /// false so every frame is encoded.
+    pub realtime: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -343,19 +346,39 @@ impl VideoEncoder {
             }
             Mode::Async { .. } => {
                 self.queue.push_back((s, force_key));
-                // Never let a slow encoder build up a backlog: drop the oldest.
-                while self.queue.len() > 4 {
-                    self.queue.pop_front();
-                    self.dropped += 1;
+                if self.cfg.realtime {
+                    // Never let a slow encoder build up a backlog: drop the
+                    // oldest (keeping a requested keyframe request alive).
+                    while self.queue.len() > 4 {
+                        if let Some((_, key)) = self.queue.pop_front() {
+                            if key {
+                                if let Some(f) = self.queue.front_mut() {
+                                    f.1 = true;
+                                }
+                            }
+                        }
+                        self.dropped += 1;
+                    }
+                    self.pump(&mut out)?;
+                } else {
+                    // Wait (polling) until the encoder has taken everything but one frame.
+                    self.pump(&mut out)?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while self.queue.len() > 1 {
+                        if std::time::Instant::now() > deadline {
+                            bail!("the video encoder stopped responding");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        self.pump(&mut out)?;
+                    }
                 }
-                self.pump(&mut out, false)?;
             }
         }
         Ok(out)
     }
 
     /// Process pending encoder events without waiting.
-    fn pump(&mut self, out: &mut Vec<EncodedFrame>, wait: bool) -> Result<()> {
+    fn pump(&mut self, out: &mut Vec<EncodedFrame>) -> Result<()> {
         loop {
             let Mode::Async { events, need_input, drained } = &mut self.mode else { return Ok(()) };
             // Feed as much as the encoder asked for.
@@ -369,8 +392,7 @@ impl VideoEncoder {
                 unsafe { self.mft.ProcessInput(0, &s, 0) }.context("encoder input")?;
                 *need_input -= 1;
             }
-            let flags = if wait { MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0) } else { MF_EVENT_FLAG_NO_WAIT };
-            let ev = match unsafe { events.GetEvent(flags) } {
+            let ev = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(e) => e,
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(()),
                 Err(e) => return Err(e).context("encoder event"),
@@ -417,7 +439,7 @@ impl VideoEncoder {
     /// Collect finished frames without submitting anything.
     pub fn poll(&mut self) -> Result<Vec<EncodedFrame>> {
         let mut out = Vec::new();
-        self.pump(&mut out, false)?;
+        self.pump(&mut out)?;
         Ok(out)
     }
 
@@ -437,7 +459,7 @@ impl VideoEncoder {
                 // Feed the queue, then drain.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
                 while !self.queue.is_empty() && std::time::Instant::now() < deadline {
-                    self.pump(&mut out, false)?;
+                    self.pump(&mut out)?;
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 unsafe {
@@ -445,7 +467,7 @@ impl VideoEncoder {
                     self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
                 }
                 while std::time::Instant::now() < deadline {
-                    self.pump(&mut out, false)?;
+                    self.pump(&mut out)?;
                     if let Mode::Async { drained: true, .. } = self.mode {
                         break;
                     }
@@ -535,7 +557,7 @@ mod tests {
         eprintln!("encoders: {encs:#?}");
         let gpu = Arc::new(Gpu::primary().unwrap());
         let (w, h) = (640u32, 360u32);
-        let cfg = EncoderConfig { width: w, height: h, fps: 60, rate: RateControl::Vbr { kbps: 4000, max_kbps: 8000 }, gop: 60, choice };
+        let cfg = EncoderConfig { width: w, height: h, fps: 60, rate: RateControl::Vbr { kbps: 4000, max_kbps: 8000 }, gop: 60, choice, realtime: false };
         let mut enc = VideoEncoder::new(Some(gpu.clone()), cfg).unwrap();
         eprintln!("using {:?}", enc.info);
         let src = gpu.texture(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, D3D11_CPU_ACCESS_FLAG(0)).unwrap();

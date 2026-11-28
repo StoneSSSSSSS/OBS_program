@@ -108,15 +108,28 @@ fn device(id: Option<&str>, flow: EDataFlow) -> Result<IMMDevice> {
     }
 }
 
+/// A Win32 event closed when the last user lets go (the activation callback
+/// may fire after we stopped waiting).
+struct OwnedEvent(HANDLE);
+unsafe impl Send for OwnedEvent {}
+unsafe impl Sync for OwnedEvent {}
+impl Drop for OwnedEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 #[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
 struct Activated {
-    event: usize,
+    event: Arc<OwnedEvent>,
 }
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
     fn ActivateCompleted(&self, _op: Option<&IActivateAudioInterfaceAsyncOperation>) -> windows::core::Result<()> {
         unsafe {
-            let _ = SetEvent(HANDLE(self.event as *mut _));
+            let _ = SetEvent(self.event.0);
         }
         Ok(())
     }
@@ -138,18 +151,11 @@ fn app_client(pid: u32) -> Result<IAudioClient> {
         raw.Anonymous.Anonymous.Anonymous.blob = windows_core::imp::BLOB { cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32, pBlobData: &params as *const _ as *mut u8 };
         // Not ours to free: the blob points at `params` on the stack.
         let pv = std::mem::ManuallyDrop::new(windows_core::PROPVARIANT::from_raw(raw));
-        let event = CreateEventW(None, true, false, None)?;
-        let handler: IActivateAudioInterfaceCompletionHandler = Activated { event: event.0 as usize }.into();
-        let op = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&*pv as *const _), &handler);
-        let op = match op {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = CloseHandle(event);
-                return Err(e).context("app audio capture is not supported (needs Windows 10 2004+)");
-            }
-        };
-        let w = WaitForSingleObject(event, 5000);
-        let _ = CloseHandle(event);
+        let event = Arc::new(OwnedEvent(CreateEventW(None, true, false, None)?));
+        let handler: IActivateAudioInterfaceCompletionHandler = Activated { event: event.clone() }.into();
+        let op = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&*pv as *const _), &handler)
+            .context("app audio capture is not supported (needs Windows 10 2004+)")?;
+        let w = WaitForSingleObject(event.0, 5000);
         if w != WAIT_OBJECT_0 {
             bail!("app audio capture didn't start");
         }

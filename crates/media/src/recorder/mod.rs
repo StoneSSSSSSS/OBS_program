@@ -209,9 +209,12 @@ pub(crate) struct AudioPacket {
 pub(crate) enum MuxMsg {
     Video(VideoPacket),
     Audio(AudioPacket),
+    /// The video pipeline stopped (capture lost, monitor gone, shutting down).
+    VideoEnd,
     /// All audio before this frame position has been sent.
     AudioWatermark(i64),
-    Slots { slots: Vec<SlotInfo> },
+    /// App-track assignment from frame position pos on.
+    Slots { pos: i64, slots: Vec<SlotInfo> },
     Flush { after_hns: i64, reply: Sender<i64> },
     Stop,
 }
@@ -329,6 +332,11 @@ pub fn parse_meta(metas: &[(u64, Vec<u8>)]) -> Vec<SegmentMeta> {
 
 // ------------------------------------------------------------ muxer
 
+/// Write a fragment even if audio hasn't caught up after this long.
+const AUDIO_WAIT_HNS: i64 = 30_000_000;
+/// A pause in the video longer than this starts a new file.
+const GAP_HNS: i64 = 15_000_000;
+
 struct Gop {
     start: i64,
     packets: Vec<VideoPacket>,
@@ -339,40 +347,62 @@ struct Segment {
     path: PathBuf,
     start_hns: i64,
     start_frames: i64,
+    /// Wall clock at `start_hns` (anchored when the file was opened).
     start_ms: i64,
     avcc: Vec<u8>,
     size: (u32, u32),
     end_hns: i64,
 }
 
+/// 100 ns -> 90 kHz ticks, rounded to nearest.
+fn ticks90(hns: i64) -> i64 {
+    ((hns as i128 * 9 + if hns >= 0 { 500 } else { -500 }) / 1000) as i64
+}
+
 struct Muxer {
     sh: Arc<Shared>,
     seg: Option<Segment>,
     gops: VecDeque<Gop>,
+    video_ended: bool,
     audio: HashMap<AudioTrack, VecDeque<AudioPacket>>,
     watermark: i64,
+    /// App-track assignments in effect at the end of what's been written.
     slots: Vec<SlotInfo>,
-    slots_pending: bool,
+    /// Assignment changes not yet written: (frame position, assignment).
+    slot_changes: VecDeque<(i64, Vec<SlotInfo>)>,
     waiters: Vec<(i64, Sender<i64>)>,
+    /// After a write error, don't try again before this time.
+    retry_at: Option<std::time::Instant>,
+    last_trim: std::time::Instant,
 }
 
 impl Muxer {
     fn new(sh: Arc<Shared>) -> Muxer {
-        Muxer { sh, seg: None, gops: VecDeque::new(), audio: HashMap::new(), watermark: 0, slots: Vec::new(), slots_pending: false, waiters: Vec::new() }
+        Muxer {
+            sh,
+            seg: None,
+            gops: VecDeque::new(),
+            video_ended: false,
+            audio: HashMap::new(),
+            watermark: 0,
+            slots: Vec::new(),
+            slot_changes: VecDeque::new(),
+            waiters: Vec::new(),
+            retry_at: None,
+            last_trim: std::time::Instant::now(),
+        }
     }
 
     fn run(mut self, rx: Receiver<MuxMsg>) {
         loop {
             let msg = match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(m) => m,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    self.trim_stale_audio();
-                    continue;
-                }
+                Ok(m) => Some(m),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
                 Err(_) => break,
             };
             match msg {
-                MuxMsg::Video(p) => {
+                Some(MuxMsg::Video(p)) => {
+                    self.video_ended = false;
                     if p.key {
                         self.gops.push_back(Gop { start: p.time_hns, packets: vec![p] });
                     } else if let Some(g) = self.gops.back_mut() {
@@ -380,20 +410,27 @@ impl Muxer {
                     }
                     self.write_ready(false);
                 }
-                MuxMsg::Audio(p) => self.audio.entry(p.track).or_default().push_back(p),
-                MuxMsg::AudioWatermark(w) => {
+                Some(MuxMsg::VideoEnd) => {
+                    self.video_ended = true;
+                    self.write_ready(false);
+                }
+                Some(MuxMsg::Audio(p)) => self.audio.entry(p.track).or_default().push_back(p),
+                Some(MuxMsg::AudioWatermark(w)) => {
                     self.watermark = self.watermark.max(w);
                     self.write_ready(false);
                 }
-                MuxMsg::Slots { slots } => {
-                    self.slots = slots;
-                    self.slots_pending = true;
-                }
-                MuxMsg::Flush { after_hns, reply } => self.waiters.push((after_hns, reply)),
-                MuxMsg::Stop => break,
+                Some(MuxMsg::Slots { pos, slots }) => self.slot_changes.push_back((pos, slots)),
+                Some(MuxMsg::Flush { after_hns, reply }) => self.waiters.push((after_hns, reply)),
+                Some(MuxMsg::Stop) => break,
+                None => self.write_ready(false),
+            }
+            if self.last_trim.elapsed() >= Duration::from_millis(500) {
+                self.last_trim = std::time::Instant::now();
+                self.trim_stale_audio();
             }
         }
         // Write everything that's left, then close the file.
+        self.video_ended = true;
         self.write_ready(true);
         if let Some(seg) = self.seg.take() {
             self.finish_segment(seg);
@@ -404,13 +441,25 @@ impl Muxer {
         hns_to_frames(hns - self.sh.epoch.hns)
     }
 
-    /// Without video (e.g. capture unavailable), don't let audio pile up.
+    fn frame_hns(&self) -> i64 {
+        10_000_000 / self.sh.cfg.lock().fps.max(1) as i64
+    }
+
+    /// Audio that can never be written (no video around it) is dropped, so a
+    /// recording without a picture can't eat memory.
     fn trim_stale_audio(&mut self) {
-        let limit = self.frame_pos(now_hns()) - 48_000 * 20;
+        let limit = match self.gops.front() {
+            Some(g) => self.frame_pos(g.start) - 2 * crate::mf::aac::FRAME as i64,
+            None => self.frame_pos(now_hns()) - 48_000 * 10,
+        };
         for q in self.audio.values_mut() {
-            while q.front().map(|p| p.pos < limit).unwrap_or(false) && self.gops.is_empty() {
+            while q.front().map(|p| p.pos < limit).unwrap_or(false) {
                 q.pop_front();
             }
+        }
+        while self.slot_changes.len() > 1 && self.slot_changes[1].0 < limit {
+            let (_, s) = self.slot_changes.pop_front().unwrap();
+            self.slots = s;
         }
     }
 
@@ -418,60 +467,89 @@ impl Muxer {
         loop {
             let ready_end = if self.gops.len() >= 2 {
                 Some(self.gops[1].start)
-            } else if finishing && self.gops.len() == 1 {
+            } else if (finishing || self.video_ended) && self.gops.len() == 1 {
                 let g = &self.gops[0];
-                let fps = self.sh.cfg.lock().fps.max(1) as i64;
-                Some(g.packets.last().map(|p| p.time_hns).unwrap_or(g.start) + 10_000_000 / fps)
+                Some(g.packets.last().map(|p| p.time_hns).unwrap_or(g.start) + self.frame_hns())
             } else {
                 None
             };
             let Some(end) = ready_end else { break };
-            if !finishing && self.watermark < self.frame_pos(end) {
+            let audio_ready = self.watermark >= self.frame_pos(end) || now_hns() - end > AUDIO_WAIT_HNS;
+            if !finishing && !audio_ready {
                 break; // audio hasn't caught up yet
             }
             let gop = self.gops.pop_front().unwrap();
+            if self.retry_at.map(|t| std::time::Instant::now() < t).unwrap_or(false) {
+                continue; // recently failed to write: drop this stretch
+            }
             if let Err(e) = self.write_gop(gop, end) {
                 tracing::error!("writing recording: {e:#}");
                 let _ = self.sh.events.send(RecEvent::Warning(format!("Recording write failed: {e:#}")));
+                self.retry_at = Some(std::time::Instant::now() + Duration::from_secs(30));
                 if let Some(seg) = self.seg.take() {
                     self.finish_segment(seg);
                 }
+            } else {
+                self.retry_at = None;
             }
         }
+    }
+
+    /// Write queued app-track assignment changes that happen before `upto`.
+    fn write_slot_changes(&mut self, upto_frames: i64) -> Result<()> {
+        while self.slot_changes.front().map(|c| c.0 < upto_frames).unwrap_or(false) {
+            let (pos, slots) = self.slot_changes.pop_front().unwrap();
+            let seg = self.seg.as_mut().unwrap();
+            let at_s = ((pos - seg.start_frames) as f64 / 48_000.0).max(0.0);
+            let meta = SegmentMeta { at_s, slots: slots.clone(), ..Default::default() };
+            seg.w.write_meta(&serde_json::to_vec(&meta)?)?;
+            self.slots = slots;
+        }
+        Ok(())
     }
 
     fn write_gop(&mut self, gop: Gop, end: i64) -> Result<()> {
         let first = &gop.packets[0];
         let cfg = self.sh.cfg.lock().clone();
-        // Roll over to a new file?
+        // Roll over to a new file? (length reached, a pause, or new video settings)
         let roll = match &self.seg {
-            Some(s) => gop.start - s.start_hns >= cfg.segment_secs as i64 * 10_000_000 || (first.width, first.height) != s.size || first.sps.as_ref().map(|sps| crate::h264::build_avcc(sps, first.pps.as_deref().unwrap_or(&[])) != s.avcc).unwrap_or(false),
+            Some(s) => {
+                gop.start - s.start_hns >= cfg.segment_secs as i64 * 10_000_000 - self.frame_hns() / 2
+                    || gop.start - s.end_hns > GAP_HNS
+                    || (first.width, first.height) != s.size
+                    || first.sps.as_ref().map(|sps| crate::h264::build_avcc(sps, first.pps.as_deref().unwrap_or(&[])) != s.avcc).unwrap_or(false)
+            }
             None => true,
         };
         if roll {
             if let Some(seg) = self.seg.take() {
                 self.finish_segment(seg);
             }
+            // Assignments that took effect before this file starts go in its header.
+            let start_frames = self.frame_pos(gop.start);
+            while self.slot_changes.front().map(|c| c.0 <= start_frames).unwrap_or(false) {
+                self.slots = self.slot_changes.pop_front().unwrap().1;
+            }
             self.seg = Some(self.open_segment(&gop, &cfg)?);
         }
+        let end_frames = self.frame_pos(end);
+        self.write_slot_changes(end_frames)?;
         let seg_start_hns = self.seg.as_ref().unwrap().start_hns;
         let seg_start_frames = self.seg.as_ref().unwrap().start_frames;
-        if self.slots_pending {
-            let at_s = (gop.start - seg_start_hns) as f64 / 1e7;
-            let meta = SegmentMeta { at_s, slots: self.slots.clone(), ..Default::default() };
-            self.seg.as_mut().unwrap().w.write_meta(&serde_json::to_vec(&meta)?)?;
-            self.slots_pending = false;
-        }
-        // Video.
+        let fh = self.frame_hns();
+        // Video: durations from rounded absolute positions, so they add up exactly.
         let mut vs: Vec<SampleRef> = Vec::with_capacity(gop.packets.len());
         for (i, p) in gop.packets.iter().enumerate() {
-            let next = gop.packets.get(i + 1).map(|n| n.time_hns).unwrap_or(end);
-            let dur = ((next - p.time_hns).max(1) * 9 / 1000).max(1) as u32;
+            let mut next = gop.packets.get(i + 1).map(|n| n.time_hns).unwrap_or(end);
+            if next - p.time_hns > 10_000_000 {
+                next = p.time_hns + fh; // never stretch a frame over a pause
+            }
+            let dur = (ticks90(next - seg_start_hns) - ticks90(p.time_hns - seg_start_hns)).max(1) as u32;
             vs.push(SampleRef { data: &p.data, duration: dur, sync: p.key, cts: 0 });
         }
-        let mut runs = vec![TrackRun { track_id: TRACK_VIDEO, base_time: ((gop.start - seg_start_hns) * 9 / 1000).max(0) as u64, samples: &vs }];
-        // Audio: everything starting before `end`, split where a track has gaps.
-        let end_frames = self.frame_pos(end);
+        let mut runs = vec![TrackRun { track_id: TRACK_VIDEO, base_time: ticks90(gop.start - seg_start_hns).max(0) as u64, samples: &vs }];
+        // Audio: this interval's packets, split where a track has gaps.
+        let from_frames = (self.frame_pos(gop.start) - 2 * crate::mf::aac::FRAME as i64).max(seg_start_frames);
         let mut taken: Vec<(u32, Vec<AudioPacket>)> = Vec::new();
         for (track, q) in self.audio.iter_mut() {
             let id = match track {
@@ -479,10 +557,11 @@ impl Muxer {
                 AudioTrack::Mic => TRACK_MIC,
                 AudioTrack::Slot(s) => FIRST_SLOT_TRACK + s,
             };
-            let mut v = Vec::new();
+            let mut v: Vec<AudioPacket> = Vec::new();
             while q.front().map(|p| p.pos < end_frames).unwrap_or(false) {
                 let p = q.pop_front().unwrap();
-                if p.pos >= seg_start_frames {
+                // Skip audio from before this file / from a pause, and overlaps.
+                if p.pos >= from_frames && v.last().map(|l| p.pos >= l.pos + crate::mf::aac::FRAME as i64).unwrap_or(true) {
                     v.push(p);
                 }
             }
@@ -510,7 +589,7 @@ impl Muxer {
         seg.w.write_fragment(&runs)?;
         seg.w.flush()?;
         seg.end_hns = end;
-        let written_ms = self.sh.epoch.to_unix_ms(end);
+        let written_ms = seg.start_ms + (end - seg.start_hns) / 10_000;
         {
             let mut st = self.sh.status.lock();
             st.bytes = seg.w.bytes_written();
@@ -532,7 +611,9 @@ impl Muxer {
         let sps = first.sps.clone().context("keyframe without SPS")?;
         let pps = first.pps.clone().context("keyframe without PPS")?;
         let avcc = crate::h264::build_avcc(&sps, &pps);
-        let start_ms = self.sh.epoch.to_unix_ms(gop.start);
+        // Anchor to the wall clock now (no drift over days, correct after sleep).
+        let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        let start_ms = unix_now - (now_hns() - gop.start) / 10_000;
         std::fs::create_dir_all(&cfg.folder)?;
         let mut path = cfg.folder.join(segment_name(start_ms));
         let mut n = 2;
@@ -576,8 +657,13 @@ impl Muxer {
             }
         }
         let meta = SegmentMeta { at_s: 0.0, start_ms: Some(start_ms), tracks: metas, slots: self.slots.clone() };
-        self.slots_pending = false;
-        let w = FragWriter::create(&path, &tracks, (start_ms / 1000).max(0) as u64, Some(&serde_json::to_vec(&meta)?)).with_context(|| format!("creating {}", path.display()))?;
+        let w = match FragWriter::create(&path, &tracks, (start_ms / 1000).max(0) as u64, Some(&serde_json::to_vec(&meta)?)) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path); // don't leave empty files behind
+                return Err(e).with_context(|| format!("creating {}", path.display()));
+            }
+        };
         tracing::info!("recording to {}", path.display());
         {
             let mut st = self.sh.status.lock();

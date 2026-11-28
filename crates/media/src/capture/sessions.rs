@@ -37,6 +37,20 @@ pub fn processes() -> HashMap<u32, ProcInfo> {
     out
 }
 
+/// When a process started (FILETIME ticks), if we may ask.
+pub fn process_created(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let r = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u);
+        let _ = CloseHandle(h);
+        r.ok()?;
+        Some(((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64)
+    }
+}
+
 /// A process with an audio session on some output device.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SoundSession {
@@ -98,9 +112,17 @@ pub const NEVER_CAPTURE: &[&str] = &["clipvault.exe", "clipvault-service.exe", "
 /// contains another chosen tree is dropped, because per-app capture always
 /// includes the whole tree and would record that app twice (e.g. a launcher
 /// with a session whose game also plays sound).
-pub fn choose_targets(session_pids: &[u32], procs: &HashMap<u32, ProcInfo>, own: &[u32], never: &[&str]) -> Vec<Target> {
+///
+/// `created(pid)` gives a process's start time; a recorded parent that started
+/// after its child is a recycled pid, not the real parent, and is ignored.
+pub fn choose_targets(session_pids: &[u32], procs: &HashMap<u32, ProcInfo>, own: &[u32], never: &[&str], created: &dyn Fn(u32) -> Option<u64>) -> Vec<Target> {
     let exe_of = |p: u32| procs.get(&p).map(|i| i.exe.as_str()).unwrap_or("");
-    let parent_of = |p: u32| procs.get(&p).map(|i| i.parent).filter(|pp| *pp != p && *pp != 0);
+    let parent_of = |p: u32| {
+        procs.get(&p).map(|i| i.parent).filter(|pp| *pp != p && *pp != 0 && procs.contains_key(pp)).filter(|pp| match (created(*pp), created(p)) {
+            (Some(a), Some(b)) => a <= b,
+            _ => true,
+        })
+    };
     let mut roots: HashSet<u32> = HashSet::new();
     for &pid in session_pids {
         let exe = exe_of(pid);
@@ -161,16 +183,22 @@ mod tests {
         .collect();
         // Sessions: chrome child, steam itself AND its game, discord grandchild,
         // explorer, and ClipVault's own player.
-        let t = choose_targets(&[201, 300, 301, 402, 100, 500], &procs, &[], NEVER_CAPTURE);
+        let none = |_: u32| None;
+        let t = choose_targets(&[201, 300, 301, 402, 100, 500], &procs, &[], NEVER_CAPTURE, &none);
         let exes: Vec<&str> = t.iter().map(|t| t.exe.as_str()).collect();
         assert_eq!(exes, vec!["chrome.exe", "cs2.exe", "discord.exe"]);
         assert_eq!(t[0].root, 200);
         assert_eq!(t[2].root, 400);
         // Without the game, Steam is captured.
-        let t = choose_targets(&[300], &procs, &[], NEVER_CAPTURE);
+        let t = choose_targets(&[300], &procs, &[], NEVER_CAPTURE, &none);
         assert_eq!(t, vec![Target { root: 300, exe: "steam.exe".into() }]);
         // Own pids are skipped.
-        assert!(choose_targets(&[201], &procs, &[201], NEVER_CAPTURE).is_empty());
+        assert!(choose_targets(&[201], &procs, &[201], NEVER_CAPTURE, &none).is_empty());
+        // A "parent" that started after the child is a reused pid: ignored,
+        // so discord's tree isn't swallowed by an unrelated process.
+        let late = |pid: u32| Some(if pid == 100 { 50 } else { 10 });
+        let t = choose_targets(&[402], &procs, &[], NEVER_CAPTURE, &late);
+        assert_eq!(t[0].root, 400);
     }
 
     #[test]
@@ -179,7 +207,7 @@ mod tests {
         let s = sound_sessions();
         let procs = processes();
         let pids: Vec<u32> = s.iter().map(|x| x.pid).collect();
-        let t = choose_targets(&pids, &procs, &[std::process::id()], NEVER_CAPTURE);
+        let t = choose_targets(&pids, &procs, &[std::process::id()], NEVER_CAPTURE, &process_created);
         eprintln!("sessions: {:?}", s.iter().map(|x| (procs.get(&x.pid).map(|p| p.exe.clone()), x.active)).collect::<Vec<_>>());
         eprintln!("targets: {t:?}");
     }

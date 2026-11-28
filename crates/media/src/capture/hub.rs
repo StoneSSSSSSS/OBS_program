@@ -86,6 +86,21 @@ impl Hub {
         self.sources.remove(&id);
     }
 
+    /// Jump the output position forward (after sleep), discarding anything
+    /// queued before it.
+    pub fn skip_to(&mut self, pos: i64) {
+        if pos <= self.next {
+            return;
+        }
+        let pos = self.next + (pos - self.next) / BLOCK as i64 * BLOCK as i64;
+        self.next = pos;
+        for src in self.sources.values_mut() {
+            while src.segs.front().map(|s| s.end() <= pos).unwrap_or(false) {
+                src.segs.pop_front();
+            }
+        }
+    }
+
     pub fn push(&mut self, c: Chunk) {
         let frames = (c.data.len() / CHANNELS) as i64;
         if frames == 0 {

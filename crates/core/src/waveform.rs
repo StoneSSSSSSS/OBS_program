@@ -1,19 +1,15 @@
 //! Audio waveforms for the timeline lanes.
 //!
-//! One low-priority ffmpeg pass per media file turns every audio track into a
-//! loudness envelope (10 values per second per track, 0-255 on a dB scale),
-//! stored in `%LOCALAPPDATA%\ClipVault\waves\<hash>.cvw`. The file being
-//! recorded is extended incrementally.
+//! Every audio track becomes a loudness envelope (10 values per second per
+//! track, 0-255 on a dB scale), stored in
+//! `%LOCALAPPDATA%\ClipVault\waves\<hash>.cvw`. The recorder writes them
+//! live while recording; other files are decoded in the background.
 
-use anyhow::{bail, Context, Result};
-use std::io::Read;
+use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const PEAKS_PER_SEC: u32 = 10;
 /// Envelope sample rate produced by ffmpeg (decimated mean |x|).
-const ENVELOPE_HZ: u32 = 200;
 const MAGIC: &[u8; 4] = b"CVW1";
 /// dB range mapped onto 0..255.
 const FLOOR_DB: f32 = -54.0;
@@ -120,105 +116,48 @@ pub fn level_u8(amp: f32) -> u8 {
     (((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// ffmpeg arguments producing interleaved s16 envelopes for `tracks` audio
-/// tracks on stdout, starting `from_s` seconds into the file.
-/// `readrate` (x realtime) throttles disk reads for background backfill.
-pub fn ffmpeg_args(input: &Path, tracks: usize, from_s: f64, readrate: Option<f64>) -> Vec<String> {
-    let mut a: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into(), "-loglevel".into(), "error".into()];
-    if let Some(r) = readrate {
-        a.push("-readrate".into());
-        a.push(format!("{r:.0}"));
-    }
-    if from_s > 0.0 {
-        a.push("-ss".into());
-        a.push(format!("{from_s:.3}"));
-    }
-    a.push("-i".into());
-    a.push(input.to_string_lossy().to_string());
-    let n = tracks.max(1);
-    let abs: Vec<String> = (0..n).map(|i| format!("abs(val({i}))")).collect();
-    let graph = if n == 1 {
-        format!("[0:a:0]aformat=sample_fmts=fltp:channel_layouts=mono,aeval={}:c=same,aresample={ENVELOPE_HZ}[w]", abs[0])
-    } else {
-        let mut g = String::new();
-        for i in 0..n {
-            g.push_str(&format!("[0:a:{i}]aformat=sample_fmts=fltp:channel_layouts=mono[m{i}];"));
-        }
-        for i in 0..n {
-            g.push_str(&format!("[m{i}]"));
-        }
-        g.push_str(&format!("amerge=inputs={n},aeval={}:c=same,aresample={ENVELOPE_HZ}[w]", abs.join("|")));
-        g
-    };
-    a.extend(["-vn", "-sn", "-dn", "-filter_complex"].iter().map(|s| s.to_string()));
-    a.push(graph);
-    a.extend(["-map", "[w]", "-f", "s16le", "pipe:1"].iter().map(|s| s.to_string()));
-    a
+/// Turns PCM into 10/s peak values, one track at a time.
+#[derive(Debug, Clone)]
+pub struct PeakMeter {
+    per: usize,
+    count: usize,
+    max: f32,
 }
 
-/// Turn the interleaved s16 envelope into 10/s peaks.
-pub fn peaks_from_envelope(samples: &[i16], tracks: usize) -> Waveform {
-    let per = (ENVELOPE_HZ / PEAKS_PER_SEC) as usize;
-    let frames = samples.len() / tracks.max(1);
-    let out_frames = frames / per;
-    let mut peaks = Vec::with_capacity(out_frames * tracks);
-    for f in 0..out_frames {
-        for t in 0..tracks {
-            let mut m = 0i32;
-            for k in 0..per {
-                let v = (samples[(f * per + k) * tracks + t] as i32).abs();
-                m = m.max(v);
+impl PeakMeter {
+    /// `rate` = sample frames per second of the input.
+    pub fn new(rate: u32) -> PeakMeter {
+        PeakMeter { per: (rate / PEAKS_PER_SEC).max(1) as usize, count: 0, max: 0.0 }
+    }
+
+    /// Feed interleaved samples (`channels` per frame); returns completed peaks.
+    pub fn push(&mut self, pcm: &[f32], channels: usize, out: &mut Vec<u8>) {
+        for frame in pcm.chunks(channels.max(1)) {
+            for v in frame {
+                self.max = self.max.max(v.abs());
             }
-            peaks.push(level_u8(m as f32 / 32768.0));
+            self.count += 1;
+            if self.count >= self.per {
+                out.push(level_u8(self.max));
+                self.count = 0;
+                self.max = 0.0;
+            }
         }
     }
-    Waveform { tracks, rate: PEAKS_PER_SEC, peaks }
-}
 
-/// Run ffmpeg and build the waveform. Runs at below-normal priority so it
-/// never competes with a game.
-pub fn generate(ffmpeg: &Path, input: &Path, tracks: usize, from_s: f64, readrate: Option<f64>, cancel: &AtomicBool) -> Result<Waveform> {
-    let tracks = tracks.max(1);
-    let mut cmd = Command::new(ffmpeg);
-    cmd.args(ffmpeg_args(input, tracks, from_s, readrate)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-        cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
-    }
-    let mut child = cmd.spawn().context("starting ffmpeg")?;
-    let stderr = child.stderr.take();
-    let err_t = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut e) = stderr {
-            let _ = e.read_to_string(&mut s);
+    /// Feed `frames` frames of silence.
+    pub fn silence(&mut self, mut frames: usize, out: &mut Vec<u8>) {
+        while frames > 0 {
+            let n = (self.per - self.count).min(frames);
+            self.count += n;
+            frames -= n;
+            if self.count >= self.per {
+                out.push(level_u8(self.max));
+                self.count = 0;
+                self.max = 0.0;
+            }
         }
-        s
-    });
-    let mut out = child.stdout.take().context("ffmpeg stdout")?;
-    let mut bytes = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("cancelled");
-        }
-        let n = out.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buf[..n]);
     }
-    let status = child.wait()?;
-    let err = err_t.join().unwrap_or_default();
-    if !status.success() {
-        bail!("ffmpeg waveform failed: {}", err.lines().last().unwrap_or(""));
-    }
-    let samples: Vec<i16> = bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
-    Ok(peaks_from_envelope(&samples, tracks))
 }
 
 #[cfg(test)]
@@ -254,47 +193,22 @@ mod tests {
     }
 
     #[test]
-    fn envelope_to_peaks() {
-        // 2 tracks, 40 envelope samples (= 2 output frames).
-        let mut s = vec![0i16; 80];
-        s[2 * 5 + 1] = 16384; // track 1 loud in frame 0
-        let w = peaks_from_envelope(&s, 2);
-        assert_eq!(w.frames(), 2);
-        assert_eq!(w.get(0, 0), 0);
-        assert!(w.get(0, 1) > 200);
-        assert_eq!(w.get(1, 1), 0);
+    fn peak_meter() {
+        let mut m = PeakMeter::new(100);
+        let mut out = Vec::new();
+        let mut pcm = vec![0.0f32; 25 * 2];
+        pcm[3] = 0.5;
+        m.push(&pcm, 2, &mut out);
+        assert_eq!(out.len(), 2, "10 frames per peak at 100 Hz");
+        assert!(out[0] > 200);
+        assert_eq!(out[1], 0);
+        m.silence(15, &mut out);
+        assert_eq!(out.len(), 4);
     }
 
     #[test]
     fn wave_paths_are_stable_and_case_insensitive() {
         assert_eq!(wave_path(Path::new(r"I:\OBS\a.mp4")), wave_path(Path::new(r"i:\obs\A.MP4")));
         assert_ne!(wave_path(Path::new(r"I:\OBS\a.mp4")), wave_path(Path::new(r"I:\OBS\b.mp4")));
-    }
-
-    #[test]
-    fn real_ffmpeg_waveform() {
-        let Ok(tools) = crate::ffmpeg::locate("", "") else {
-            eprintln!("ffmpeg not found; skipping");
-            return;
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("w.mp4");
-        // Track 0 silent, track 1 a loud tone for the first 2 s then silence.
-        let mut cmd = Command::new(&tools.ffmpeg);
-        cmd.args(["-hide_banner", "-loglevel", "error", "-y",
-                  "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-                  "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2,apad",
-                  "-t", "4", "-map", "0:a", "-map", "1:a", "-c:a", "aac", "-ac", "2"])
-            .arg(&src);
-        crate::util::hide_console(&mut cmd);
-        assert!(cmd.status().unwrap().success());
-        let w = generate(&tools.ffmpeg, &src, 2, 0.0, Some(200.0), &AtomicBool::new(false)).unwrap();
-        assert!((w.duration_s() - 4.0).abs() < 0.3, "{}", w.duration_s());
-        assert_eq!(w.max_in(0, 0.0, 4.0, 1000), 0, "silent track stays flat");
-        assert!(w.max_in(1, 0.2, 1.8, 1000) > 150, "tone is loud");
-        assert!(w.max_in(1, 2.6, 3.8, 1000) < 40, "silence after the tone");
-        // Incremental from 2 s.
-        let tail = generate(&tools.ffmpeg, &src, 2, 2.0, None, &AtomicBool::new(false)).unwrap();
-        assert!((tail.duration_s() - 2.0).abs() < 0.3);
     }
 }

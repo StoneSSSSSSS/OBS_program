@@ -33,49 +33,76 @@ pub struct Category {
     pub clip_count: i64,
 }
 
-/// A non-destructive volume change on one audio track over a time range.
+/// A non-destructive volume change on one audio lane over a time range.
 /// `gain` 0 = muted, 1 = unchanged, 2 = twice as loud. Times are seconds on
-/// the media's own timeline (clip time), except in `Request::CutRange` where
-/// they are wall-clock seconds (Unix time) on the 24/7 timeline.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// the media's own timeline (clip time), except on the 24/7 timeline where
+/// they are wall-clock seconds (Unix time).
+///
+/// `lane` names what the edit applies to (`cat:game`, `app:discord.exe`,
+/// `mic`, `full`...; see [`crate::mixer`]). Older edits only have `track`,
+/// an index into the legacy 6-track layout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioEdit {
+    #[serde(default)]
     pub track: usize,
     pub start: f64,
     pub end: f64,
     pub gain: f32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lane: String,
 }
 
 impl AudioEdit {
+    pub fn new(lane: &str, start: f64, end: f64, gain: f32) -> AudioEdit {
+        AudioEdit { track: 0, start, end, gain, lane: lane.to_string() }
+    }
+
     pub fn overlaps(&self, a: f64, b: f64) -> bool {
         self.start < b && self.end > a
     }
+
+    /// The lane this edit applies to.
+    pub fn lane_id(&self) -> String {
+        if !self.lane.is_empty() {
+            self.lane.clone()
+        } else {
+            crate::mixer::LEGACY_LANES.get(self.track).map(|s| s.to_string()).unwrap_or_else(|| format!("track:{}", self.track))
+        }
+    }
 }
 
-/// Apply a gain to `[a, b)` on `track`, replacing whatever edits covered that
-/// range on that track. `gain == 1.0` simply clears the range.
-pub fn apply_edit(edits: &mut Vec<AudioEdit>, track: usize, a: f64, b: f64, gain: f32) {
+/// Apply a gain to `[a, b)` on `lane`, replacing whatever edits covered that
+/// range on that lane. `gain == 1.0` simply clears the range.
+pub fn apply_edit(edits: &mut Vec<AudioEdit>, lane: &str, a: f64, b: f64, gain: f32) {
     let (a, b) = (a.min(b), a.max(b));
     if b - a < 0.01 {
         return;
     }
     let mut out = Vec::with_capacity(edits.len() + 2);
     for e in edits.drain(..) {
-        if e.track != track || !e.overlaps(a, b) {
+        if e.lane_id() != lane || !e.overlaps(a, b) {
             out.push(e);
             continue;
         }
         // Keep the parts of the old edit outside [a, b).
         if e.start < a {
-            out.push(AudioEdit { end: a, ..e });
+            out.push(AudioEdit { end: a, ..e.clone() });
         }
         if e.end > b {
-            out.push(AudioEdit { start: b, ..e });
+            out.push(AudioEdit { start: b, ..e.clone() });
         }
     }
     if (gain - 1.0).abs() > 0.001 {
-        out.push(AudioEdit { track, start: a, end: b, gain });
+        out.push(AudioEdit::new(lane, a, b, gain));
     }
-    out.sort_by(|x, y| x.track.cmp(&y.track).then(x.start.total_cmp(&y.start)));
+    // Normalise legacy edits to lane ids so they compare cleanly.
+    for e in out.iter_mut() {
+        if e.lane.is_empty() {
+            e.lane = e.lane_id();
+            e.track = 0;
+        }
+    }
+    out.sort_by(|x, y| x.lane.cmp(&y.lane).then(x.start.total_cmp(&y.start)));
     *edits = out;
 }
 
@@ -86,7 +113,7 @@ pub fn rebase_edits(edits: &[AudioEdit], from: f64, to: f64) -> Vec<AudioEdit> {
     edits
         .iter()
         .filter(|e| e.overlaps(from, to))
-        .map(|e| AudioEdit { track: e.track, start: e.start.max(from) - from, end: e.end.min(to) - from, gain: e.gain })
+        .map(|e| AudioEdit { track: 0, start: e.start.max(from) - from, end: e.end.min(to) - from, gain: e.gain, lane: e.lane_id() })
         .collect()
 }
 
@@ -230,31 +257,40 @@ pub struct EventEntry {
 mod tests {
     use super::*;
 
-    fn e(track: usize, start: f64, end: f64, gain: f32) -> AudioEdit {
-        AudioEdit { track, start, end, gain }
+    fn e(lane: &str, start: f64, end: f64, gain: f32) -> AudioEdit {
+        AudioEdit::new(lane, start, end, gain)
     }
 
     #[test]
     fn applying_edits_replaces_overlaps() {
-        let mut v = vec![e(1, 0.0, 10.0, 0.0)];
-        apply_edit(&mut v, 1, 4.0, 6.0, 2.0);
-        assert_eq!(v, vec![e(1, 0.0, 4.0, 0.0), e(1, 4.0, 6.0, 2.0), e(1, 6.0, 10.0, 0.0)]);
-        // Other tracks untouched; gain 1 clears.
-        apply_edit(&mut v, 2, 0.0, 5.0, 0.5);
-        apply_edit(&mut v, 1, 3.0, 7.0, 1.0);
-        assert_eq!(v, vec![e(1, 0.0, 3.0, 0.0), e(1, 7.0, 10.0, 0.0), e(2, 0.0, 5.0, 0.5)]);
+        let mut v = vec![e("cat:game", 0.0, 10.0, 0.0)];
+        apply_edit(&mut v, "cat:game", 4.0, 6.0, 2.0);
+        assert_eq!(v, vec![e("cat:game", 0.0, 4.0, 0.0), e("cat:game", 4.0, 6.0, 2.0), e("cat:game", 6.0, 10.0, 0.0)]);
+        // Other lanes untouched; gain 1 clears.
+        apply_edit(&mut v, "app:discord.exe", 0.0, 5.0, 0.5);
+        apply_edit(&mut v, "cat:game", 3.0, 7.0, 1.0);
+        assert_eq!(v, vec![e("app:discord.exe", 0.0, 5.0, 0.5), e("cat:game", 0.0, 3.0, 0.0), e("cat:game", 7.0, 10.0, 0.0)]);
         // Reversed ranges are normalised; tiny ranges ignored.
-        apply_edit(&mut v, 3, 9.0, 8.0, 0.0);
-        assert!(v.contains(&e(3, 8.0, 9.0, 0.0)));
+        apply_edit(&mut v, "mic", 9.0, 8.0, 0.0);
+        assert!(v.contains(&e("mic", 8.0, 9.0, 0.0)));
         let before = v.clone();
-        apply_edit(&mut v, 3, 1.0, 1.001, 0.0);
+        apply_edit(&mut v, "mic", 1.0, 1.001, 0.0);
         assert_eq!(v, before);
     }
 
     #[test]
+    fn legacy_edits_convert_to_lanes() {
+        let legacy: AudioEdit = serde_json::from_str(r#"{"track":1,"start":0.0,"end":5.0,"gain":0.0}"#).unwrap();
+        assert_eq!(legacy.lane_id(), "cat:game");
+        let mut v = vec![legacy];
+        apply_edit(&mut v, "cat:game", 2.0, 3.0, 1.0);
+        assert_eq!(v, vec![e("cat:game", 0.0, 2.0, 0.0), e("cat:game", 3.0, 5.0, 0.0)]);
+    }
+
+    #[test]
     fn rebasing() {
-        let v = vec![e(0, 100.0, 110.0, 0.0), e(1, 95.0, 102.0, 2.0), e(2, 200.0, 210.0, 0.0)];
+        let v = vec![e("full", 100.0, 110.0, 0.0), e("cat:game", 95.0, 102.0, 2.0), e("mic", 200.0, 210.0, 0.0)];
         let r = rebase_edits(&v, 98.0, 108.0);
-        assert_eq!(r, vec![e(0, 2.0, 10.0, 0.0), e(1, 0.0, 4.0, 2.0)]);
+        assert_eq!(r, vec![e("full", 2.0, 10.0, 0.0), e("cat:game", 0.0, 4.0, 2.0)]);
     }
 }
