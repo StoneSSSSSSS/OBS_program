@@ -134,6 +134,7 @@ struct UiState {
     hotkeys: Vec<(i32, Action, Hotkey)>,
     mouse_hotkeys: Vec<(Action, Hotkey)>,
     raw_mouse: bool,
+    hotkeys_suspended: bool,
     taskbar_created: u32,
     overlay_cache: Option<(String, f32, Vec<u8>, u32, u32)>,
     icons: [HICON; 3],
@@ -235,6 +236,7 @@ pub fn run(
                 hotkeys: Vec::new(),
                 mouse_hotkeys: Vec::new(),
                 raw_mouse: false,
+                hotkeys_suspended: false,
                 taskbar_created,
                 overlay_cache: None,
                 icons,
@@ -316,7 +318,8 @@ impl UiState {
                         unsafe {
                             let _ = KillTimer(self.main, TIMER_HOTKEY_RESUME);
                         }
-                        if self.hotkeys.is_empty() && self.mouse_hotkeys.is_empty() {
+                        if self.hotkeys_suspended {
+                            self.hotkeys_suspended = false;
                             tracing::info!("hotkey capture timed out; restoring global hotkeys");
                             self.apply_config();
                         }
@@ -391,6 +394,7 @@ impl UiState {
                 }
             }
             UiCmd::SuspendHotkeys(suspend) => {
+                self.hotkeys_suspended = suspend;
                 if suspend {
                     unsafe {
                         for (id, _, _) in self.hotkeys.drain(..) {
@@ -414,7 +418,14 @@ impl UiState {
     fn apply_config(&mut self) {
         let cfg = self.cfg.read().clone();
         self.overlay_cache = None;
-        // Hotkeys
+        // A settings reload must not restore global keys during capture.
+        if !self.hotkeys_suspended {
+            self.apply_hotkeys(&cfg);
+        }
+        self.sync_tray();
+    }
+
+    fn apply_hotkeys(&mut self, cfg: &Config) {
         unsafe {
             for (id, _, _) in self.hotkeys.drain(..) {
                 let _ = UnregisterHotKey(self.main, id);
@@ -472,7 +483,6 @@ impl UiState {
                 }
             }
         }
-        self.sync_tray();
     }
 
     fn raw_input(&mut self, h: HRAWINPUT) {

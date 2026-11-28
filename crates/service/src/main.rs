@@ -20,6 +20,8 @@ mod startup;
 mod status;
 mod waves;
 mod win;
+#[cfg(test)]
+mod test_ipc;
 
 use crate::shared::{EngineCmd, LibCmd, Shared};
 use crate::win::ui::{self, Action, ToastLevel, UiCmd};
@@ -149,6 +151,8 @@ fn run_service() -> Result<()> {
     let hotkey_errors = Arc::new(Mutex::new(Vec::new()));
     let sh = Arc::new(Shared {
         cfg: cfg.clone(),
+        #[cfg(test)]
+        isolated_test: false,
         status: Mutex::new(cv_core::ipc::Status { service_started_ms: cv_core::util::now_ms(), ..Default::default() }),
         ui: ui_handle.clone(),
         engine_tx,
@@ -260,10 +264,9 @@ fn open_gui(sh: &Shared) {
 
 /// Re-read config.toml after the GUI saved it.
 pub fn reload_config(sh: &Shared, restart_recorder: bool) -> Result<()> {
-    let mut new = Config::load()?;
-    if new.fix_missing_drives() {
-        let _ = new.save();
-    }
+    let new = Config::load()?;
+    #[cfg(test)]
+    let new = if sh.isolated_test { test_ipc::isolate_config(new, &cv_core::paths::data_dir()) } else { new };
     let old = std::mem::replace(&mut *sh.cfg.write(), new.clone());
     let restart = restart_recorder || old.recorder_restart_needed(&new);
     tracing::info!("config reloaded (restart recorder: {restart})");
@@ -272,10 +275,10 @@ pub fn reload_config(sh: &Shared, restart_recorder: bool) -> Result<()> {
     if old.clips.folder != new.clips.folder || old.recording.folder != new.recording.folder {
         let _ = sh.lib_tx.send(LibCmd::Rescan);
     }
+    sh.engine_tx.send(EngineCmd::ConfigChanged { restart })?;
     if old.general.start_with_windows != new.general.start_with_windows {
         startup::sync_startup_shortcut(&new)?;
     }
-    let _ = sh.engine_tx.send(EngineCmd::ConfigChanged { restart });
     sh.log_event("info", "Settings updated");
     Ok(())
 }

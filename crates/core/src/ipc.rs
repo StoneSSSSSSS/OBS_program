@@ -78,20 +78,21 @@ pub enum Request {
     TrimClip { clip_id: i64, start_s: f64, end_s: f64, replace: bool },
     /// Export a shareable copy with one mixed audio track. `range` is in the
     /// source's seconds; `edits` in the same time base (clip seconds, or
-    /// wall-clock seconds for a recording range).
+    /// wall-clock seconds for a recording range). Omitted edits use stored clip edits.
     Export {
         source: ExportSource,
         #[serde(default)]
         range: Option<(f64, f64)>,
         mix: crate::mixer::MixSettings,
         #[serde(default)]
-        edits: Vec<crate::model::AudioEdit>,
+        edits: Option<Vec<crate::model::AudioEdit>>,
         target_size_mb: Option<u32>,
         #[serde(default)]
         title: String,
     },
     CancelJob { id: u64 },
     AudioDevices,
+    Monitors,
     RescanLibrary,
     KeepRecording { recording_id: i64, keep: bool },
     /// Delete clips (Recycle Bin by default).
@@ -128,6 +129,8 @@ pub struct RecStatus {
     pub paused_by_user: bool,
     pub path: String,
     pub started_ms: i64,
+    #[serde(default)]
+    pub written_until_ms: i64,
     pub bytes: i64,
     pub healthy: bool,
     pub tracks: u32,
@@ -207,6 +210,14 @@ pub struct AudioDevices {
     pub outputs: Vec<Endpoint>,
     pub default_input: Option<String>,
     pub default_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    pub device_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

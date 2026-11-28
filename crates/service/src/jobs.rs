@@ -11,7 +11,7 @@ use cv_core::mixer::{compose, compose_slot, MixSettings, TrackSource};
 use cv_core::model::{rebase_edits, AudioEdit, NewClip};
 use cv_core::naming::{render_template, sanitize_component, unique_path};
 use cv_core::util::now_ms;
-use cv_media::cut::{cut, CutSource};
+use cv_media::cut::{cut, CutSource, CutSpan};
 use cv_media::export::{bitrate_for_size, export as run_export, ExportJob, VideoOut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 pub enum JobKind {
     CutRange { from_ms: i64, to_ms: i64, title: String, game_id: Option<i64>, category_ids: Vec<i64>, mix: Option<MixSettings>, audio_edits: Vec<AudioEdit> },
     Trim { clip_id: i64, start_s: f64, end_s: f64, replace: bool },
-    Export { source: ExportSource, range: Option<(f64, f64)>, mix: MixSettings, edits: Vec<AudioEdit>, target_size_mb: Option<u32>, title: String },
+    Export { source: ExportSource, range: Option<(f64, f64)>, mix: MixSettings, edits: Option<Vec<AudioEdit>>, target_size_mb: Option<u32>, title: String },
 }
 
 pub struct JobRequest {
@@ -79,6 +79,7 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<JobRequest>) {
         let id = req.id;
         if req.cancel.load(Ordering::SeqCst) {
             update(&sh, id, |j| j.state = "cancelled".into());
+            CANCELS.lock().retain(|(i, _)| *i != id);
             continue;
         }
         update(&sh, id, |j| j.state = "running".into());
@@ -92,7 +93,7 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<JobRequest>) {
         let result = match &req.kind {
             JobKind::CutRange { from_ms, to_ms, title, game_id, category_ids, mix, audio_edits } => cut_range(&sh, *from_ms, *to_ms, title, *game_id, category_ids, mix.as_ref(), audio_edits, &mut progress, &req.cancel),
             JobKind::Trim { clip_id, start_s, end_s, replace } => trim(&sh, *clip_id, *start_s, *end_s, *replace, &mut progress, &req.cancel),
-            JobKind::Export { source, range, mix, edits, target_size_mb, title } => export(&sh, source, *range, mix, edits, *target_size_mb, title, &mut progress, &req.cancel),
+            JobKind::Export { source, range, mix, edits, target_size_mb, title } => export(&sh, source, *range, mix, edits.as_deref(), *target_size_mb, title, &mut progress, &req.cancel),
         };
         match result {
             Ok((output, clip_id)) => {
@@ -141,34 +142,63 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<JobRequest>) {
 /// 24/7 footage overlapping a wall-clock range (the live file as far as written).
 fn footage_for(sh: &Shared, from_ms: i64, to_ms: i64) -> Result<Vec<Footage>> {
     let db = Db::open_default()?;
-    let written = sh.status.lock().recording.bytes;
-    let _ = written;
-    let now = now_ms();
+    let (live_path, written) = {
+        let status = sh.status.lock();
+        (status.recording.path.clone(), status.recording.written_until_ms)
+    };
     Ok(db
         .list_recordings()?
         .into_iter()
         .filter(|r| r.start_ms < to_ms && (r.end_ms() > from_ms || r.is_live()))
+        .filter(|r| !r.is_live() || crate::shared::same_path(&r.path, &live_path))
         .map(|r| Footage {
-            duration_s: if r.is_live() { ((now - r.start_ms - 2000).max(0)) as f64 / 1000.0 } else { r.duration },
+            duration_s: if r.is_live() { (written - r.start_ms).max(0) as f64 / 1000.0 } else { r.duration },
             path: PathBuf::from(&r.path),
             start_ms: r.start_ms,
         })
         .collect())
 }
 
-/// Cut `[from_ms, to_ms)` of the 24/7 recording into `dest` (lossless).
-fn cut_recording(sh: &Shared, from_ms: i64, to_ms: i64, dest: &Path, progress: &mut dyn FnMut(f32), cancel: &AtomicBool) -> Result<(f64, i64)> {
+/// Translate absolute edits through the intervals that made it into the cut.
+fn edits_for_join(edits: &[AudioEdit], starts: &[i64], spans: &[CutSpan]) -> Vec<AudioEdit> {
+    let mut mapped = Vec::new();
+    for edit in edits {
+        let mut pieces: Vec<AudioEdit> = Vec::new();
+        for span in spans {
+            let wall_start = starts[span.source_index] as f64 / 1000.0;
+            let from = wall_start + span.from_s;
+            let to = wall_start + span.to_s;
+            if let Some(mut piece) = rebase_edits(std::slice::from_ref(edit), from, to).pop() {
+                piece.start += span.output_start_s;
+                piece.end += span.output_start_s;
+                if let Some(last) = pieces.last_mut() {
+                    if (last.end - piece.start).abs() < 0.000_001 {
+                        last.end = piece.end;
+                        continue;
+                    }
+                }
+                pieces.push(piece);
+            }
+        }
+        mapped.extend(pieces);
+    }
+    mapped
+}
+
+/// Cut a wall-clock range of the 24/7 recording, and translate any edits into clip time.
+#[allow(clippy::too_many_arguments)]
+fn cut_recording(sh: &Shared, from_ms: i64, to_ms: i64, dest: &Path, edits: &[AudioEdit], progress: &mut dyn FnMut(f32), cancel: &AtomicBool) -> Result<(f64, i64, Vec<AudioEdit>)> {
     anyhow::ensure!(to_ms > from_ms, "the end is before the start");
     anyhow::ensure!(to_ms - from_ms <= 6 * 3600 * 1000, "clips are limited to 6 hours");
     let footage = footage_for(sh, from_ms, to_ms)?;
     let parts = plan(&footage, from_ms, to_ms);
     anyhow::ensure!(!parts.is_empty(), "nothing was recorded in that time range");
-    let first = footage.iter().find(|f| f.path == parts[0].path).map(|f| f.start_ms).unwrap_or(from_ms);
-    let start_ms = first + (parts[0].from_s * 1000.0) as i64;
+    let starts: Vec<_> = parts.iter().map(|part| footage.iter().find(|f| f.path == part.path).map(|f| f.start_ms).unwrap_or(from_ms)).collect();
+    let start_ms = starts[0] + (parts[0].from_s * 1000.0) as i64;
     let out = cut(&parts, dest, Some(start_ms), progress, cancel).inspect_err(|_| {
         let _ = std::fs::remove_file(dest);
     })?;
-    Ok((out.duration, start_ms))
+    Ok((out.duration, start_ms, edits_for_join(edits, &starts, &out.spans)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,7 +229,7 @@ fn cut_range(
     let dir = clip_dir(&cfg, &game_name);
     std::fs::create_dir_all(&dir)?;
     let tmp = temp_beside(&dir);
-    let (dur, start_ms) = cut_recording(sh, from_ms, to_ms, &tmp, progress, cancel)?;
+    let (dur, start_ms, clip_edits) = cut_recording(sh, from_ms, to_ms, &tmp, edits, progress, cancel)?;
     let _lock = sh.library_lock.lock();
     let dest = unique_path(&dir, &title, "mp4", None);
     move_file(&tmp, &dest, Duration::from_secs(10))?;
@@ -223,7 +253,6 @@ fn cut_range(
     if let Some(m) = mix {
         db.set_clip_mixer(id, Some(m))?;
     }
-    let clip_edits = rebase_edits(edits, start_ms as f64 / 1000.0, start_ms as f64 / 1000.0 + dur);
     if !clip_edits.is_empty() {
         db.set_clip_audio_edits(id, &clip_edits)?;
     }
@@ -251,14 +280,21 @@ fn trim(sh: &Shared, clip_id: i64, start_s: f64, end_s: f64, replace: bool, prog
     })?;
     let edits = rebase_edits(&clip.audio_edits, start_s, end_s);
     let _lock = sh.library_lock.lock();
+    let current = db.clip(clip_id).and_then(|clip| clip.context("clip not found"));
+    if let Err(error) = current.and_then(|current| {
+        anyhow::ensure!(current.path == clip.path && src.is_file(), "The source clip changed during trimming");
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
+        Ok(())
+    }) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     if replace {
-        if cfg.clips.delete_to_recycle_bin {
-            crate::win::shell::recycle(&[src.as_path()])?;
-        } else {
-            std::fs::remove_file(&src)?;
-        }
-        std::fs::rename(&tmp, &src)?;
+        replace_trimmed_file(&tmp, &src, cfg.clips.delete_to_recycle_bin).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
         drop(_lock);
+        let _ = std::fs::remove_file(cv_core::waveform::wave_path(&src));
         probe_and_thumb(&db, clip_id, &src, cfg.clips.generate_thumbnails);
         db.set_clip_audio_edits(clip_id, &edits)?;
         let _ = db.set_clip_source_start(clip_id, start_ms);
@@ -297,6 +333,36 @@ fn trim(sh: &Shared, clip_id: i64, start_s: f64, end_s: f64, replace: bool, prog
     }
 }
 
+/// Keep the existing path in place until the same-volume rename succeeds.
+fn replace_trimmed_file(replacement: &Path, original: &Path, recycle_original: bool) -> Result<()> {
+    let backup = recycle_original.then(|| original.with_file_name(format!(
+        ".cv_{}_{}", cv_core::util::random_token(12), original.file_name().unwrap_or_default().to_string_lossy()
+    )));
+    if let Some(path) = &backup {
+        std::fs::hard_link(original, path).or_else(|_| std::fs::copy(original, path).map(|_| ()))
+            .inspect_err(|_| { let _ = std::fs::remove_file(path); })
+            .context("Could not preserve the original clip")?;
+    }
+    if let Err(error) = std::fs::rename(replacement, original) {
+        if let Some(path) = &backup {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error).context("Could not replace the clip");
+    }
+    if let Some(path) = backup {
+        if let Err(error) = crate::win::shell::recycle(&[path.as_path()]) {
+            tracing::warn!("Original clip retained at {}: {error:#}", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Adjust the retry to the observed overshoot, with a margin for encoder variance.
+fn share_retry_bitrate(kbps: u32, actual: u64, cap: u64) -> Option<u32> {
+    let next = (kbps as f64 * cap as f64 / actual as f64 * 0.9) as u32;
+    (next >= 150).then_some(next)
+}
+
 /// Gain curve for every audio track of `path` from a mix + edits (file time).
 pub fn gains_for(path: &Path, mix: &MixSettings, edits: &[AudioEdit], edit_offset: f64, fade: f64, overrides: &std::collections::BTreeMap<String, String>) -> Result<Vec<cv_core::mixer::GainCurve>> {
     let info = cv_media::probe::probe(path)?;
@@ -320,7 +386,7 @@ fn export(
     source: &ExportSource,
     range: Option<(f64, f64)>,
     mix: &MixSettings,
-    edits: &[AudioEdit],
+    edits: Option<&[AudioEdit]>,
     target_size_mb: Option<u32>,
     title: &str,
     progress: &mut dyn FnMut(f32),
@@ -334,15 +400,13 @@ fn export(
         ExportSource::Clip { clip_id } => {
             let db = Db::open_default()?;
             let clip = db.clip(*clip_id)?.context("clip not found")?;
-            let e = if edits.is_empty() { clip.audio_edits.clone() } else { edits.to_vec() };
+            let e = edits.map(<[AudioEdit]>::to_vec).unwrap_or(clip.audio_edits);
             (PathBuf::from(&clip.path), e, clip.source_start_ms, clip.title.clone(), None)
         }
         ExportSource::Recording { from_ms, to_ms } => {
-            let tmp = out_dir.join(format!(".cv_range_{}.mp4", now_ms()));
+            let tmp = temp_beside(&out_dir);
             let mut sub = |p: f32| progress(p * 0.2);
-            let (dur, start) = cut_recording(sh, *from_ms, *to_ms, &tmp, &mut sub, cancel)?;
-            // Wall-clock edits -> seconds into the cut.
-            let e = rebase_edits(edits, start as f64 / 1000.0, start as f64 / 1000.0 + dur);
+            let (_, start, e) = cut_recording(sh, *from_ms, *to_ms, &tmp, edits.unwrap_or_default(), &mut sub, cancel)?;
             let local = chrono::DateTime::from_timestamp_millis(*from_ms).unwrap_or_default().with_timezone(&chrono::Local);
             (tmp.clone(), e, Some(start), format!("24-7 {}", local.format("%Y-%m-%d %H-%M-%S")), Some(tmp))
         }
@@ -369,25 +433,35 @@ fn export(
             None => "export".into(),
         };
         let out = unique_path(&out_dir, &format!("{label} ({suffix})"), "mp4", None);
-        let tmp = out.with_extension("tmp.mp4");
+        let tmp = temp_beside(&out_dir);
         let base = if temp.is_some() { 0.2 } else { 0.0 };
-        for attempt in 0..2 {
-            let job = ExportJob { source: src.clone(), range, gains: gains.clone(), video: video.clone(), audio_kbps, start_ms };
-            let mut sub = |p: f32| progress(base + p * (1.0 - base));
-            run_export(&job, &tmp, &mut sub, cancel).inspect_err(|_| {
-                let _ = std::fs::remove_file(&tmp);
-            })?;
-            let size = tmp.metadata().map(|m| m.len()).unwrap_or(0);
-            match (target_size_mb, &video) {
-                (Some(mb), VideoOut::Reencode { kbps, max_height }) if size > mb as u64 * 1024 * 1024 && attempt == 0 => {
-                    let smaller = (*kbps as f64 * 0.82) as u32;
-                    tracing::info!("export {} MB over target; retrying at {smaller} kbps", size / 1024 / 1024);
-                    video = VideoOut::Reencode { kbps: smaller, max_height: *max_height };
+        let result = (|| -> Result<()> {
+            let max_bytes = target_size_mb.map(|mb| u64::from(mb) * 1024 * 1024);
+            for attempt in 0..3 {
+                let job = ExportJob { source: src.clone(), range, gains: gains.clone(), video: video.clone(), audio_kbps, start_ms };
+                let mut sub = |p: f32| progress(base + p * (1.0 - base));
+                run_export(&job, &tmp, &mut sub, cancel)?;
+                anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
+                let size = tmp.metadata()?.len();
+                if max_bytes.is_none_or(|cap| size <= cap) {
+                    std::fs::rename(&tmp, &out)?;
+                    return Ok(());
                 }
-                _ => break,
+                if attempt == 2 {
+                    break;
+                }
+                let (Some(cap), VideoOut::Reencode { kbps, max_height }) = (max_bytes, &video) else { break };
+                let Some(smaller) = share_retry_bitrate(*kbps, size, cap) else { break };
+                tracing::info!("export is {size} bytes for a {cap}-byte limit; retrying at {smaller} kbps");
+                video = VideoOut::Reencode { kbps: smaller, max_height: *max_height };
+                std::fs::remove_file(&tmp)?;
             }
+            anyhow::bail!("The export exceeded the {} MB limit. Trim the selection or choose a larger limit.", target_size_mb.unwrap_or_default())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, &out)?;
+        result?;
         Ok(out)
     })();
     if let Some(t) = temp {
@@ -403,4 +477,58 @@ fn export(
     let msg = if cfg.export.copy_to_clipboard { "Exported — copied to clipboard, paste it anywhere" } else { "Export finished" };
     sh.toast(ToastLevel::Success, msg);
     Ok((out, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_audio_edits_move_with_footage_across_a_gap() {
+        let spans = [
+            CutSpan { source_index: 0, from_s: 2.0, to_s: 8.0, output_start_s: 0.0 },
+            CutSpan { source_index: 1, from_s: 0.0, to_s: 8.0, output_start_s: 6.0 },
+        ];
+        let starts = [100_000, 120_000];
+        let edits = [
+            AudioEdit::new("mic", 115.0, 119.0, 0.0),
+            AudioEdit::new("mic", 122.0, 124.0, 0.0),
+            AudioEdit::new("game", 106.0, 121.0, 0.5),
+        ];
+        assert_eq!(edits_for_join(&edits, &starts, &spans), vec![
+            AudioEdit::new("mic", 8.0, 10.0, 0.0),
+            AudioEdit::new("game", 4.0, 7.0, 0.5),
+        ]);
+    }
+
+    #[test]
+    fn failed_replacement_preserves_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.mp4");
+        let missing = dir.path().join("missing.mp4");
+        std::fs::write(&original, b"original").unwrap();
+
+        assert!(replace_trimmed_file(&missing, &original, true).is_err());
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn trim_replaces_original_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.mp4");
+        let replacement = dir.path().join("replacement.mp4");
+        std::fs::write(&original, b"original").unwrap();
+        std::fs::write(&replacement, b"trimmed").unwrap();
+
+        replace_trimmed_file(&replacement, &original, false).unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"trimmed");
+        assert!(!replacement.exists());
+    }
+
+    #[test]
+    fn share_retry_uses_observed_overshoot() {
+        assert_eq!(share_retry_bitrate(1000, 20_000, 10_000), Some(450));
+        assert_eq!(share_retry_bitrate(150, 20_000, 10_000), None);
+    }
 }

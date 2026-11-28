@@ -6,13 +6,11 @@ use cv_core::config::{parse_legacy_configs, Config};
 use cv_core::paths;
 use std::path::{Path, PathBuf};
 
-/// Load config.toml (creating it with defaults on first run). Folders on a
-/// drive this PC doesn't have are switched to the defaults.
+/// Load config.toml, preserving selected folders if their drives are offline.
 pub fn load_or_first_run() -> Config {
     let path = paths::config_path();
-    let mut cfg = if path.exists() { Config::load_or_default() } else { Config::default() };
-    let fixed = cfg.fix_missing_drives();
-    if !path.exists() || fixed {
+    let cfg = Config::load_or_default();
+    if !path.exists() {
         if let Err(e) = cfg.save() {
             tracing::error!("could not save config: {e:#}");
         }

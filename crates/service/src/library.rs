@@ -60,13 +60,19 @@ pub fn run(sh: Arc<Shared>, rx: crossbeam_channel::Receiver<LibCmd>) {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(_) => break,
         }
-        while rx.try_recv().is_ok() {}
+        for cmd in rx.try_iter() {
+            force_scan |= matches!(cmd, LibCmd::Rescan);
+        }
     }
 }
 
 fn list_videos(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file() && is_video_file(p)).collect())
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            p.is_file() && is_video_file(p)
+                && !name.starts_with(".cv_")
+        }).collect())
         .unwrap_or_default()
 }
 
@@ -77,6 +83,7 @@ fn index_recordings(sh: &Shared, db: &Db) -> bool {
     if !folder.is_dir() {
         return false;
     }
+    let _lock = sh.library_lock.lock();
     let mut changed = false;
     let mut present: HashSet<String> = HashSet::new();
     let existing: HashMap<String, cv_core::model::Recording> =
@@ -157,9 +164,11 @@ fn retention(sh: &Shared, db: &Db) {
     let cfg = sh.cfg();
     let folder = PathBuf::from(&cfg.recording.folder);
     let Some((free, _)) = crate::win::shell::disk_space(&folder) else { return };
+    let _lock = sh.library_lock.lock();
     let recs = db.list_recordings().unwrap_or_default();
     let segments: Vec<SegmentInfo> = recs
         .iter()
+        .filter(|recording| Path::new(&recording.path).starts_with(&folder))
         .map(|r| SegmentInfo {
             path: PathBuf::from(&r.path),
             start_ms: r.start_ms,
@@ -392,8 +401,12 @@ fn legacy_reorganize(sh: &Shared, db: &Db) -> anyhow::Result<()> {
 
 /// Move a recording into/out of the Kept folder (protected from retention).
 pub fn set_kept(sh: &Shared, recording_id: i64, keep: bool) -> anyhow::Result<()> {
+    let _lock = sh.library_lock.lock();
     let db = Db::open_default()?;
     let rec = db.recording(recording_id)?.ok_or_else(|| anyhow::anyhow!("recording not found"))?;
+    if rec.kept == keep {
+        return Ok(());
+    }
     anyhow::ensure!(!rec.is_live() || keep, "can't move the recording that's being written");
     let src = PathBuf::from(&rec.path);
     let folder = PathBuf::from(&sh.cfg.read().recording.folder);

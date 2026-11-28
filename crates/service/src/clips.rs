@@ -120,7 +120,7 @@ pub fn clip_dir(cfg: &cv_core::config::Config, game_name: &str) -> PathBuf {
 
 /// A temporary output path next to where the clip will end up.
 pub fn temp_beside(dir: &Path) -> PathBuf {
-    dir.join(format!(".cv_{}.mp4", now_ms()))
+    dir.join(format!(".cv_{}.mp4", cv_core::util::random_token(12)))
 }
 
 fn save_range(sh: &Shared, footage: &[Footage], from_ms: i64, to_ms: i64, short: bool) -> Result<(i64, String, String, f64)> {

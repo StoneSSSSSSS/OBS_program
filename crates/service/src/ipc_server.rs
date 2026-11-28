@@ -4,7 +4,7 @@ use crate::jobs::{self, JobKind};
 use crate::engine::send_and_wait;
 use crate::shared::{EngineCmd, LibCmd, Shared};
 use anyhow::Result;
-use cv_core::ipc::{ClientMsg, Event, IpcInfo, Request, ServerMsg};
+use cv_core::ipc::{ClientMsg, Event, IpcInfo, MonitorInfo, Request, ServerMsg};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
@@ -136,6 +136,15 @@ fn handle(sh: &Arc<Shared>, req: Request) -> Result<Value, String> {
             let _ = sh.audio_tx.try_send(());
             Ok(serde_json::to_value(sh.devices.lock().clone()).unwrap_or_default())
         }
+        Request::Monitors => {
+            let monitors: Vec<_> = cv_media::d3d::list_outputs().into_iter().map(|output| MonitorInfo {
+                width: output.width(),
+                height: output.height(),
+                primary: output.primary,
+                device_name: output.device_name,
+            }).collect();
+            serde_json::to_value(monitors).map_err(|err| err.to_string())
+        }
         Request::RescanLibrary => {
             let _ = sh.lib_tx.send(LibCmd::Rescan);
             Ok(Value::Null)
@@ -159,6 +168,10 @@ fn handle(sh: &Arc<Shared>, req: Request) -> Result<Value, String> {
             Ok(Value::Null)
         }
         Request::CopyFileToClipboard { path } => {
+            #[cfg(test)]
+            if sh.isolated_test {
+                return Err("Clipboard is disabled for the isolated IPC fixture".to_string());
+            }
             crate::win::shell::copy_file_to_clipboard(std::path::Path::new(&path)).map_err(e2s)?;
             Ok(Value::Null)
         }

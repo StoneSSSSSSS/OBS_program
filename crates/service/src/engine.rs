@@ -22,6 +22,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const META_RECORDING_WANTED: &str = "recording_wanted";
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const RESTART_WINDOW: Duration = Duration::from_secs(3600);
+const MAX_STALL_RESTARTS: usize = 10;
+
+fn stall_restart_allowed(starts: &mut VecDeque<Instant>, now: Instant) -> bool {
+    starts.retain(|start| now.saturating_duration_since(*start) < RESTART_WINDOW);
+    starts.len() < MAX_STALL_RESTARTS
+}
+
 
 pub fn buffer_dir() -> PathBuf {
     cv_core::paths::data_dir().join("buffer")
@@ -81,7 +90,7 @@ struct Engine {
     namer: Arc<Namer>,
     wanted: bool,
     buffer_mode: bool,
-    /// Files written by the current recorder (newest last).
+    /// Recent files written by this engine, including footage across mode changes.
     footage: Vec<Footage>,
     mic: Option<MicDecision>,
     last_save: Option<Instant>,
@@ -120,12 +129,21 @@ pub fn run(sh: Arc<Shared>, rx: Receiver<EngineCmd>) {
     };
     // Give the mic guard a moment to pick the microphone first.
     std::thread::sleep(Duration::from_millis(600));
-    while let Ok(cmd) = rx.try_recv() {
-        if let EngineCmd::Mic { decision } = cmd {
-            e.mic = Some(decision);
+    let mut pending = Vec::new();
+    for cmd in rx.try_iter() {
+        match cmd {
+            EngineCmd::Mic { decision } => e.mic = Some(decision),
+            EngineCmd::Shutdown => return,
+            cmd => pending.push(cmd),
         }
     }
+    if e.sh.is_shutting_down() {
+        return;
+    }
     e.start();
+    for cmd in pending {
+        e.command(cmd);
+    }
     let tick = crossbeam_channel::tick(Duration::from_secs(1));
     loop {
         let ev_rx = e.events_rx.clone();
@@ -210,12 +228,8 @@ impl Engine {
         match Recorder::start(rc, self.namer.clone(), self.events_tx.clone()) {
             Ok(r) => {
                 self.rec = Some(r);
-                self.footage.clear();
                 self.progress = (0, Instant::now());
-                self.starts.push_back(Instant::now());
-                while self.starts.front().map(|t| t.elapsed() > Duration::from_secs(3600)).unwrap_or(false) {
-                    self.starts.pop_front();
-                }
+                self.sh.update_status(|s| s.engine.last_error.clear());
                 self.retry_at = None;
                 let what = if self.buffer_mode { "clip buffer only (24/7 paused)" } else { "24/7 recording" };
                 self.sh.log_event("info", format!("Recording started: {what} to {}", folder.display()));
@@ -282,14 +296,33 @@ impl Engine {
                 reply(r, res);
             }
             EngineCmd::SetRecording { enabled, reply: r } => {
+                if enabled && !self.sh.cfg().recording.enabled {
+                    let msg = "Turn on 24/7 recording in Settings before resuming".to_string();
+                    self.sh.toast(ToastLevel::Warning, &msg);
+                    reply(r, Err(msg));
+                    return;
+                }
+                let changed = self.wanted != enabled;
+                let stored = Db::open_default().and_then(|db| {
+                    db.meta_set(META_RECORDING_WANTED, if enabled { "1" } else { "0" })
+                });
+                if let Err(error) = stored {
+                    let msg = format!("Could not save the recording preference: {error:#}");
+                    self.sh.toast(ToastLevel::Error, &msg);
+                    reply(r, Err(msg));
+                    return;
+                }
                 self.wanted = enabled;
-                if let Ok(db) = Db::open_default() {
-                    let _ = db.meta_set(META_RECORDING_WANTED, if enabled { "1" } else { "0" });
+                if changed || self.rec.is_none() {
+                    self.restart("24/7 toggled");
+                }
+                if self.rec.is_none() {
+                    reply(r, Err(self.sh.status.lock().engine.last_error.clone()));
+                    return;
                 }
                 let msg = if enabled { "24/7 recording resumed" } else { "24/7 recording paused (the clip hotkey still works)" };
                 self.sh.log_event("info", msg);
                 self.sh.toast(ToastLevel::Info, msg);
-                self.restart("24/7 toggled");
                 reply(r, Ok(()));
             }
             EngineCmd::Restart { reply: r } => {
@@ -343,22 +376,29 @@ impl Engine {
         let end_ms = rec.flush(Duration::from_secs(6)).map_err(|e| format!("{e:#}"))?;
         let secs = if short { cfg.clips.short_clip_secs } else { cfg.clips.clip_length_secs };
         let from_ms = end_ms - secs as i64 * 1000;
-        let footage = if self.buffer_mode {
-            let mut f = self.footage.clone();
-            if let Some(last) = f.last_mut() {
-                last.duration_s = last.duration_s.max((end_ms - last.start_ms) as f64 / 1000.0);
+        // The flush can rotate the file. Consume those events before taking a snapshot.
+        while let Ok(event) = self.events_rx.try_recv() {
+            self.event(event);
+        }
+        let mut footage = self.footage.clone();
+        if let Some(live) = self.sh.live_path.lock().as_ref() {
+            if let Some(segment) = footage.iter_mut().find(|segment| &segment.path == live) {
+                segment.duration_s = segment.duration_s.max((end_ms - segment.start_ms) as f64 / 1000.0);
             }
-            f
-        } else {
-            let db = Db::open_default().map_err(|e| format!("{e:#}"))?;
-            db.list_recordings()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|r| r.end_ms() > from_ms - 1000 || r.is_live())
-                .map(|r| Footage { duration_s: if r.is_live() { (end_ms - r.start_ms) as f64 / 1000.0 } else { r.duration }, path: PathBuf::from(r.path), start_ms: r.start_ms })
-                .collect()
-        };
-        let _ = self.sh.clip_tx.send(ClipTask::SaveRange { footage, from_ms, to_ms: end_ms, short });
+        }
+        // Use the library for history, including recordings from earlier service runs.
+        // The engine's live snapshot wins, while the library's finalized path wins after a move to Kept.
+        let db = Db::open_default().map_err(|error| format!("{error:#}"))?;
+        let records = db.list_recordings().map_err(|error| format!("{error:#}"))?;
+        for record in records.into_iter().filter(|record| !record.is_live() && record.end_ms() > from_ms) {
+            let path = PathBuf::from(record.path);
+            if !footage.iter().any(|segment| crate::shared::same_path(&segment.path.to_string_lossy(), &path.to_string_lossy())) {
+                footage.push(Footage { path, start_ms: record.start_ms, duration_s: record.duration });
+            }
+        }
+        footage.retain(|segment| segment.path.is_file());
+        self.sh.clip_tx.send(ClipTask::SaveRange { footage, from_ms, to_ms: end_ms, short })
+            .map_err(|_| "Clip worker is unavailable".to_string())?;
         Ok(())
     }
 
@@ -384,7 +424,7 @@ impl Engine {
                 if let Some(f) = self.footage.iter_mut().find(|f| f.path == path) {
                     f.duration_s = duration_s;
                 }
-                if !self.buffer_mode && path.starts_with(&self.sh.cfg().recording.folder) {
+                if !self.buffer_mode {
                     if let Ok(db) = Db::open_default() {
                         if let Ok(id) = db.upsert_recording(&path.to_string_lossy(), start_ms, bytes as i64, "complete") {
                             let tracks = cv_media::probe::probe(&path).map(|i| i.audio.len() as i64).unwrap_or(0);
@@ -414,16 +454,20 @@ impl Engine {
             return;
         }
         let st = self.rec.as_ref().unwrap().status();
-        // Stalled? (nothing written for a minute although the screen is fine)
+        let now = Instant::now();
         if st.written_until_ms != self.progress.0 {
-            self.progress = (st.written_until_ms, Instant::now());
-        } else if st.video_error.is_none() && self.progress.1.elapsed() > Duration::from_secs(60) && self.starts.len() < 10 {
+            self.progress = (st.written_until_ms, now);
+        } else if st.video_error.is_none()
+            && now.saturating_duration_since(self.progress.1) > STALL_TIMEOUT
+            && stall_restart_allowed(&mut self.starts, now)
+        {
+            self.starts.push_back(now);
             self.sh.log_event("warn", "The recording stopped making progress; restarting it");
             self.restart("stalled");
             return;
         }
         if let Some(last) = self.footage.last_mut() {
-            if st.written_until_ms > last.start_ms {
+            if st.path.as_ref() == Some(&last.path) && st.written_until_ms > last.start_ms {
                 last.duration_s = (st.written_until_ms - last.start_ms) as f64 / 1000.0;
             }
         }
@@ -434,12 +478,12 @@ impl Engine {
             self.mic_warned = false;
         }
         let mins = cfg.audio.mic_silence_warning_mins;
-        if mins > 0 && !self.mic_warned && self.mic_last_sound.elapsed() > Duration::from_secs(mins as u64 * 60) {
+        if cfg.audio.record_mic && self.mic_choice(&cfg).is_some() && mins > 0 && !self.mic_warned && self.mic_last_sound.elapsed() > Duration::from_secs(mins as u64 * 60) {
             self.mic_warned = true;
             self.sh.ui.send(UiCmd::Balloon { level: ToastLevel::Warning, title: "Your mic is silent".into(), text: format!("No sound from the microphone for {mins} minutes.") });
         }
         // Rolling clip buffer: keep only what the hotkey can use.
-        if self.buffer_mode && self.last_buffer_clean.elapsed() > Duration::from_secs(30) {
+        if self.last_buffer_clean.elapsed() > Duration::from_secs(30) {
             self.last_buffer_clean = Instant::now();
             self.clean_buffer(&cfg);
         }
@@ -458,25 +502,31 @@ impl Engine {
         let keep_ms = (cfg.clips.clip_length_secs.max(cfg.clips.short_clip_secs) as i64 + 180) * 1000;
         let cutoff = now_ms() - keep_ms;
         let live = self.sh.live_path.lock().clone();
+        let buffer = buffer_dir();
         self.footage.retain(|f| {
             let end = f.start_ms + (f.duration_s * 1000.0) as i64;
-            let old = end < cutoff;
-            if old && Some(&f.path) != live.as_ref() {
+            if end >= cutoff || Some(&f.path) == live.as_ref() {
+                return true;
+            }
+            if f.path.starts_with(&buffer) {
                 let _ = std::fs::remove_file(&f.path);
                 let _ = std::fs::remove_file(cv_core::waveform::wave_path(&f.path));
-                false
-            } else {
-                true
             }
+            false
         });
-        // Leftovers from earlier runs.
-        if let Ok(rd) = std::fs::read_dir(buffer_dir()) {
+        // The buffer is dedicated to rolling replay. Keep recent files across a mode
+        // change and remove leftovers from earlier runs once they age out.
+        if let Ok(rd) = std::fs::read_dir(&buffer) {
             for e in rd.flatten() {
                 let p = e.path();
                 if Some(&p) == live.as_ref() || self.footage.iter().any(|f| f.path == p) {
                     continue;
                 }
-                let _ = std::fs::remove_file(&p);
+                let old = e.metadata().and_then(|m| m.modified()).ok()
+                    .is_some_and(|t| cv_core::util::system_time_ms(t) < cutoff);
+                if old {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
         }
     }
@@ -500,6 +550,7 @@ impl Engine {
                     s.recording.active = !paused && st.path.is_some();
                     s.recording.path = if paused { String::new() } else { st.path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default() };
                     s.recording.started_ms = st.segment_start_ms;
+                    s.recording.written_until_ms = if paused { 0 } else { st.written_until_ms };
                     s.recording.bytes = st.bytes as i64;
                     s.recording.healthy = healthy;
                     s.recording.tracks = 2 + if cfg.recording.app_tracks { cfg.recording.app_track_count } else { 0 };
@@ -509,6 +560,10 @@ impl Engine {
                 None => {
                     s.engine.running = false;
                     s.recording.active = false;
+                    s.recording.healthy = false;
+                    s.recording.path.clear();
+                    s.recording.written_until_ms = 0;
+                    s.recording.bytes = 0;
                     s.replay.active = false;
                 }
             }
@@ -533,4 +588,18 @@ pub fn send_and_wait(sh: &Shared, make: impl FnOnce(crossbeam_channel::Sender<Re
     let (tx, rx) = crossbeam_channel::bounded(1);
     sh.engine_tx.send(make(tx)).map_err(|_| "service is shutting down".to_string())?;
     rx.recv_timeout(timeout).map_err(|_| "timed out".to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_watchdog_budget_recovers_when_the_window_expires() {
+        let now = Instant::now();
+        let mut starts = VecDeque::from(vec![now; MAX_STALL_RESTARTS]);
+        assert!(!stall_restart_allowed(&mut starts, now));
+        assert!(stall_restart_allowed(&mut starts, now + RESTART_WINDOW));
+        assert!(starts.is_empty());
+    }
 }

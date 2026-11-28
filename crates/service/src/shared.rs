@@ -46,6 +46,8 @@ pub enum LibCmd {
 
 pub struct Shared {
     pub cfg: Arc<RwLock<Config>>,
+    #[cfg(test)]
+    pub isolated_test: bool,
     pub status: Mutex<Status>,
     pub ui: UiHandle,
     pub engine_tx: Sender<EngineCmd>,
