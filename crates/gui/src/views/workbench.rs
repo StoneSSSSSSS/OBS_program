@@ -148,6 +148,19 @@ impl Workbench {
         self.preview.pause();
     }
 
+    pub(crate) fn qa_view(&mut self, page: &str) {
+        let mut project = Project::default();
+        let id = project.title("Opening title".into(), 2 * TICKS_PER_SECOND).expect("fixture title");
+        project.color([62; 3], 3 * TICKS_PER_SECOND).expect("fixture color");
+        *self = Self::default();
+        self.saved = project.clone();
+        self.history = History::new(project);
+        self.selected = Some(Selection::Shot(id));
+        self.dock = Dock::Inspector;
+        self.preview_expanded = page == "workbench_preview";
+        self.tab = if page == "workbench_wiki" { Tab::Wiki } else { Tab::Workbench };
+    }
+
     pub fn intercept_close(&mut self, ctx: &egui::Context) -> bool {
         if self.close_confirmed || !self.dirty() {
             return false;
@@ -400,11 +413,22 @@ impl Workbench {
                 });
             });
             let transport = if ui.available_width() < 340.0 { 57.0 } else { 33.0 };
-            let height = (ui.available_height() - transport - 5.0).max(42.0);
+            let scrub_height = if self.preview_expanded { 26.0 } else { 0.0 };
+            let height = (ui.available_height() - transport - scrub_height - 5.0).max(42.0);
             let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
             response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, duration > 0, "Toggle preview playback"));
             self.preview.picture(ui, rect, &self.history.project, accent, self.revision, self.playhead);
             if response.clicked() { self.toggle_play(ui.ctx()); }
+            if self.preview_expanded {
+                ui.scope(|ui| {
+                    ui.spacing_mut().slider_width = ui.available_width();
+                    let mut at = seconds(self.playhead);
+                    let bar = egui::Slider::new(&mut at, 0.0..=seconds(duration)).show_value(false);
+                    let response = ui.add_enabled(duration > 0, bar).on_hover_text("Scrub the preview");
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Slider, duration > 0, "Preview playhead"));
+                    if response.changed() { self.seek(ticks(at), ui.ctx()); }
+                });
+            }
             ui.horizontal_wrapped(|ui| {
                 let playing = self.preview.playing();
                 if ui.add_enabled(duration > 0, egui::Button::new(if playing { "Pause" } else { "Play" }))
@@ -789,7 +813,7 @@ impl Workbench {
                 .set_file_name(format!("{}.mp4", safe_name(&self.history.project.name))).save_file()
         }) else { return; };
         let result = extension(path, "mp4").and_then(|path| self.export.start(ctx, self.history.project.clone(), path));
-        if let Err(error) = result { self.notice = Some(Notice::Error(format!("Could not export: {error:#}"))); }
+        self.notice = result.err().map(|error| Notice::Error(format!("Could not export: {error:#}")));
     }
 
     fn start_generator(&mut self, kind: Generated) {

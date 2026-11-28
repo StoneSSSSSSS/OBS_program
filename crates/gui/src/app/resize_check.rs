@@ -21,6 +21,9 @@ const PAGES: &[(&str, &str)] = &[
     ("editor", "Synthetic highlight"),
     ("editor_trim", "Trim"),
     ("editor_export", "Export to share"),
+    ("workbench", "Workbench"),
+    ("workbench_preview", "Workbench"),
+    ("workbench_wiki", "Editor Wiki"),
     ("settings_general", "Startup"),
     ("settings_recording", "Recording history"),
     ("settings_clips", "Saved clip length"),
@@ -37,6 +40,11 @@ const WIDTHS: &[f32] = &[
     690., 716., 754., 788., 812., 838., 840., 842., 880., 914., 950., 980., 1008., 1036., 1049.,
     1060., 1071., 1080., 1094., 1105., 1118., 1120., 1122., 1148., 1161., 1180., 1217., 1250.,
     1300.,
+];
+
+const WORKBENCH_WIDTHS: &[f32] = &[
+    360., 420., 530., 590., 598., 600., 602., 618., 620., 622., 690., 780., 838., 840.,
+    842., 898., 900., 902., 990., 1048., 1050., 1052., 1120., 1180., 1250., 1300.,
 ];
 
 struct Line {
@@ -195,6 +203,8 @@ fn inspect(
             "recordings" => &["Set start ", "Set end ", "Save selected clip"],
             "editor_trim" => &["Set start ", "Set end ", "Save as new clip"],
             "editor_export" => &["Export to size limit", "Export full quality"],
+            "workbench" | "workbench_preview" => &["Project", "Import Media…", "Export MP4…"],
+            "workbench_wiki" => &["All topics", "Clear"],
             page if page.starts_with("settings_") => &["Save", "Discard"],
             _ => &[],
         };
@@ -273,6 +283,10 @@ impl Sweep {
                 }
             }
             "library" => app.navigate(Page::Clips),
+            name if name.starts_with("workbench") => {
+                app.navigate(Page::Editor);
+                app.editor.qa_view(name);
+            }
             "recording_files" => app.recordings.show_compact_files(),
             "editor_trim" | "editor_export" => app.clips.show_compact_inspector(),
             "editor" => {
@@ -386,6 +400,7 @@ impl Sweep {
             }
         }
 
+        let widths = if PAGES[self.page].0.starts_with("workbench") { WORKBENCH_WIDTHS } else { WIDTHS };
         let size = ctx.viewport_rect().size();
         if let Some((wanted, since)) = self.requested {
             let (page, label) = PAGES[self.page];
@@ -425,11 +440,12 @@ impl Sweep {
             }
             let capture = if matches!(
                 page,
-                "editor" | "recordings" | "editor_trim" | "editor_export"
+                "editor" | "recordings" | "editor_trim" | "editor_export" | "workbench" | "workbench_preview" | "workbench_wiki"
             ) {
-                [0, 8, 10, 12, 16, 22, WIDTHS.len() + 9].contains(&self.step)
+                (page.starts_with("workbench") && self.step == widths.len() - 1)
+                    || [0, 8, 10, 12, 16, 22, widths.len() + 9].contains(&self.step)
             } else {
-                self.step == 10 || self.step == WIDTHS.len() + 1
+                self.step == 10 || self.step == widths.len() + 1
             };
             if let Some((done, started)) = &self.screenshot {
                 if !done.load(std::sync::atomic::Ordering::Acquire) {
@@ -467,7 +483,7 @@ impl Sweep {
                 return;
             }
             self.step += 1;
-            if self.step == WIDTHS.len() * 2 {
+            if self.step == widths.len() * 2 {
                 self.page += 1;
                 self.step = 0;
                 if self.page == PAGES.len() {
@@ -478,16 +494,16 @@ impl Sweep {
                 return;
             }
         }
-        let index = if self.step < WIDTHS.len() {
-            WIDTHS.len() - 1 - self.step
+        let index = if self.step < widths.len() {
+            widths.len() - 1 - self.step
         } else {
-            self.step - WIDTHS.len()
+            self.step - widths.len()
         };
-        let width = WIDTHS[index];
-        let height = if self.step < WIDTHS.len() {
+        let width = widths[index];
+        let height = if self.step < widths.len() {
             671.
         } else {
-            510. + 0.27 * (width - WIDTHS[0])
+            510. + 0.27 * (width - widths[0])
         };
         let wanted = Vec2::new(width, height);
         self.requested = Some((wanted, Instant::now()));

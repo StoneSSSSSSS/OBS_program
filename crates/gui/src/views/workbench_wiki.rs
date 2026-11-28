@@ -67,10 +67,10 @@ const GUIDES: &[Guide] = &[
         "Duplicate the cue for each additional entrance. In the Inspector set Start on Timeline, then choose Apply Changes or press Enter.",
         "Set Gain to 50% for half volume on an individual occurrence. Apply Changes, then preview. Source Out trims the cue itself before the credits.",
         "Preview the last beat and the ending. Audio extending beyond the last picture can extend the export with a black background."] },
-    Guide { section: "Pictures", title: "Make a portrait or square montage", terms: "vertical portrait horizontal landscape aspect 9:16 16:9 square canvas resolution still photo montage social",
+    Guide { section: "Pictures", title: "Make a portrait or square montage", terms: "vertical portrait horizontal landscape aspect 9:16 16:9 square canvas resolution still photo montage social fit framing letterbox letterboxing black bars pillarbox border",
         intro: "Choose the output shape first so you can check how landscape footage and portrait stills fit inside it.",
         steps: &["In Project Settings choose a portrait or square Canvas, then Apply Project Settings. The 1080 × 1920 portrait preset is full HD. Add pictures and videos in viewing order.",
-        "Select each still and set its duration in the Inspector. Use Move Earlier or Move Later to change the order.",
+        "Select each still, set Duration in the Inspector, then choose Apply Changes. Pictures fit inside the canvas. Black bars keep a source with a different shape fully visible.",
         "Add a title card and move it to the opening. Check text, framing and the final image in Preview.",
         "Export MP4… creates a file using the selected canvas and frame rate."] },
     Guide { section: "Pictures", title: "Rotate or mirror a picture", terms: "sideways rotate rotation upside down flip horizontal mirror orientation photo video",
@@ -93,7 +93,7 @@ const GUIDES: &[Guide] = &[
         intro: "Use these shortcuts when editing in the Workbench.",
         steps: &["Space plays or pauses. Comma steps back one frame and period steps forward. S splits the selected item and Delete removes it.",
         "Ctrl+Z undoes and Ctrl+Y redoes. Ctrl+I imports media. Ctrl+O opens a project, Ctrl+S saves, and Ctrl+Shift+S saves a new version.",
-        "Choose Expand Preview above the picture for a larger monitor. Choose Restore Preview to return to the timeline."] },
+        "Choose Expand Preview above the picture for a larger monitor. Use the scrub bar beneath it to seek. Choose Restore Preview for the editing layout."] },
     Guide { section: "Pictures", title: "Add a title card or solid color", terms: "slate title text credit opening chapter intertitle black blank color matte",
         intro: "Title cards and color frames occupy time in the picture sequence.",
         steps: &["Use + Title for an opening, chapter break or credit. Enter the text and choose the card duration.",
@@ -102,7 +102,7 @@ const GUIDES: &[Guide] = &[
     Guide { section: "Files", title: "Save, reopen and move a project", terms: "save as open cvproj portable external file preserve share move handoff editable revision",
         intro: "A .cvproj stores edit decisions and links to your source files. An MP4 export contains the finished picture and sound.",
         steps: &["Use Project → Save Project As… for the first save or a new version. Save Project updates the current edit.",
-        "For a portable handoff, keep the footage in the project folder or a neighboring Media folder. Copy the project and the media together.",
+        "Copy the project and its media together. Keep each relative subfolder in the same place, including any sibling folders holding footage. Open the transferred project and check the Media Bin for Missing.",
         "Open Project… loads the sequence and all its edits. An offline source can be restored with Relink Media….",
         "To share the finished video for viewing, use Export MP4… and share that output."] },
     Guide { section: "Files", title: "Find missing media and relink it", terms: "missing offline not found broken moved renamed locate reconnect relink original sources file",
@@ -114,7 +114,7 @@ const GUIDES: &[Guide] = &[
         intro: "Preview and export use the same shot order, source trims, timing and audio levels.",
         steps: &["Check the canvas, frame rate and end of the timeline. Choose Export MP4… and select a new output filename.",
         "Watch the progress indicator. If you cancel, wait for the job to finish cancelling before starting again.",
-        "After completion, open the output folder and play the MP4 to verify it. Pick a fresh filename when an existing file must be preserved."] },
+        "After completion, choose Open Output Folder to find the MP4. An occupied export name is refused and the existing file is preserved. Choose a fresh filename and retry."] },
     Guide { section: "Start here", title: "Cut a highlight and its replay", terms: "sports gameplay highlight replay two cameras angles archive recording boundary match cut",
         intro: "Cut the wide shot on the action, then show the same play from a second angle.",
         steps: &["In 24/7 Recordings, mark the play and save a selected clip. A range may cross adjacent recording files.",
@@ -223,7 +223,7 @@ mod tests {
     fn search_finds_workflows_by_user_vocabulary() {
         for (query, expected) in [("missing file", "relink"), ("how do I nudge a frame", "one frame"),
             ("voiceover music", "narration"), ("portrait montage", "portrait"), ("cancel export", "Export"),
-            ("move shot to beginning", "Reorder"), ("save as revision", "revise"), ("effects cue", "effects")] {
+            ("move shot to beginning", "Reorder"), ("save as revision", "revise"), ("effects cue", "effects"), ("half volume", "effects"), ("letterbox", "portrait")] {
             assert!(GUIDES.iter().any(|g| g.title.to_lowercase().contains(&expected.to_lowercase()) && rank(g, query).is_some()), "{query}");
         }
         assert!(GUIDES.iter().all(|g| rank(g, "unfindable0001").is_none()));

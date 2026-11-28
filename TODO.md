@@ -33,6 +33,13 @@
 
 - [x] Run ten-minute Full history against real, newly captured footage for 626 seconds. The owned-window WGC run expired two ordinary segments and kept 600.000 seconds of finalized footage plus the current eight-second durable tail. An eight-second recording marked Keep and a saved four-second clip kept their original bytes. This opt-in soak uses eight-second test segments. The ordinary ten-minute configuration uses sixty-second segments.
 
+## Desktop Editor verification
+
+- [x] Build an editable, multi-source timeline with native audio/video previews and exports, portable project files and offline searchable help. See [Editor features](docs/editor-features.md).
+- [x] Verify full-HD landscape and portrait delivery, audio fades, subtitle visibility at cue boundaries, rotation and mirroring with actual native renders.
+- [x] Exercise the Workbench, expanded preview and Wiki from 360 to 1300 logical points. The integrated Windows resize sweep passed across all 21 screens at 100%, 125% and 150% UI scale, with 1,470 rendered frames per scale in the initial run.
+- [ ] Finish independent editing challenges and document the outcome of each retest. [Review briefs and rubric](docs/editor-challenges.md)
+
 ## Next verification
 
 - [ ] Run a sustained live replay-only session on a second Windows setup. Check hotkey capture and rebinding, headset and display reconnects, disk pressure, and waveform backfill while entering and leaving a game.

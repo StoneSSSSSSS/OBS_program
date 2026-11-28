@@ -137,8 +137,16 @@ impl Workbench {
                     }
                 };
                 ui.label(RichText::new(format!("Timeline start {}", clock(at))).small().color(theme::TEXT_DIM));
-                time_field(ui, "Source In", input, limit);
-                time_field(ui, "Source Out", output, limit);
+                let timed_video = matches!(source, Source::Asset(id) if project.asset(*id).is_some_and(|asset| asset.info.kind == AssetKind::Video));
+                if timed_video {
+                    time_field(ui, "Source In", input, limit);
+                    time_field(ui, "Source Out", output, limit);
+                } else {
+                    let mut duration = *output - *input;
+                    if time_field(ui, "Duration", &mut duration, limit - *input).changed() {
+                        *output = *input + duration;
+                    }
+                }
                 if let Source::Asset(id) = source {
                     visual_transform_fields(ui, visual_transform);
                     if project.asset(*id).is_some_and(|asset| asset.info.kind == AssetKind::Video) {

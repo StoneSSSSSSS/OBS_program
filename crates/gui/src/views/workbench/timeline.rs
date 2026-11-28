@@ -393,15 +393,15 @@ fn lanes(project: &Project) -> Vec<Lane> {
         };
         let rgb = match shot.source {
             Source::Color([r, g, b]) => Color32::from_rgb(r, g, b),
-            Source::Title(_) => Color32::from_rgb(96, 59, 123),
-            Source::Asset(_) => Color32::from_rgb(39, 71, 112),
+            Source::Title(_) => Color32::from_gray(91),
+            Source::Asset(_) => Color32::from_gray(69),
         };
         let item = Item { selection: Selection::Shot(shot.id), at, range: shot.range, limit, label: shot_name(project, &shot.source), rgb };
         at += shot.range.len();
         item
     }).collect();
     let mut result = vec![Lane { role: None, rows: vec![video] }];
-    for (role, rgb) in ROLES.into_iter().zip([Color32::from_rgb(46, 93, 75), Color32::from_rgb(111, 76, 39), Color32::from_rgb(76, 75, 105)]) {
+    for (role, rgb) in ROLES.into_iter().zip([Color32::from_gray(82), Color32::from_gray(67), Color32::from_gray(94)]) {
         let mut items = project.sounds.iter().filter(|sound| sound.role == role).collect::<Vec<_>>();
         items.sort_by_key(|sound| (sound.at, sound.id));
         let mut rows: Vec<Vec<Item>> = vec![Vec::new()];

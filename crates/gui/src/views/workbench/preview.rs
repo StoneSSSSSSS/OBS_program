@@ -182,7 +182,7 @@ impl Preview {
                 Err(error) => {
                     self.playing = false;
                     self.pending_play = false;
-                    self.error = Some(format!("Preview failed: {error:#}"));
+                    self.error = Some(preview_error(project, &error));
                 }
             }
         }
@@ -235,7 +235,7 @@ impl Preview {
                             self.displayed = Some((revision, rendered_at));
                             self.set_image(ctx, image);
                         }
-                        Err(error) if self.error.is_none() => self.error = Some(format!("Preview failed: {error:#}")),
+                        Err(error) if self.error.is_none() => self.error = Some(preview_error(project, &error)),
                         Err(_) => {}
                     }
                 }
@@ -321,7 +321,7 @@ impl Preview {
         let scale = (rect.width() / source.x).min(rect.height() / source.y);
         let picture = Rect::from_center_size(rect.center(), source * scale);
         painter.rect_filled(picture, 2.0, Color32::BLACK);
-        if let Some(texture) = self.texture.as_ref().filter(|_| project.duration() > 0) {
+        if let Some(texture) = self.texture.as_ref().filter(|_| project.duration() > 0 && self.error.is_none()) {
             let dimensions = texture.size_vec2();
             let fit = (picture.width() / dimensions.x).min(picture.height() / dimensions.y);
             let bounds = Rect::from_center_size(picture.center(), dimensions * fit);
@@ -357,6 +357,17 @@ impl Preview {
             painter.galley(pos, galley, color);
         }
     }
+}
+
+fn preview_error(project: &Project, error: &anyhow::Error) -> String {
+    let details = format!("{error:#}");
+    for asset in &project.assets {
+        let name = super::filename(&asset.path);
+        if details.contains(&name) && !asset.path.is_file() {
+            return format!("Media offline · {name}\nChoose Relink Media… in the Media Bin.");
+        }
+    }
+    format!("Preview failed: {details}")
 }
 
 fn in_span(span: Span, at: u64, duration: u64) -> bool {
