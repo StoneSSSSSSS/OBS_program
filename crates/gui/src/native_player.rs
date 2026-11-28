@@ -64,6 +64,7 @@ pub struct NativeState {
 
 pub struct VideoFrame {
     pub serial: u64,
+    pub at_seconds: f64,
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
@@ -754,7 +755,7 @@ impl Playback {
         let height = frame.height as usize;
         let rgba = rgba_from_nv12(&frame);
         self.serial += 1;
-        Ok(Some(VideoFrame { serial: self.serial, width, height, rgba }))
+        Ok(Some(VideoFrame { serial: self.serial, at_seconds: media.frame_seconds(pts), width, height, rgba }))
     }
 }
 

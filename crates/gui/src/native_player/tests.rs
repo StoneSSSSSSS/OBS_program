@@ -731,7 +731,7 @@ fn new_load_invalidates_the_previous_segment_before_the_worker_opens_it() {
     let old = NativeState { loaded: true, position: 7.95, duration: 8.0, ..Default::default() };
     let view = Arc::new(Mutex::new(View { generation: 1, ..Default::default() }));
     assert!(view.lock().publish(1, &old, Some(VideoFrame {
-        serial: 8, width: 2, height: 2, rgba: vec![255; 16],
+        serial: 8, at_seconds: 7.95, width: 2, height: 2, rgba: vec![255; 16],
     })));
     let player = NativePlayer { tx, view: view.clone() };
     player.load(PathBuf::from("next.mp4"), 0.0, true, false);

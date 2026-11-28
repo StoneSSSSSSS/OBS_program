@@ -4,7 +4,7 @@ use crate::player::Player;
 use crate::service::{Service, UiEvent};
 use crate::theme::{self, icon};
 use crate::thumbs::Thumbs;
-use crate::views::{clips::ClipsView, home::HomeView, recordings::RecordingsView, settings::SettingsView};
+use crate::views::{clips::ClipsView, home::HomeView, recordings::RecordingsView, settings::SettingsView, workbench::{self, Workbench}};
 use cv_core::config::Config;
 use cv_core::db::Db;
 use cv_core::ipc::Request;
@@ -18,6 +18,7 @@ pub enum Page {
     Home,
     Recordings,
     Clips,
+    Editor,
     Settings,
 }
 
@@ -86,6 +87,8 @@ pub struct App {
     clips: ClipsView,
     recordings: RecordingsView,
     settings: SettingsView,
+    editor: Workbench,
+    editor_window: bool,
     titlebar_done: u32,
     selftest: Option<SelfTest>,
     resize_check: Option<resize_check::Sweep>,
@@ -136,6 +139,8 @@ impl App {
             clips: ClipsView::default(),
             recordings: RecordingsView::default(),
             settings: SettingsView::default(),
+            editor: Workbench::default(),
+            editor_window: false,
             titlebar_done: 0,
             resize_check: resize_check::Sweep::from_env(),
             review_driver: crate::qa_driver::Driver::from_env(),
@@ -193,6 +198,7 @@ impl App {
         if matches!(self.page, Page::Recordings | Page::Clips) {
             self.c.player.set_paused(true);
         }
+        if self.page == Page::Editor { self.editor.pause(); }
         self.page = page;
     }
 
@@ -215,6 +221,7 @@ impl App {
             (Page::Home, icon::HOME, "Home"),
             (Page::Recordings, icon::HISTORY, "24/7 Recordings"),
             (Page::Clips, icon::LIBRARY, "Clips"),
+            (Page::Editor, icon::EDIT, "Editor"),
             (Page::Settings, icon::SETTINGS, "Settings"),
         ];
         for (page, glyph, label) in items {
@@ -427,7 +434,7 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.titlebar_done < 3 {
             self.titlebar_done += 1;
@@ -443,23 +450,41 @@ impl eframe::App for App {
             self.navigate(Page::Settings);
         }
 
+        if ctx.input(|input| input.viewport().close_requested()) && self.editor.intercept_close(&ctx) {
+            if self.c.player.fullscreen {
+                self.c.player.fullscreen = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+            self.navigate(Page::Editor);
+        }
         let fullscreen = self.c.player.fullscreen && matches!(self.page, Page::Recordings | Page::Clips);
         let compact = ui.available_width() < 1120.0;
-        let icon_only = ui.available_width() < 840.0 || ui.available_height() < 470.0;
+        let rail_breakpoint = if self.page == Page::Editor { 900.0 } else { 840.0 };
+        let icon_only = ui.available_width() < rail_breakpoint || ui.available_height() < 470.0;
         if !fullscreen {
             egui::Panel::left("nav")
-                .exact_size(if icon_only { 62.0 } else if compact { 174.0 } else { 196.0 })
+                .exact_size(if icon_only { 62.0 } else if compact || self.page == Page::Editor { 174.0 } else { 196.0 })
                 .resizable(false)
                 .frame(egui::Frame::NONE.fill(theme::SIDEBAR).stroke(Stroke::new(1.0, theme::BORDER)))
                 .show(ui, |ui| self.sidebar(ui, icon_only));
         }
-        let margin = if fullscreen { Margin::ZERO } else if compact { Margin::symmetric(18, 14) } else { Margin::symmetric(24, 20) };
+        let is_editor = self.page == Page::Editor;
+        if self.editor_window != is_editor {
+            self.editor_window = is_editor;
+            workbench::set_min_window(&ctx, is_editor);
+        }
+        if is_editor {
+            let files = ctx.input_mut(|input| std::mem::take(&mut input.raw.dropped_files));
+            self.editor.dropped_files(files.into_iter().map(|file| file.path().to_path_buf()).collect(), &ctx);
+        }
+        let margin = if fullscreen { Margin::ZERO } else if compact || is_editor { Margin::symmetric(18, 14) } else { Margin::symmetric(24, 20) };
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::BG).inner_margin(margin))
             .show(ui, |ui| match self.page {
                 Page::Home => self.home.ui(ui, &mut self.c),
                 Page::Recordings => self.recordings.ui(ui, &mut self.c),
                 Page::Clips => self.clips.ui(ui, &mut self.c),
+                Page::Editor => self.editor.ui(ui, &self.c, frame),
                 Page::Settings => self.settings.ui(ui, &mut self.c),
             });
         self.toasts(&ctx);

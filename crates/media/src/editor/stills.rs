@@ -21,6 +21,7 @@ pub(super) fn probe(file: &StorageFile) -> Result<AssetInfo> {
     let decoder = decoder(file)?;
     Ok(AssetInfo {
         kind: AssetKind::Image,
+        fps_milli: None,
         duration: 0,
         width: decoder.OrientedPixelWidth()?,
         height: decoder.OrientedPixelHeight()?,

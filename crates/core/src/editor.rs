@@ -20,6 +20,8 @@ pub enum AssetKind { Video, Image, Audio }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetInfo {
     pub kind: AssetKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_milli: Option<u32>,
     pub duration: u64,
     pub width: u32,
     pub height: u32,

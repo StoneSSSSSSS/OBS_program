@@ -4,7 +4,7 @@ use std::fs;
 const S: u64 = TICKS_PER_SECOND;
 
 fn info(kind: AssetKind, seconds: u64) -> AssetInfo {
-    AssetInfo { kind, duration: seconds * S, width: 320, height: 192 }
+    AssetInfo { kind, fps_milli: None, duration: seconds * S, width: 320, height: 192 }
 }
 
 #[test]

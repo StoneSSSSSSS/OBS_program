@@ -92,6 +92,11 @@ fn video_info(clip: &MediaClip) -> Result<AssetInfo> {
     ensure!(width > 0 && height > 0, "Media has no video picture");
     Ok(AssetInfo {
         kind: AssetKind::Video,
+        fps_milli: props.FrameRate().ok().and_then(|rate| {
+            let n = u64::from(rate.Numerator().ok()?);
+            let d = u64::from(rate.Denominator().ok()?);
+            u32::try_from((n * 1000 + d / 2).checked_div(d)?).ok().filter(|rate| *rate > 0)
+        }),
         duration: positive_ticks(clip.OriginalDuration()?)?,
         width,
         height,
@@ -102,6 +107,7 @@ fn audio_info(file: &StorageFile) -> Result<AssetInfo> {
     let track = BackgroundAudioTrack::CreateFromFileAsync(file)?.get()?;
     Ok(AssetInfo {
         kind: AssetKind::Audio,
+        fps_milli: None,
         duration: positive_ticks(track.OriginalDuration()?)?,
         width: 0,
         height: 0,
@@ -127,6 +133,7 @@ pub fn probe(path: &Path) -> Result<AssetInfo> {
                     if info.fragmented && info.video_codec == "h264" && info.duration > 0.0 {
                         return Ok(AssetInfo {
                             kind: AssetKind::Video,
+                            fps_milli: (info.fps > 0.0).then(|| (info.fps * 1000.0).round() as u32),
                             duration: (info.duration * TICKS_PER_SECOND as f64).round() as u64,
                             width: info.width,
                             height: info.height,

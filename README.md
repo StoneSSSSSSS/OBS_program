@@ -6,6 +6,15 @@ ClipVault records your Windows screen and app audio, saves highlights and export
 
 Extract the whole Windows app folder somewhere you can write and open **clipvault.exe**. Keep it beside `clipvault-service.exe`, the bundled Microsoft C++ runtime, and the assets folder. The window starts the background recorder. Closing the window lets the recorder continue. Use **Quit ClipVault service** in the tray when you want to stop capturing.
 
+## Edit imported video, pictures and sound
+
+1. Choose **Editor → Workbench → Import Media…**. Add a video or still from the Media Bin to the timeline.
+2. Select a shot, set **Source In** and **Source Out**, then choose **Apply Changes**. Use **Play** or the frame buttons to check the cut.
+3. Add narration, music or effects to their lanes. Adjust **Start on Timeline** and **Gain** for the selected occurrence.
+4. Use **Project → Save Project As…** for an editable project and **Export MP4…** for the finished video. Keep the source files with the project when moving it.
+
+Search **Editor → Wiki** for help with an individual task, including removing one frame, relinking moved media and mixing a voiceover. [Editor features](docs/editor-features.md)
+
 ## Keep ten minutes on the 24/7 timeline
 
 1. Open **Settings → Recording & storage** and choose **Full history**.

@@ -45,7 +45,8 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ClipVault")
         .with_inner_size([1180.0, 740.0])
-        .with_min_inner_size([690.0, 500.0])
+        .with_min_inner_size(views::workbench::STANDARD_MIN_WINDOW)
+        .with_drag_and_drop(true)
         .with_app_id("ClipVault");
     if let Some(icon) = icon {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
