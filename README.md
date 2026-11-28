@@ -2,9 +2,13 @@
 
 ClipVault records your Windows screen and app audio, saves highlights and exports an MP4 you can share. Recording, playback and export use the Windows media stack. You can run ClipVault without installing OBS, FFmpeg or mpv.
 
+## Open ClipVault
+
+Extract the Windows app folder somewhere you can write, keep `clipvault.exe` and `clipvault-service.exe` together, and open **clipvault.exe**. The window starts the background recorder. Closing the window lets the recorder continue. Use **Quit ClipVault service** in the tray when you want to stop capturing.
+
 ## Keep just the last two minutes
 
-1. Open **Settings → 24/7 recording → Replay only**.
+1. Open **Settings → Recording & storage → Replay only**.
 2. Choose **2 min**, then **Save**. Choose **Save & restart recording** when prompted. Other presets are 1, 5 and 10 minutes. **Custom** accepts 1–60 minutes.
 3. Use **Home → Clip last 30 seconds** once the buffer has filled, or press your clip hotkey. Find the saved recording in **Clips**.
 
@@ -18,14 +22,21 @@ Replay only continually replaces temporary footage. Both clip hotkeys are limite
 4. Drag across a waveform or choose **Edit audio range** to mute or change volume for part of a track. Use **Undo audio change** to reverse it. **Track names & visibility** customizes the lanes for this clip. **Settings → Player → Smooth audio edits** controls fades.
 5. Preview the result. Choose **Export full quality** or set a limit and choose **Export to size limit**. Export uses the current mix and optional trim selection. The source clip retains its original audio tracks.
 
+In a narrow window, use **Timeline** to play or select footage in **24/7 Recordings**, then **Files & jobs** to see recording files or open a finished clip. In a clip, use **Player** for preview, seeking, and audio lanes. Switch to **Trim & export** for the clip details and export controls. Widen the window to see both views at once.
+
+Long clip titles stay in the library, including punctuation and emoji. ClipVault creates a Windows-safe filename and shows the finished filename in Jobs. Use **Open folder** to highlight that file in Explorer.
+
 ## Recording and storage
 
-- Recordings go to `%USERPROFILE%\Videos\ClipVault\Recordings` by default. Clips have their own folder under `Videos\ClipVault`. Settings, the SQLite library, logs and thumbnails live under `%LOCALAPPDATA%\ClipVault`.
+- The portable app keeps recordings, clips, exports, settings, thumbnails, logs and its SQLite library in `.clipvault-local\profile`. In a source checkout that folder is at the project root and Git ignores it. Choose **Settings → About → Open data folder** to find it. The portable app starts when opened and keeps discarded clips in its own trash folder when that option is enabled.
+- The optional per-user installation keeps its existing Windows layout. Settings and the library live in `%LOCALAPPDATA%\ClipVault`. Default recording and clip folders are under `%USERPROFILE%\Videos\ClipVault`.
 - The recorder uses Windows desktop capture, WASAPI sound capture and Media Foundation H.264/AAC codecs. It writes fragmented MP4 and can use a GPU encoder when available.
 - **Full history** defaults to 30-minute files and 48 hours of retained footage. It also supports age, disk usage and free-space limits. Use the tray's exit action to stop the service completely.
+- Keep Recordings separate from Clips, Exports and internal storage. Exports can use their own subfolder under Clips. The service leaves saved clips, exports and legacy media alone during automatic recording cleanup.
 - The default clip hotkey is **Ctrl + Shift + backtick**. Find saved clips in **Clips**, organized by game.
 - Audio includes a full mix, microphone and a configurable number of simultaneous app tracks (eight by default). Apps can share a category. A browser is one app. Capture capabilities depend on Windows version and audio endpoints.
 - Saving a clip retains its audio tracks. Export creates an MP4 with the selected mix baked into one audio track. The native tools support H.264/AAC MP4. Older six-track recordings in this format map to their original categories.
+- If the service is interrupted during an in-place trim, it checks the pending operation at startup against the library and the files on disk. An uncommitted trim can restore the original, and a committed trim keeps the new clip. If the destination has changed, ClipVault leaves the files in place for inspection.
 
 ## Rust workspace
 
@@ -37,5 +48,7 @@ Replay only continually replaces temporary footage. Both clip hotkeys are limite
 | gui | Windows desktop interface, timeline, clip library, player, mixer and settings |
 
 For development, use a Windows Rust toolchain with a linker and Windows SDK. Run `cargo check --workspace` for a source check and `cargo test -p clipvault-core --lib` for the logic suite. Some media integration tests record the actual desktop or play sound. Use a dedicated test session for those. Set `CLIPVAULT_DATA_DIR` to an isolated directory and configure test media folders when exercising the service.
+
+To build the two Windows executables from source, run `cargo build --release --locked` at the workspace root. Open `target\release\clipvault.exe` to run that build. For a per-user installation with shortcuts, run `scripts\install.ps1` from PowerShell after the release build finishes.
 
 See [TODO.md](TODO.md) for the current rewrite and verification status.
