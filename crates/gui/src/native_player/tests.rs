@@ -14,6 +14,9 @@ use cv_media::recorder::{AppIdent, SegmentMeta, SlotInfo, TrackMeta};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
+#[path = "review_footage.rs"]
+mod review_footage;
+
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 192;
 const FPS: u32 = 25;
@@ -58,6 +61,15 @@ impl Fixture {
         names: &[&str],
         signal: impl Fn(usize, f64) -> f32,
     ) -> Result<Self> {
+        Self::make_with_images(fragments, names, signal, moving_image)
+    }
+
+    fn make_with_images(
+        fragments: usize,
+        names: &[&str],
+        signal: impl Fn(usize, f64) -> f32,
+        image: impl Fn(usize) -> Vec<u8>,
+    ) -> Result<Self> {
         let mut encoder = VideoEncoder::new(None, EncoderConfig {
             width: WIDTH, height: HEIGHT, fps: FPS,
             rate: RateControl::Cbr { kbps: 1000 },
@@ -65,7 +77,7 @@ impl Fixture {
         })?;
         let mut frames = Vec::new();
         for i in 0..fragments * GOP {
-            let frame = moving_image(i);
+            let frame = image(i);
             frames.extend(encoder.encode_cpu(&frame, (i as f64 * VIDEO_CLOCK / FPS as f64) as i64, i % GOP == 0)?);
         }
         frames.extend(encoder.finish()?);
@@ -108,7 +120,7 @@ impl Fixture {
         Ok(Self { tracks, video, audio })
     }
 
-    fn write_legacy(&self, path: &Path) -> Result<()> {
+    fn write_flat(&self, path: &Path) -> Result<()> {
         let mut writer = FlatWriter::new(path, &self.tracks, (START_MS / 1000) as u64)?;
         for frame in &self.video {
             writer.add(0, &SampleRef {
@@ -265,7 +277,7 @@ const LEGACY_TONES: [f64; 6] = [330.0, GAME_HZ, VOICE_HZ, 610.0, MIC_HZ, 970.0];
 fn legacy_fixture(path: &Path) -> Result<()> {
     Fixture::make_with_audio(FRAGMENTS, &["SoundHandler"; 6], |i, time| {
         tone(LEGACY_TONES[i], time) * 0.2
-    })?.write_legacy(path)
+    })?.write_flat(path)
 }
 
 fn muted_mic() -> PreviewMix {
