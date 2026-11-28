@@ -107,6 +107,11 @@ impl AacEncoder {
     }
 }
 
+pub(crate) struct DecodedPcm {
+    pub time_hns: i64,
+    pub samples: Vec<f32>,
+}
+
 pub struct AacDecoder {
     m: SyncMft,
     float_out: bool,
@@ -143,26 +148,71 @@ impl AacDecoder {
     /// the decoder primes).
     pub fn decode(&mut self, frame: &[u8]) -> Result<Vec<f32>> {
         let s = sample_from(frame, 0, 0)?;
-        let mut got = Vec::new();
-        while !self.m.push(&s)? {
-            self.m.pull_all(&mut got)?;
-        }
-        if self.m.pull_all(&mut got)? {
-            self.m.refresh_out_info();
-        }
         let mut out = Vec::new();
-        for g in got {
-            let b = sample_bytes(&g)?;
-            if self.float_out {
-                out.extend(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
-            } else {
-                out.extend(b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0));
-            }
+        for sample in self.decode_sample(&s)? {
+            self.append_pcm(&sample, &mut out)?;
         }
         Ok(out)
     }
 
-    /// Forget state (after a seek).
+    pub(crate) fn decode_timed(
+        &mut self,
+        frame: &[u8],
+        time_hns: i64,
+        duration_hns: i64,
+    ) -> Result<Vec<DecodedPcm>> {
+        let sample = sample_from(frame, time_hns, duration_hns)?;
+        let output = self.decode_sample(&sample)?;
+        self.timed_pcm(output)
+    }
+
+    /// Release PCM still buffered by the transform at a discontinuity or EOF.
+    pub(crate) fn drain(&mut self) -> Result<Vec<DecodedPcm>> {
+        self.m.drain()?;
+        let mut output = Vec::new();
+        self.pull_output(&mut output)?;
+        self.timed_pcm(output)
+    }
+
+    fn decode_sample(&mut self, sample: &IMFSample) -> Result<Vec<IMFSample>> {
+        let mut output = Vec::new();
+        while !self.m.push(sample)? {
+            self.pull_output(&mut output)?;
+        }
+        self.pull_output(&mut output)?;
+        Ok(output)
+    }
+
+    fn pull_output(&mut self, output: &mut Vec<IMFSample>) -> Result<()> {
+        if self.m.pull_all(output)? {
+            self.m.refresh_out_info();
+        }
+        Ok(())
+    }
+
+    fn timed_pcm(&self, output: Vec<IMFSample>) -> Result<Vec<DecodedPcm>> {
+        output
+            .into_iter()
+            .map(|sample| {
+                let time_hns = unsafe { sample.GetSampleTime()? };
+                let mut samples = Vec::new();
+                self.append_pcm(&sample, &mut samples)?;
+                Ok(DecodedPcm { time_hns, samples })
+            })
+            .collect()
+    }
+
+    fn append_pcm(&self, sample: &IMFSample, out: &mut Vec<f32>) -> Result<()> {
+        let bytes = sample_bytes(sample)?;
+        if self.float_out {
+            out.extend(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+        } else {
+            out.extend(bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0));
+        }
+        Ok(())
+    }
+
+    /// Forget codec state when starting a new run after a seek or gap.
     pub fn reset(&mut self) {
         self.m.flush();
     }

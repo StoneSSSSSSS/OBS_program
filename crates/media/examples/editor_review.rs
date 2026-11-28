@@ -208,7 +208,10 @@ fn inspect(run: &Path, output: &Path, frame_at: &[f64], audio_ranges: &[[f64; 2]
         ensure!(start >= 0.0 && end > start && end <= duration + 0.001 && end - start <= 30.0,
             "Choose an audio range between 0 and the output duration, up to 30 seconds");
         for &index in &audio {
-            let pcm = cv_media::audioread::read_range(&reader, index, start, end)?;
+            // The decoder reads media time; review windows are on the exported presentation clock.
+            // Only skip samples that the track's edit list explicitly excludes.
+            let media_start = reader.tracks[index].edit_start_s();
+            let pcm = cv_media::audioread::read_range(&reader, index, start + media_start, end + media_start)?;
             ensure!(!pcm.is_empty(), "Audio sample window is too short");
             let sum = pcm.iter().map(|sample| f64::from(*sample).powi(2)).sum::<f64>();
             let peak = pcm.iter().map(|sample| sample.abs()).fold(0.0, f32::max);

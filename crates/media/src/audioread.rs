@@ -2,7 +2,8 @@
 //! the track has no samples (unused app tracks) and resampling for files
 //! recorded at other rates.
 
-use crate::mf::aac::AacDecoder;
+use crate::mf::aac::{AacDecoder, DecodedPcm, FRAME};
+use crate::mf::HNS;
 use crate::mp4::reader::{Mp4Reader, Sample};
 use crate::mp4::Codec;
 use anyhow::{Context, Result};
@@ -15,17 +16,20 @@ pub const OUT_RATE: u32 = 48_000;
 pub struct TrackPcm {
     idx: usize,
     rate: u32,
+    timescale: u32,
     channels: usize,
     dec: AacDecoder,
     /// Decoded native-rate stereo frames, starting at `buf_pos` (native frames).
     buf: VecDeque<f32>,
     buf_pos: i64,
-    /// Next native frame position we will fetch samples from.
-    fetch_pos: i64,
+    /// Next media tick we will fetch packets from.
+    fetch_pos: u64,
     pending: VecDeque<Sample>,
-    /// Decode time of the last sample queued (avoids queueing one twice).
-    last_dts: i64,
-    end: i64,
+    /// Decode time of the last packet queued (avoids queueing one twice).
+    last_dts: Option<u64>,
+    /// End of the last packet accepted by the decoder for this continuous run.
+    decoder_end: Option<u64>,
+    end: u64,
 }
 
 impl TrackPcm {
@@ -35,7 +39,20 @@ impl TrackPcm {
         let Codec::Aac { asc, .. } = &t.codec else { anyhow::bail!("not an AAC track") };
         let dec = AacDecoder::new(asc)?;
         let channels = dec.channels.max(1) as usize;
-        Ok(TrackPcm { idx, rate: t.timescale.max(1), channels, dec, buf: VecDeque::new(), buf_pos: 0, fetch_pos: 0, pending: VecDeque::new(), last_dts: -1, end: r.end_ticks(idx) as i64 })
+        Ok(TrackPcm {
+            idx,
+            rate: dec.rate,
+            timescale: t.timescale.max(1),
+            channels,
+            dec,
+            buf: VecDeque::new(),
+            buf_pos: 0,
+            fetch_pos: 0,
+            pending: VecDeque::new(),
+            last_dts: None,
+            decoder_end: None,
+            end: r.end_ticks(idx),
+        })
     }
 
     fn to_native(&self, out_frames: i64) -> i64 {
@@ -46,13 +63,15 @@ impl TrackPcm {
     /// codec has settled.
     pub fn seek(&mut self, r: &Mp4Reader, pos: i64) -> Result<()> {
         let native = self.to_native(pos.max(0));
-        let warm = 2048;
+        let preroll = (native - 2 * FRAME as i64).max(0);
         self.dec.reset();
         self.buf.clear();
         self.pending.clear();
-        self.last_dts = -1;
-        self.fetch_pos = (native - warm).max(0);
-        self.buf_pos = self.fetch_pos;
+        self.last_dts = None;
+        self.decoder_end = None;
+        self.fetch_pos = (i128::from(preroll) * i128::from(self.timescale)
+            / i128::from(self.rate)) as u64;
+        self.buf_pos = preroll;
         self.fill(r, native)?;
         // Drop everything before the target.
         let drop = ((native - self.buf_pos).max(0) as usize * 2).min(self.buf.len());
@@ -64,51 +83,108 @@ impl TrackPcm {
         Ok(())
     }
 
+    fn buf_end(&self) -> i64 {
+        self.buf_pos + (self.buf.len() / 2) as i64
+    }
+
+    fn silence_until(&mut self, end: i64) {
+        let frames = end.saturating_sub(self.buf_end()).max(0) as usize;
+        self.buf.extend(std::iter::repeat(0.0).take(frames * 2));
+    }
+
+    fn media_frame(&self, tick: i64) -> i64 {
+        Self::frame_at(tick, self.rate, i64::from(self.timescale))
+    }
+
+    fn frame_at(timestamp: i64, rate: u32, clock: i64) -> i64 {
+        let scaled = i128::from(timestamp) * i128::from(rate);
+        let clock = i128::from(clock);
+        // MFT timestamps are truncated to 100 ns. Round back to the nearest PCM frame.
+        ((scaled + scaled.signum() * (clock / 2)) / clock) as i64
+    }
+
+    fn append_decoded(&mut self, output: Vec<DecodedPcm>, end_ticks: u64) {
+        let end = self.media_frame(end_ticks as i64);
+        for block in output {
+            let start = Self::frame_at(block.time_hns, self.rate, HNS);
+            self.silence_until(start.min(end));
+            let frames = (end - start)
+                .max(0)
+                .min((block.samples.len() / self.channels) as i64);
+            let skip = (self.buf_end() - start).clamp(0, frames) as usize;
+            for frame in block.samples.chunks_exact(self.channels).take(frames as usize).skip(skip) {
+                self.buf.push_back(frame[0]);
+                self.buf.push_back(frame[usize::from(self.channels > 1)]);
+            }
+        }
+    }
+
+    fn drain_decoder(&mut self) {
+        if let Some(end) = self.decoder_end.take() {
+            // A whole AAC frame can contain padding beyond the run's last packet duration.
+            match self.dec.drain() {
+                Ok(output) => self.append_decoded(output, end),
+                Err(e) => tracing::debug!("AAC drain at {end}: {e:#}"),
+            }
+            self.dec.reset();
+        }
+    }
+
     /// Decode until the buffer reaches native frame `upto`.
     fn fill(&mut self, r: &Mp4Reader, upto: i64) -> Result<()> {
-        while self.buf_pos + (self.buf.len() / 2) as i64 <= upto {
-            if self.pending.is_empty() {
-                if self.fetch_pos >= self.end {
-                    // Past the end: silence.
-                    let n = (upto - (self.buf_pos + (self.buf.len() / 2) as i64) + 1).max(1) as usize;
-                    self.buf.extend(std::iter::repeat(0.0).take(n * 2));
+        while self.buf_end() <= upto {
+            if self.pending.is_empty() && self.fetch_pos < self.end {
+                let to = self.fetch_pos + u64::from(self.timescale) * 2;
+                let samples = r.samples(self.idx, self.fetch_pos, to)?;
+                self.fetch_pos = to;
+                self.pending.extend(samples.into_iter().filter(|s| {
+                    self.last_dts.is_none_or(|last| s.dts > last)
+                }));
+                if let Some(last) = self.pending.back() {
+                    self.last_dts = Some(last.dts);
+                }
+            }
+
+            let Some(&packet) = self.pending.front() else {
+                self.drain_decoder();
+                let silence_end = if self.fetch_pos >= self.end {
+                    upto + 1
+                } else {
+                    self.media_frame(self.fetch_pos as i64).min(upto + 1)
+                };
+                self.silence_until(silence_end);
+                continue;
+            };
+            if self.decoder_end.is_none_or(|end| packet.dts > end) {
+                self.drain_decoder();
+                self.silence_until(self.media_frame(packet.pts()).min(upto + 1));
+                if self.buf_end() > upto {
                     break;
                 }
-                let to = self.fetch_pos + self.rate as i64 * 2;
-                let s = r.samples(self.idx, self.fetch_pos as u64, to as u64)?;
-                self.fetch_pos = to;
-                let have_until = self.buf_pos + (self.buf.len() / 2) as i64;
-                let last = self.last_dts;
-                self.pending.extend(s.into_iter().filter(|x| x.end() as i64 > have_until && x.dts as i64 > last));
-                if let Some(l) = self.pending.back() {
-                    self.last_dts = l.dts as i64;
-                }
-                if self.pending.is_empty() {
-                    // A gap in the track: silence until the next window.
-                    let gap_end = to.min(upto + 1);
-                    let n = (gap_end - have_until).max(0) as usize;
-                    self.buf.extend(std::iter::repeat(0.0).take(n * 2));
-                    continue;
-                }
             }
-            let s = self.pending.pop_front().unwrap();
-            let have_until = self.buf_pos + (self.buf.len() / 2) as i64;
-            let start = s.dts as i64;
-            if start > have_until {
-                // Silence before this frame, and a fresh decoder state.
-                let n = (start - have_until) as usize;
-                self.buf.extend(std::iter::repeat(0.0).take(n * 2));
-            }
-            let data = r.read(&s)?;
-            let pcm = self.dec.decode(&data).unwrap_or_default();
-            let frames = pcm.len() / self.channels;
-            // Place the decoded frame at its timestamp, skipping overlap.
-            let have_until = self.buf_pos + (self.buf.len() / 2) as i64;
-            let skip = (have_until - start).clamp(0, frames as i64) as usize;
-            for f in skip..frames {
-                let (l, rr) = if self.channels == 1 { (pcm[f], pcm[f]) } else { (pcm[f * self.channels], pcm[f * self.channels + 1]) };
-                self.buf.push_back(l);
-                self.buf.push_back(rr);
+
+            self.pending.pop_front();
+            let data = r.read(&packet)?;
+            // The transform may return PCM for an earlier packet after accepting this one.
+            let to_hns = |ticks: i64| {
+                (i128::from(ticks) * i128::from(HNS) / i128::from(self.timescale)) as i64
+            };
+            let timestamp = to_hns(packet.pts());
+            let duration = to_hns(i64::from(packet.duration)).max(1);
+            match self.dec.decode_timed(&data, timestamp, duration) {
+                Ok(output) => {
+                    let end = packet.end();
+                    self.decoder_end = Some(end);
+                    self.append_decoded(output, end);
+                }
+                Err(e) => {
+                    tracing::debug!("AAC packet at {}: {e:#}", packet.dts);
+                    if self.decoder_end.is_some() {
+                        self.drain_decoder();
+                    } else {
+                        self.dec.reset();
+                    }
+                }
             }
         }
         Ok(())
