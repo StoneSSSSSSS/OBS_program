@@ -1,7 +1,10 @@
 # Rust build output
 /target/
 
-# Large third-party binaries (libmpv, ffmpeg) are fetched/copied by scripts/install.ps1
+# Local recordings, exports, portable builds and visual test evidence
+/.clipvault-local/
+
+# Locally downloaded tools from older versions
 /third_party/
 
 # IDEs
