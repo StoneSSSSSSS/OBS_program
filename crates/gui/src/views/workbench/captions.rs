@@ -1,6 +1,6 @@
 use super::{clock, seconds, ticks, Workbench};
 use crate::qa_driver;
-use cv_core::editor::{CaptionPosition, Id, Span};
+use cv_core::editor::{Caption, CaptionPosition, Id, Span};
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -16,6 +16,20 @@ pub(super) struct Captions {
 }
 
 impl Captions {
+    pub(super) fn open_cue(&mut self, cue: &Caption) {
+        self.select(cue);
+        self.open = true;
+        self.was_open = true;
+    }
+
+    fn select(&mut self, cue: &Caption) {
+        self.selected = Some(cue.id);
+        self.text.clone_from(&cue.text);
+        self.start = seconds(cue.range.start);
+        self.end = seconds(cue.range.end);
+        self.message.clear();
+    }
+
     fn new_at(&mut self, tick: u64) {
         self.selected = None;
         self.text.clear();
@@ -82,11 +96,7 @@ impl Workbench {
                                 for cue in cues {
                                     let name = format!("{}   {}", clock(cue.range.start), cue.text.lines().next().unwrap_or(""));
                                     if ui.add(egui::Button::selectable(state.selected == Some(cue.id), name).truncate()).clicked() {
-                                        state.selected = Some(cue.id);
-                                        state.text = cue.text.clone();
-                                        state.start = seconds(cue.range.start);
-                                        state.end = seconds(cue.range.end);
-                                        state.message.clear();
+                                        state.select(cue);
                                         action = Some(Action::Go(cue.range.start));
                                     }
                                 }

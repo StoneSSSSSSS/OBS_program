@@ -91,12 +91,17 @@ const GUIDES: &[Guide] = &[
         steps: &["Select a sound occurrence or a video shot with audio. In the Inspector set Fade in or Fade out in seconds.",
         "Choose Apply Changes and play across the boundary. Set a fade back to zero to remove it.",
         "Splitting a sound during a fade preserves the level on both sides of the cut."] },
-    Guide { section: "Pictures", title: "Add timed captions or import subtitles", terms: "bilingual multilingual subtitle subtitles caption captions accessibility srt subrip transcript closed open burned burn text position bottom top background frame counter scoreboard legible keep visible",
+    Guide { section: "Pictures", title: "Add timed captions or import subtitles", terms: "bilingual multilingual subtitle subtitles caption captions accessibility srt subrip transcript closed open burned burn cue boundaries text position bottom top background frame counter scoreboard legible keep visible",
         intro: "Time a subtitle to speech, burn it into the shared MP4, or save a separate SubRip file.",
         steps: &["Open Captions… and choose New at Playhead. Enter Caption text. Click a time, use Ctrl+A and type seconds or minutes:seconds, then press Enter. Choose Add Caption.",
-        "Choose a cue from the list to jump to its start. Edit its text or times and choose Save Caption.",
+        "The Captions lane shows each cue below the time ruler. Click a cue to jump to its start, or click its right edge to jump to the end. Double-click a cue to edit its text and times, then choose Save Caption.",
         "Use Import SRT… for existing subtitles. Caption position moves subtitles to the top or bottom of the picture so important detail stays visible. Export SRT… writes a separate subtitle file. Choose a fresh filename.",
         "Start is the first included time and End is the first time without that cue. Check both sides with Previous Frame and Next Frame. Export MP4… includes the captions in the picture."] },
+    Guide { section: "Pictures", title: "Show closing credits on black after video", terms: "black after video last picture footage closing end credits captions subtitles blank screen extend hold tail",
+        intro: "A caption can continue after the last video frame. The editor shows a black picture until the final caption ends.",
+        steps: &["Seek to the end of the last picture. Open Captions… and choose New at Playhead. Enter the credit, set Start and End, then choose Add Caption.",
+        "The Captions lane shows the cue below the time ruler. Click its start or right edge and step with comma or period to check the cut to black. The end time is the first instant without the cue.",
+        "Choose Export MP4… for a movie with visible credits. For a separate subtitle file, open Captions… and choose Export SRT…."] },
     Guide { section: "Timeline", title: "Keyboard shortcuts and a larger preview", terms: "keys keyboard hotkeys shortcuts shortcut play pause step nudge enlarge expand restore save undo",
         intro: "Use these shortcuts when editing in the Workbench.",
         steps: &["Click the playback clock to open Go to time. Type seconds or minutes:seconds and press Enter. Space plays or pauses. Comma steps back one frame and period steps forward. S splits the selected item and Delete removes it.",
@@ -257,7 +262,7 @@ mod tests {
     use super::*;
     #[test]
     fn search_finds_workflows_by_user_vocabulary() {
-        for (query, expected) in [("missing file", "relink"), ("frame counter", "one frame"), ("how do I nudge a frame", "one frame"),
+        for (query, expected) in [("black after video", "closing credits"), ("caption boundaries", "captions"), ("missing file", "relink"), ("frame counter", "one frame"), ("how do I nudge a frame", "one frame"),
             ("voiceover music", "narration"), ("camera audio", "camera audio"), ("portrait montage", "portrait"), ("penultimate shot", "long sequence"), ("cancel export", "Export"),
             ("move shot to beginning", "Reorder"), ("move title to front", "Reorder"), ("move closing chaptercard to front", "Reorder"), ("save as revision", "revise"), ("effects cue", "effects"), ("silent tail", "effects"), ("half volume", "effects"), ("letterbox", "portrait"), ("crop fill focus", "portrait")] {
             assert!(GUIDES.iter().any(|g| g.title.to_lowercase().contains(&expected.to_lowercase()) && rank(g, query).is_some()), "{query}");

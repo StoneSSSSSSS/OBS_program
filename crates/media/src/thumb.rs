@@ -6,12 +6,23 @@ use crate::mp4::Codec;
 use anyhow::{bail, ensure, Context, Result};
 use std::path::Path;
 
+// Converting a decimal time to binary can put an exact track tick just below its integer.
+fn presentation_tick(seconds: f64, timescale: u32) -> i64 {
+    let tick = seconds * f64::from(timescale);
+    let nearest = tick.round();
+    if (tick - nearest).abs() <= (tick.abs() * f64::EPSILON).min(0.25) {
+        nearest as i64
+    } else {
+        tick.floor() as i64
+    }
+}
+
 /// Decode the keyframe at or before `at_s` (presentation seconds).
 pub fn keyframe_at(r: &Mp4Reader, at_s: f64) -> Result<DecodedFrame> {
     let vi = r.video().context("no playable video")?;
     let t = &r.tracks[vi];
     let Codec::H264 { avcc } = &t.codec else { anyhow::bail!("unsupported video") };
-    let media = (at_s.max(0.0) + t.edit_start_s()) * t.timescale as f64;
+    let media = presentation_tick(at_s.max(0.0), t.timescale).saturating_add(t.edit.map_or(0, |(start, _)| start.max(0)));
     let key = r.sync_at_or_before(vi, media as u64)?.context("no keyframe")?;
     let mut dec = VideoDecoder::new(avcc, None, true)?;
     let data = r.read(&key)?;
@@ -30,7 +41,7 @@ pub fn frame_at_time(reader: &Mp4Reader, video: usize, at: f64) -> Result<(Decod
     let scale = i64::from(track.timescale);
     ensure!(scale > 0, "Video track has no timebase");
     let edit = track.edit.map(|(start, _)| start.max(0)).unwrap_or(0);
-    let media_at = ((at * scale as f64).floor() as i64).saturating_add(edit);
+    let media_at = presentation_tick(at, track.timescale).saturating_add(edit);
     let from = media_at.saturating_sub(scale * 3).max(0) as u64;
     let to = media_at.saturating_add(scale * 3) as u64;
     let candidates = reader.samples(video, from, to)?;

@@ -23,11 +23,15 @@ fn caption_panel_and_text_exist_only_during_cue_in_preview_and_export() -> Resul
     published.append(id)?;
     let reader = Mp4Reader::open(&movie)?;
     let video = reader.video().context("Missing subtitle-test video")?;
+    for (input, expected) in [(1.160, 1.160), (1.159999, 1.120), (1.160001, 1.160)] {
+        let (_, actual) = frame_at_time(&reader, video, input)?;
+        ensure!((actual - expected).abs() < 0.000001, "At {input}s decoded {actual}s, expected {expected}s");
+    }
     let mut incorrect = Vec::new();
     for (kind, p) in [("preview", &project), ("export", &published)] {
         for (n, (time, visible)) in [(S / 2, false), (24*S/25, false), (S, true), (3*S/2, true), (49*S/25, true), (2*S, false), (51*S/25, false), (5*S/2, false), (13*S/4, true), (18*S/5, false), (15*S/4, false)].into_iter().enumerate() {
             let image = if kind == "export" {
-                let (frame, _) = frame_at_time(&reader, video, time as f64 / S as f64 + 0.001)?;
+                let (frame, _) = frame_at_time(&reader, video, time as f64 / S as f64)?;
                 image::DynamicImage::ImageRgb8(nv12_to_rgb(&frame, 640)).to_rgba8()
             } else { thumbnail(p, time, 640, 360)? };
             let top_changed = (10..235).flat_map(|y| (25..615).map(move |x| (x,y)))
@@ -80,7 +84,7 @@ fn scrub_before_and_during_a_credit_after_the_last_picture() -> Result<()> {
         let video = reader.video().context("Missing credit video")?;
         for (at, expected_text) in [(4 * S, false), (4 * S + S / 25, true), (4 * S + S / 2, true)] {
             let scrub = thumbnail(&project, at, 640, 360)?;
-            let (decoded, _) = frame_at_time(&reader, video, at as f64 / S as f64 + 0.001)?;
+            let (decoded, _) = frame_at_time(&reader, video, at as f64 / S as f64)?;
             let exported = nv12_to_rgb(&decoded, 640);
             for image in [image::DynamicImage::ImageRgba8(scrub).to_rgb8(), exported] {
                 let ink = image.pixels().filter(|p| p[0] > 130 && p[1] > 130 && p[2] > 130).count();

@@ -1,4 +1,6 @@
 //! Timeline geometry and gestures calculated from the current frame's width.
+mod caption_lane;
+
 use super::{clock, filename, frame_number, frame_tick, role_name, seconds, ticks, Generated, Selection, Workbench};
 use crate::theme;
 use anyhow::Context as _;
@@ -16,6 +18,7 @@ pub(super) struct BinAsset(pub Id);
 pub(super) struct Timeline {
     window: Option<Window>,
     gesture: Option<Gesture>,
+    caption_rows: caption_lane::CaptionRows,
 }
 
 #[derive(Clone, Copy)]
@@ -184,6 +187,7 @@ impl Workbench {
         }
         self.axis_scroll(ui, &response, window, axis, domain);
         paint_ruler(ui, ruler, axis, window, cursor, accent);
+        self.caption_lane(ui, axis, window, accent);
 
         let mut drop = None;
         let mut select = None;
