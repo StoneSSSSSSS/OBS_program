@@ -2,8 +2,9 @@
 //! with an activity lane (what was focused), markers and clips, audio lanes
 //! with non-destructive region edits, live playback and clip-from-range.
 
+use super::editor_layout::{self, EditorLayout};
 use crate::app::Ctx;
-use crate::lanes::{self, LaneAction, LaneState, PreviewProgress, RangePreview, WaveSource, GUTTER};
+use crate::lanes::{self, LaneAction, LaneState, PreviewProgress, RangePreview, WaveSource};
 use crate::theme::{self, icon};
 use chrono::{Local, TimeZone};
 use cv_core::ipc::{ExportSource, Request};
@@ -11,7 +12,7 @@ use cv_core::mixer::MixSettings;
 use cv_core::model::{apply_edit, rebase_edits, ActivitySpan, AudioEdit, Category, Clip, Game, Marker, Recording};
 use cv_core::timeline::{locate, plan_cut, plan_duration_s, Segment};
 use cv_core::util::{format_duration, format_duration_precise, human_bytes, now_ms};
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -116,6 +117,15 @@ pub struct RecordingsView {
     compact_files: bool,
 }
 
+pub(super) fn timeline_help(ui: &mut Ui) -> egui::Response {
+    ui.add(
+        egui::Label::new(theme::label_dim(
+            "Click to seek. Use I and O to mark start and end.",
+        ))
+        .wrap(),
+    )
+}
+
 fn timeline_mix_file() -> PathBuf {
     cv_core::paths::data_dir().join("timeline_mix.json")
 }
@@ -125,6 +135,24 @@ fn edits_file() -> PathBuf {
 }
 
 impl RecordingsView {
+    pub(crate) fn qa_mark_trim(&mut self) -> bool {
+        if self.selection().is_some() {
+            return true;
+        }
+        let Some((start, duration)) = self.recs.iter().rev().find_map(|r| {
+            let duration = self.seg_end(r).saturating_sub(r.start_ms);
+            (r.probed && !r.is_live() && duration >= 500).then_some((r.start_ms, duration))
+        }) else { return false };
+        self.in_ms = Some(start + duration / 4);
+        self.out_ms = Some(start + duration / 2);
+        self.frame_recording(start + duration / 3);
+        self.selection().is_some()
+    }
+
+    pub(crate) fn show_compact_files(&mut self) {
+        self.compact_files = true;
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -466,8 +494,8 @@ impl RecordingsView {
         }
 
         let fullscreen = c.player.fullscreen;
+        let compact = ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
         if !fullscreen {
-            let compact = ui.available_width() < 840.0;
             if compact {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(theme::heading("24/7 Recordings"));
@@ -482,12 +510,6 @@ impl RecordingsView {
                 ui.horizontal_wrapped(|ui| self.header_controls(ui, c, false));
             } else {
                 self.header(ui, c);
-                let side_width = (ui.available_width() * 0.30).clamp(245.0, 330.0);
-                egui::Panel::right("rec_side")
-                    .exact_size(side_width)
-                    .resizable(false)
-                    .frame(egui::Frame::NONE.inner_margin(Margin { left: 18, right: 0, top: 0, bottom: 0 }))
-                    .show(ui, |ui| self.files_inspector(ui, c));
             }
             ui.add_space(10.0);
         }
@@ -517,32 +539,38 @@ impl RecordingsView {
             return;
         }
 
-        let bottom_margin = if fullscreen { Margin::symmetric(16, 8) } else { Margin::ZERO };
-        egui::Panel::bottom("rec_transport")
-            .resizable(false)
-            .frame(egui::Frame::NONE.inner_margin(bottom_margin).fill(if fullscreen { theme::BG } else { Color32::TRANSPARENT }))
-            .show(ui, |ui| {
+        let side_width = (!compact && !fullscreen).then(|| (ui.available_width() * 0.30).clamp(245.0, 330.0));
+        let show_lanes = c.player.show_mixer && !fullscreen;
+        let controls_height = if show_lanes { 398.0 } else { 102.0 };
+        let layout = EditorLayout::new(ui, side_width, controls_height, !fullscreen);
+        if let Some(mut inspector) = layout.inspector {
+            inspector.min.x += 18.0;
+            editor_layout::region(ui, "rec_side", inspector, |ui| self.files_inspector(ui, c));
+        }
+        editor_layout::region(ui, "rec_transport", layout.transport, |ui| {
+            editor_layout::controls(ui, "rec_transport_scroll", |ui| {
                 let label = self.time_label(c);
                 c.player.transport(ui, &label, &c.cfg.player);
                 if !fullscreen {
                     self.cut_bar(ui, c);
                 }
             });
-        let lane_budget = ui.available_height() - 220.0;
-        egui::Panel::bottom("rec_controls")
-            .resizable(false)
-            .frame(egui::Frame::NONE.inner_margin(bottom_margin).fill(if fullscreen { theme::BG } else { Color32::TRANSPARENT }))
-            .show(ui, |ui| {
+        });
+        editor_layout::region(ui, "rec_controls", layout.timeline, |ui| {
+            editor_layout::controls(ui, "rec_controls_scroll", |ui| {
                 ui.add_space(6.0);
                 self.timeline(ui, c);
-                if c.player.show_mixer && !fullscreen {
+                if show_lanes {
                     ui.add_space(4.0);
-                    self.audio_lanes(ui, c, lane_budget);
+                    self.audio_lanes(ui, c, layout.timeline.height() - 106.0);
                 }
             });
-        let avail = ui.available_size();
-        let h = if fullscreen { avail.y } else { (avail.x * 9.0 / 16.0).min(avail.y).max(0.0) };
-        c.player.video(ui, Vec2::new(avail.x, h));
+        });
+        editor_layout::region(ui, "rec_video", layout.video, |ui| {
+            let available = layout.video.size();
+            let h = if fullscreen { available.y } else { (available.x * 9.0 / 16.0).min(available.y) };
+            c.player.video(ui, Vec2::new(available.x, h));
+        });
         self.cut_dialog(ui, c);
     }
 
@@ -633,7 +661,7 @@ impl RecordingsView {
     }
 
     fn timeline(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        let w = ui.available_width();
+        let w = ui.available_width().max(1.0);
         let (row, _) = ui.allocate_exact_size(Vec2::new(w, 96.0), Sense::hover());
         let rect = lanes::axis_rect(row);
         let span = self.view_span.max(MIN);
@@ -646,13 +674,14 @@ impl RecordingsView {
         let ruler = Rect::from_x_y_ranges(rect.x_range(), row.top()..=row.top() + 20.0);
         let seg_band = Rect::from_x_y_ranges(rect.x_range(), row.top() + 24.0..=row.top() + 54.0);
         let act_band = Rect::from_x_y_ranges(rect.x_range(), row.top() + 60.0..=row.top() + 80.0);
-        let gp = ui.painter();
+        let gutter = Rect::from_x_y_ranges(row.left()..=rect.left(), row.y_range());
+        let gp = ui.painter_at(gutter);
         let gx = row.left() + 10.0;
         gp.text(Pos2::new(gx, seg_band.center().y), Align2::LEFT_CENTER, "Recording", FontId::new(12.0, theme::semibold()), theme::TEXT_DIM);
         gp.text(Pos2::new(gx, act_band.center().y), Align2::LEFT_CENTER, "Activity", FontId::new(12.0, theme::semibold()), theme::TEXT_DIM);
         gp.text(Pos2::new(gx, act_band.bottom() + 9.0), Align2::LEFT_CENTER, "what was on screen", FontId::proportional(10.5), theme::TEXT_FAINT);
 
-        let p = ui.painter_at(rect.expand2(Vec2::new(lanes::AXIS_INSET, 0.0)));
+        let p = ui.painter_at(rect);
         p.rect(Rect::from_x_y_ranges(rect.x_range(), row.y_range()), 5.0, theme::SIDEBAR, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
 
         // Ticks.
@@ -711,7 +740,7 @@ impl RecordingsView {
                 p.rect_filled(br, CornerRadius::same(3), color);
                 if x1 - x0 > 46.0 {
                     let text_color = if s.is_game { Color32::from_black_alpha(220) } else { theme::TEXT_DIM };
-                    p.text(Pos2::new(x0 + 5.0, br.center().y), Align2::LEFT_CENTER, crate::views::clips::truncate(&s.name, ((x1 - x0) / 7.0) as usize), FontId::new(10.5, theme::semibold()), text_color);
+                    p.with_clip_rect(br).text(Pos2::new(x0 + 5.0, br.center().y), Align2::LEFT_CENTER, crate::views::clips::truncate(&s.name, ((x1 - x0) / 7.0) as usize), FontId::new(10.5, theme::semibold()), text_color);
                 }
             }
         }
@@ -811,6 +840,7 @@ impl RecordingsView {
                 tip.push_str("\nNot recorded");
             }
             if self.drag_mode.is_none() {
+                tip.push_str("\nClick to seek. Scroll to zoom or drag the ruler to pan. Press I or O to mark start or end.");
                 egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::unique("tl_tip"), egui::PopupAnchor::Pointer).show(|ui| ui.label(tip));
             }
             let (dx, dy) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y));
@@ -860,10 +890,7 @@ impl RecordingsView {
                 ui.close();
             }
         });
-        ui.horizontal(|ui| {
-            ui.add_space(GUTTER + lanes::AXIS_INSET);
-            ui.label(theme::label_dim("Click to seek, then use Set start (I) and Set end (O). Scroll to zoom or drag the ruler to pan."));
-        });
+        timeline_help(ui);
     }
 
     fn audio_lanes(&mut self, ui: &mut Ui, c: &mut Ctx, height_budget: f32) {
@@ -1231,7 +1258,7 @@ impl RecordingsView {
                     ui.label(RichText::new(&day).size(12.0).color(theme::TEXT_FAINT));
                     last_day = day;
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let playing = self.cur == Some(i);
                     let dur = (self.seg_end(r) - r.start_ms) as f64 / 1000.0;
                     let text = format!("Play {}  ·  {}", dt.format("%H:%M"), format_duration(dur));

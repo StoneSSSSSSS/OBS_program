@@ -11,6 +11,8 @@ use cv_core::ipc::Request;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Stroke, Ui, Vec2};
 use std::time::{Duration, Instant};
 
+mod resize_check;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Home,
@@ -86,6 +88,7 @@ pub struct App {
     settings: SettingsView,
     titlebar_done: u32,
     selftest: Option<SelfTest>,
+    resize_check: Option<resize_check::Sweep>,
 }
 
 /// `CLIPVAULT_SELFTEST=<dir>`: visit each page, save a screenshot of the app
@@ -133,6 +136,7 @@ impl App {
             recordings: RecordingsView::default(),
             settings: SettingsView::default(),
             titlebar_done: 0,
+            resize_check: resize_check::Sweep::from_env(),
             selftest: std::env::var_os("CLIPVAULT_SELFTEST").map(|d| SelfTest { dir: d.into(), step: 0, at: Instant::now(), entered: false, shot: false }),
         }
     }
@@ -285,6 +289,7 @@ impl App {
             return;
         }
         ctx.request_repaint_after(Duration::from_millis(250));
+        let toast_width = (ctx.content_rect().width() - 72.0).clamp(0.0, 380.0);
         egui::Area::new(egui::Id::unique("toasts"))
             .anchor(Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -20.0))
             .order(egui::Order::Foreground)
@@ -303,10 +308,10 @@ impl App {
                         .inner_margin(Margin::symmetric(14, 10))
                         .shadow(egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(110) })
                         .show(ui, |ui| {
-                            ui.set_max_width(380.0);
+                            ui.set_max_width(toast_width);
                             ui.horizontal(|ui| {
                                 ui.label(theme::icon_text(glyph, 15.0).color(color));
-                                ui.label(RichText::new(&t.text).color(theme::TEXT));
+                                ui.add(egui::Label::new(RichText::new(&t.text).color(theme::TEXT)).wrap());
                             });
                         });
                     ui.add_space(8.0);
@@ -430,7 +435,7 @@ impl eframe::App for App {
 
         let fullscreen = self.c.player.fullscreen && matches!(self.page, Page::Recordings | Page::Clips);
         let compact = ui.available_width() < 1120.0;
-        let icon_only = ui.available_width() < 840.0;
+        let icon_only = ui.available_width() < 840.0 || ui.available_height() < 470.0;
         if !fullscreen {
             egui::Panel::left("nav")
                 .exact_size(if icon_only { 62.0 } else if compact { 174.0 } else { 196.0 })
@@ -448,6 +453,10 @@ impl eframe::App for App {
                 Page::Settings => self.settings.ui(ui, &mut self.c),
             });
         self.toasts(&ctx);
+        if let Some(mut sweep) = self.resize_check.take() {
+            sweep.after_frame(self, &ctx);
+            self.resize_check = Some(sweep);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {

@@ -188,6 +188,9 @@ pub struct JobInfo {
     #[serde(default)]
     pub output_bytes: Option<u64>,
     pub clip_id: Option<i64>,
+    /// The source clip for a share/export job. Recording exports have no clip ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_clip_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

@@ -355,6 +355,10 @@ fn cut_trim_and_export_over_ipc() -> Result<()> {
         target_size_mb: Some(1),
         title: "Synthetic share".into(),
     })?;
+    ensure!(
+        exported.source_clip_id == Some(clip.id) && exported.clip_id.is_none(),
+        "completed export must identify its source without becoming a saved clip"
+    );
     let output = PathBuf::from(exported.output.context("export returned no output path")?);
     ensure!(
         output.starts_with(profile.dir.join("exports")),

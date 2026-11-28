@@ -19,11 +19,16 @@ use std::time::{Duration, Instant, SystemTime};
 pub const GUTTER: f32 = 196.0;
 /// Inset of the time axis inside the area right of the gutter.
 pub const AXIS_INSET: f32 = 8.0;
-const LANE_H: f32 = 40.0;
+const LANE_H: f32 = 44.0;
+
+pub fn gutter_width(row_width: f32) -> f32 {
+    GUTTER.min(row_width * 0.46)
+}
 
 /// The time-axis rectangle for a full-width row rect.
 pub fn axis_rect(row: Rect) -> Rect {
-    Rect::from_x_y_ranges(row.left() + GUTTER + AXIS_INSET..=row.right() - AXIS_INSET, row.y_range())
+    let inset = AXIS_INSET.min(row.width() * 0.08);
+    Rect::from_x_y_ranges(row.left() + gutter_width(row.width()) + inset..=row.right() - inset, row.y_range())
 }
 
 /// A waveform placed on the lane time axis (`start`..`end` in axis units).
@@ -221,7 +226,7 @@ pub struct LaneState {
     reveal_app: Option<String>,
 }
 
-fn waveform_id(lane: &str) -> egui::Id {
+pub(crate) fn waveform_id(lane: &str) -> egui::Id {
     egui::Id::unique(("audio_lane_waveform", lane))
 }
 
@@ -526,13 +531,13 @@ pub fn lanes(
 
     let span = (t1 - t0).max(1e-6);
     let header_height = ui.cursor().top() - top;
-    let rows_height = (height_budget - header_height).clamp(LANE_H, 210.0);
+    let rows_height = (height_budget - header_height).clamp(LANE_H, 228.0);
     egui::ScrollArea::vertical().id_salt("audio_lane_rows").max_height(rows_height).show(ui, |ui| {
         for (i, lane) in lane_ids.iter().enumerate() {
             if !visible_lanes.contains(&lane) {
                 continue;
             }
-            let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), LANE_H), Sense::hover());
+            let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), LANE_H), Sense::hover());
             if st.reveal_app.as_ref() == Some(lane) {
                 ui.scroll_to_rect(row, Some(egui::Align::Center));
                 st.reveal_app = None;
@@ -545,21 +550,35 @@ pub fn lanes(
             let audible_gain = if muted_by_mode { 0.0 } else { player.mix.lane(lane).effective() };
 
             // ---- header (name, mute, volume)
-            let head = Rect::from_min_size(row.min, Vec2::new(GUTTER - 4.0, LANE_H - 4.0));
-            ui.painter().rect_filled(head, CornerRadius::same(8), theme::SURFACE);
+            let head = Rect::from_min_size(row.min, Vec2::new((gutter_width(row.width()) - 4.0).max(1.0), LANE_H - 4.0));
+            let hp = ui.painter_at(head);
+            hp.rect_filled(head, CornerRadius::same(8), theme::SURFACE);
             let name = &labels[i];
             let dim = audible_gain <= 0.0005;
-            ui.painter().text(
-                head.left_top() + egui::vec2(10.0, 6.0),
-                Align2::LEFT_TOP,
-                crate::views::clips::truncate(name, 14),
-                FontId::new(12.5, theme::semibold()),
-                if dim { theme::TEXT_FAINT } else { theme::TEXT },
-            );
-            if player.expandable(lane) {
+            let expandable = player.expandable(lane) && head.width() >= 72.0;
+            let expand_width = if head.width() >= 138.0 { 52.0 } else { 20.0 };
+            let label_padding = if expandable { expand_width + 30.0 } else { 29.0 };
+            let label_rect = Rect::from_min_max(head.left_top() + egui::vec2(8.0, 3.0),
+                Pos2::new((head.right() - label_padding).max(head.left() + 8.0), head.top() + 21.0));
+            if label_rect.is_positive() {
+                let mut label_ui = ui.new_child(egui::UiBuilder::new().id_salt(("lane_name", lane)).max_rect(label_rect));
+                label_ui.shrink_clip_rect(label_rect);
+                label_ui.add(egui::Label::new(RichText::new(name).font(FontId::new(12.5, theme::semibold()))
+                    .color(if dim { theme::TEXT_FAINT } else { theme::TEXT })).truncate()).on_hover_text(name);
+            }
+            if expandable {
                 let expanded = player.expanded(lane);
-                let button_rect = Rect::from_center_size(Pos2::new(head.right() - 53.0, head.top() + 13.0), Vec2::new(52.0,20.0));
-                if ui.put(button_rect, egui::Button::new(if expanded { "Apps ▾" } else { "Apps ▸" }).frame(false))
+                let button_rect = Rect::from_min_size(Pos2::new(head.right() - 28.0 - expand_width, head.top() + 3.0), Vec2::new(expand_width, 20.0));
+                let label = match (expand_width > 20.0, expanded) {
+                    (true, true) => "Apps ▾",
+                    (true, false) => "Apps ▸",
+                    (false, true) => "▾",
+                    (false, false) => "▸",
+                };
+                let mut button_ui = ui.new_child(egui::UiBuilder::new().id_salt(("expand_lane", lane)).max_rect(button_rect));
+                button_ui.shrink_clip_rect(button_rect);
+                button_ui.spacing_mut().interact_size.y = button_rect.height();
+                if button_ui.add_sized(button_rect.size(), egui::Button::new(label).frame(false))
                     .on_hover_text(if expanded { "Collapse apps" } else { "Show apps in this category" }).clicked()
                 {
                     player.set_expanded(lane, !expanded);
@@ -574,38 +593,45 @@ pub fn lanes(
                 }
             }
             let g = player.mix.lane(lane).effective();
-            let mute_rect = Rect::from_center_size(Pos2::new(head.right() - 16.0, head.top() + 13.0), Vec2::splat(22.0));
+            let mute_rect = Rect::from_center_size(Pos2::new(head.right() - 15.0, head.top() + 13.0), Vec2::splat(22.0)).intersect(head);
             let mresp = ui.interact(mute_rect, ui.scope_id().with(("lane_mute", lane)), Sense::click());
             let glyph = if g <= 0.0005 { icon::MUTE } else { icon::VOLUME };
             if mresp.hovered() {
-                ui.painter().circle_filled(mute_rect.center(), 11.0, theme::SURFACE3);
+                hp.circle_filled(mute_rect.center(), 11.0, theme::SURFACE3);
             }
-            ui.painter().text(mute_rect.center(), Align2::CENTER_CENTER, glyph, FontId::new(11.0, theme::icons_family()), theme::TEXT_DIM);
+            hp.text(mute_rect.center(), Align2::CENTER_CENTER, glyph, FontId::new(11.0, theme::icons_family()), theme::TEXT_DIM);
             if mresp.on_hover_text(if g <= 0.0005 { "Unmute" } else { "Mute" }).clicked() {
                 let previous = player.mix.clone();
                 player.set_lane_muted(lane, g > 0.0005);
                 actions.push(LaneAction::MixChanged { previous: Some(previous) });
             }
-            let slider_rect = Rect::from_min_size(head.left_top() + egui::vec2(8.0, 22.0), Vec2::new(GUTTER - 60.0, 14.0));
-            let mut gv = g;
-            let sresp = ui.put(slider_rect, egui::Slider::new(&mut gv, 0.0..=4.0).show_value(false).trailing_fill(true));
-            if sresp.changed() {
-                let dragging = sresp.is_pointer_button_down_on() || sresp.drag_stopped();
-                let previous = st.gain_gesture.new_change(lane, dragging).then(|| player.mix.clone());
-                player.set_lane_gain(lane, gv);
-                actions.push(LaneAction::MixChanged { previous });
+            let show_percentage = head.width() >= 90.0;
+            let slider_width = head.width() - if show_percentage { 53.0 } else { 16.0 };
+            if slider_width >= 20.0 {
+                let slider_rect = Rect::from_min_size(head.left_top() + egui::vec2(8.0, 21.0), Vec2::new(slider_width, 18.0));
+                let mut slider_ui = ui.new_child(egui::UiBuilder::new()
+                    .id_salt(("lane_gain", lane)).max_rect(slider_rect)
+                    .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)));
+                slider_ui.shrink_clip_rect(slider_rect);
+                slider_ui.spacing_mut().slider_width = slider_width;
+                slider_ui.spacing_mut().interact_size.y = slider_rect.height();
+                let mut gv = g;
+                let sresp = slider_ui.add(egui::Slider::new(&mut gv, 0.0..=4.0).show_value(false).trailing_fill(true));
+                if sresp.changed() {
+                    let dragging = sresp.is_pointer_button_down_on() || sresp.drag_stopped();
+                    let previous = st.gain_gesture.new_change(lane, dragging).then(|| player.mix.clone());
+                    player.set_lane_gain(lane, gv);
+                    actions.push(LaneAction::MixChanged { previous });
+                }
+                if show_percentage {
+                    hp.text(Pos2::new(head.right() - 8.0, slider_rect.center().y),
+                        Align2::RIGHT_CENTER, format!("{:.0}%", gv * 100.0), FontId::monospace(10.5), theme::TEXT_FAINT);
+                }
             }
-            ui.painter().text(
-                Pos2::new(head.right() - 8.0, slider_rect.center().y),
-                Align2::RIGHT_CENTER,
-                format!("{:.0}%", gv * 100.0),
-                FontId::monospace(10.5),
-                theme::TEXT_FAINT,
-            );
 
             // ---- waveform area
             let wave_area = Rect::from_x_y_ranges(axis.x_range(), row.top()..=row.bottom() - 4.0);
-            let p = ui.painter_at(wave_area.expand2(Vec2::new(AXIS_INSET, 0.0)));
+            let p = ui.painter_at(wave_area);
             p.rect_filled(wave_area, CornerRadius::same(6), theme::SURFACE);
             let mid = wave_area.center().y;
             let half = wave_area.height() / 2.0 - 3.0;

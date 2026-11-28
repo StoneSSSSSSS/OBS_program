@@ -74,6 +74,13 @@ impl Default for SettingsView {
 }
 
 impl SettingsView {
+    /// Change only the staged QA draft so the sweep exercises the pinned save bar.
+    pub(crate) fn qa_seed_dirty(&mut self, c: &Ctx) {
+        let saved = self.saved.get_or_insert_with(|| c.cfg.clone());
+        let draft = self.draft.get_or_insert_with(|| saved.clone());
+        draft.general.confirm_deletes = !saved.general.confirm_deletes;
+    }
+
     /// Called when navigating away: never leave global hotkeys suspended.
     pub fn leave(&mut self, c: &mut Ctx) {
         if self.capturing.take().is_some() {
@@ -89,6 +96,11 @@ impl SettingsView {
             "games" => Tab::Games,
             "clips" => Tab::Clips,
             "hotkeys" => Tab::Hotkeys,
+            "overlay" => Tab::Overlay,
+            "player" => Tab::Player,
+            "export" => Tab::Export,
+            "advanced" => Tab::Advanced,
+            "about" => Tab::About,
             _ => Tab::General,
         };
     }
@@ -106,11 +118,32 @@ impl SettingsView {
         });
         ui.add_space(10.0);
 
+        let mut body = ui.available_rect_before_wrap();
+        let _ = ui.allocate_rect(body, egui::Sense::hover());
         if dirty {
-            egui::Panel::bottom("save_bar")
-                .frame(egui::Frame::NONE.inner_margin(Margin { left: 0, right: 0, top: 10, bottom: 0 }))
-                .show(ui, |ui| self.save_bar(ui, c));
+            let restart = self.saved.as_ref().zip(self.draft.as_ref())
+                .is_some_and(|(saved, draft)| saved.recorder_restart_needed(draft));
+            let status = if restart { "Unsaved changes · recording will restart" } else { "Unsaved changes" };
+            let compact = body.width() < 510.0;
+            let mut footer = body;
+            let height = if compact {
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let label = ui.painter().layout(status.to_owned(), font, theme::TEXT, (body.width() - 34.0).max(0.0));
+                56.0 + ui.spacing().item_spacing.y + label.size().y
+            } else {
+                56.0
+            };
+            footer.min.y = (footer.bottom() - height).max(footer.top());
+            body.max.y = (footer.top() - 10.0).max(body.top());
+            super::editor_layout::region(ui, "settings_save_footer", footer, |ui| {
+                self.save_bar(ui, c, status, restart, compact);
+            });
         }
+        super::editor_layout::region(ui, "settings_body", body, |ui| self.settings_body(ui, c));
+        self.restart_modal(ui, c);
+    }
+
+    fn settings_body(&mut self, ui: &mut Ui, c: &mut Ctx) {
         if ui.available_width() < 740.0 {
             let mut selected = self.tab;
             let label = TABS.iter().find(|(tab, _, _)| *tab == selected).map(|(_, _, label)| *label).unwrap_or("General");
@@ -129,12 +162,16 @@ impl SettingsView {
             .exact_size(210.0)
             .resizable(false)
             .frame(egui::Frame::NONE.inner_margin(Margin { left: 0, right: 16, top: 0, bottom: 0 }))
-            .show(ui, |ui| {
+            .show(ui, |ui| egui::ScrollArea::vertical().id_salt("settings_sections").auto_shrink(false).show(ui, |ui| {
                 for (tab, glyph, label) in TABS {
                     let sel = self.tab == tab;
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), egui::Sense::click());
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, sel, label));
                     let bg = if sel { theme::SURFACE3 } else if resp.hovered() { theme::SURFACE2 } else { Color32::TRANSPARENT };
                     ui.painter().rect_filled(rect, egui::CornerRadius::same(8), bg);
+                    if resp.has_focus() {
+                        ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.5, theme::TEXT), egui::StrokeKind::Inside);
+                    }
                     let fg = if sel { theme::TEXT } else { theme::TEXT_DIM };
                     ui.painter().text(rect.left_center() + egui::vec2(16.0, 0.0), egui::Align2::CENTER_CENTER, glyph, egui::FontId::new(13.0, theme::icons_family()), if sel { c.accent } else { theme::TEXT_FAINT });
                     ui.painter().text(rect.left_center() + egui::vec2(34.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.5), fg);
@@ -145,7 +182,7 @@ impl SettingsView {
                         }
                     }
                 }
-            });
+            }));
         }
 
         egui::ScrollArea::vertical().id_salt(("settings_scroll", self.tab)).auto_shrink(false).show(ui, |ui| {
@@ -172,35 +209,29 @@ impl SettingsView {
             }
             self.draft = Some(d);
         });
-        self.restart_modal(ui, c);
     }
 
-    fn save_bar(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        let restart = self.saved.as_ref().zip(self.draft.as_ref()).map(|(s, d)| s.recorder_restart_needed(d)).unwrap_or(false);
+    fn save_bar(&mut self, ui: &mut Ui, c: &mut Ctx, status: &str, restart: bool, compact: bool) {
         theme::card().inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let compact = ui.available_width() < 570.0;
-            let status = if restart { "Unsaved changes · recording will restart" } else { "Unsaved changes" };
             if compact {
-                ui.label(theme::label_dim(status));
+                ui.add(egui::Label::new(theme::label_dim(status)).wrap());
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if !compact {
                     ui.label(theme::icon_text(icon::INFO, 14.0).color(theme::TEXT_DIM));
                     ui.label(RichText::new(status).color(theme::TEXT));
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::primary_button(ui, Some(icon::CHECK), "Save").clicked() {
-                        if restart {
-                            self.confirm_restart = true;
-                        } else {
-                            self.save(ui.ctx(), c, false);
-                        }
+                if theme::primary_button(ui, Some(icon::CHECK), "Save").clicked() {
+                    if restart {
+                        self.confirm_restart = true;
+                    } else {
+                        self.save(ui.ctx(), c, false);
                     }
-                    if theme::ghost_button(ui, None, "Discard").clicked() {
-                        self.draft = self.saved.clone();
-                    }
-                });
+                }
+                if theme::ghost_button(ui, None, "Discard").clicked() {
+                    self.draft = self.saved.clone();
+                }
             });
         });
     }
@@ -211,11 +242,11 @@ impl SettingsView {
         }
         let mut choice = None;
         egui::Modal::new(egui::Id::unique("restart_recorder")).show(ui.ctx(), |ui| {
-            ui.set_width(420.0);
+            ui.set_width(dialog_width(ui, 420.0));
             ui.label(theme::title("Restart recording to apply?"));
             ui.label(theme::label_dim("ClipVault closes the current file and starts a new one with your settings. The timeline may have a short gap."));
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if theme::primary_button(ui, Some(icon::REFRESH), "Save & restart recording").clicked() {
                     choice = Some(true);
                 }
@@ -367,9 +398,8 @@ impl SettingsView {
                 ("F / double-click", "Fullscreen"),
                 ("Esc", "Leave fullscreen / back to library"),
             ] {
-                ui.horizontal(|ui| {
-                    ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new(k).monospace().color(theme::TEXT)));
-                    ui.label(theme::label_dim(v));
+                row(ui, k, "", |ui| {
+                    ui.add(egui::Label::new(theme::label_dim(v)).wrap());
                 });
             }
         });
@@ -385,8 +415,9 @@ impl SettingsView {
             } else {
                 value.clone()
             };
-            let btn = egui::Button::new(RichText::new(text).monospace().color(if capturing { c.accent } else { theme::TEXT })).min_size(Vec2::new(200.0, 30.0));
-            if ui.add(btn).clicked() && !capturing {
+            let width = field_width(ui.available_width(), 200.0, 36.0);
+            let btn = egui::Button::new(RichText::new(&text).monospace().color(if capturing { c.accent } else { theme::TEXT })).truncate();
+            if ui.add_sized([width, 30.0], btn).on_hover_text(text).clicked() && !capturing {
                 self.capturing = Some(id);
                 let _ = c.service.call(Request::SuspendHotkeys { suspend: true });
             }
@@ -429,9 +460,9 @@ impl SettingsView {
                     let mut swap = None;
                     let n = d.audio.mic_priority.len();
                     for (i, m) in d.audio.mic_priority.iter().enumerate() {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(format!("{}.", i + 1)).color(theme::TEXT_FAINT));
-                            ui.label(m);
+                            ui.add(egui::Label::new(m).truncate()).on_hover_text(m);
                             if i > 0 && theme::icon_button(ui, "\u{E70E}", 10.0, "Move up").clicked() {
                                 swap = Some(i - 1);
                             }
@@ -450,8 +481,9 @@ impl SettingsView {
                         d.audio.mic_priority.remove(i);
                     }
                     let inputs: Vec<Endpoint> = self.devices.as_ref().map(|x| x.inputs.clone()).unwrap_or_default();
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("add_mic").selected_text("Add a connected mic…").width(260.0).show_ui(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let width = field_width(ui.available_width(), 260.0, 36.0);
+                        egui::ComboBox::from_id_salt("add_mic").selected_text("Add a connected mic…").width(width).truncate().show_ui(ui, |ui| {
                             for e in &inputs {
                                 let name = cv_core::audio_names::clean_display_name(&e.name);
                                 if ui.selectable_label(false, &name).clicked() && !d.audio.mic_priority.iter().any(|m| m.eq_ignore_ascii_case(&name)) {
@@ -521,48 +553,46 @@ impl SettingsView {
             ui.label(theme::small("Rename how a game appears, mark whether it's a game, or merge duplicates. Changes apply immediately."));
             ui.add_space(6.0);
             let mut reload = false;
-            egui::Grid::new("games_grid").num_columns(4).spacing([12.0, 8.0]).striped(false).show(ui, |ui| {
-                ui.label(theme::small("NAME"));
-                ui.label(theme::small("EXECUTABLE"));
-                ui.label(theme::small("IS A GAME"));
-                ui.label(theme::small("CLIPS"));
-                ui.end_row();
-                for g in self.games.iter_mut() {
-                    let r = ui.add(egui::TextEdit::singleline(&mut g.name).desired_width(200.0));
-                    if r.lost_focus() && !g.name.trim().is_empty() {
-                        if let Some(db) = c.db() {
-                            let _ = db.rename_game(g.id, g.name.trim());
-                        }
-                        reload = true;
-                    }
+            for g in &mut self.games {
+                ui.push_id(g.id, |ui| {
                     let exe = if g.exe_path.is_empty() { g.key.clone() } else { cv_core::games::exe_name_of(&g.exe_path) };
-                    ui.label(RichText::new(exe).size(12.0).color(theme::TEXT_FAINT));
-                    let mut ov = g.is_game_override;
-                    let label = match ov {
-                        None => format!("Auto ({})", if g.auto_is_game { "yes" } else { "no" }),
-                        Some(true) => "Yes".into(),
-                        Some(false) => "No".into(),
-                    };
-                    egui::ComboBox::from_id_salt(("isgame", g.id)).selected_text(label).width(110.0).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut ov, None, "Auto");
-                        ui.selectable_value(&mut ov, Some(true), "Yes");
-                        ui.selectable_value(&mut ov, Some(false), "No");
-                    });
-                    if ov != g.is_game_override {
-                        if let Some(db) = c.db() {
-                            let _ = db.set_game_override(g.id, ov);
+                    ui.horizontal_wrapped(|ui| {
+                        let width = ui.available_width().min(200.0);
+                        let r = ui.add(egui::TextEdit::singleline(&mut g.name).desired_width(width).min_size(egui::Vec2::ZERO));
+                        if r.lost_focus() && !g.name.trim().is_empty() {
+                            if let Some(db) = c.db() {
+                                let _ = db.rename_game(g.id, g.name.trim());
+                            }
+                            reload = true;
                         }
-                        g.is_game_override = ov;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(g.clip_count.to_string());
-                        if ui.small_button("Merge…").on_hover_text("Move this game's clips into another game").clicked() {
-                            self.merge_from = Some(g.id);
+                        let mut ov = g.is_game_override;
+                        let label = match ov {
+                            None => format!("Game · Auto ({})", if g.auto_is_game { "yes" } else { "no" }),
+                            Some(true) => "Game · Yes".into(),
+                            Some(false) => "Game · No".into(),
+                        };
+                        egui::ComboBox::from_id_salt("isgame").selected_text(label).width(138.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut ov, None, "Auto");
+                            ui.selectable_value(&mut ov, Some(true), "Yes");
+                            ui.selectable_value(&mut ov, Some(false), "No");
+                        });
+                        if ov != g.is_game_override {
+                            if let Some(db) = c.db() {
+                                let _ = db.set_game_override(g.id, ov);
+                            }
+                            g.is_game_override = ov;
                         }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("{} clips", g.clip_count));
+                            if ui.small_button("Merge…").on_hover_text("Move this game's clips into another game").clicked() {
+                                self.merge_from = Some(g.id);
+                            }
+                        });
                     });
-                    ui.end_row();
-                }
-            });
+                    ui.add(egui::Label::new(RichText::new(&exe).size(12.0).color(theme::TEXT_FAINT)).wrap()).on_hover_text(exe);
+                });
+                ui.separator();
+            }
             if reload {
                 self.games_loaded = false;
             }
@@ -571,12 +601,12 @@ impl SettingsView {
             let mut close = false;
             let from_name = self.games.iter().find(|g| g.id == from).map(|g| g.name.clone()).unwrap_or_default();
             egui::Modal::new(egui::Id::unique("merge")).show(ui.ctx(), |ui| {
-                ui.set_width(380.0);
+                ui.set_width(dialog_width(ui, 380.0));
                 ui.label(theme::title(format!("Merge \"{from_name}\" into…")));
                 ui.label(theme::small("Its clips move to the other game (their files stay where they are)."));
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     for g in self.games.clone() {
-                        if g.id != from && ui.button(&g.name).clicked() {
+                        if g.id != from && ui.add(egui::Button::new(&g.name).wrap()).clicked() {
                             if let Some(db) = c.db.as_mut() {
                                 if let Err(e) = db.merge_games(from, g.id) {
                                     c.toasts.push(crate::app::Toast { level: "error".into(), text: format!("{e:#}"), at: std::time::Instant::now() });
@@ -655,12 +685,13 @@ fn recording(ui: &mut Ui, c: &mut Ctx, d: &mut Config, monitors: &mut Option<Vec
             } else {
                 selected.map(monitor_label).unwrap_or_else(|| d.recording.monitor.clone())
             };
-            egui::ComboBox::from_id_salt("recording_monitor").selected_text(label).show_ui(ui, |ui| {
+            let width = field_width(ui.available_width(), 260.0, 38.0);
+            egui::ComboBox::from_id_salt("recording_monitor").selected_text(&label).width(width).truncate().show_ui(ui, |ui| {
                 ui.selectable_value(&mut d.recording.monitor, "primary".to_string(), "Primary monitor");
                 for monitor in monitors.as_deref().unwrap_or_default() {
                     ui.selectable_value(&mut d.recording.monitor, monitor.device_name.clone(), monitor_label(monitor));
                 }
-            });
+            }).response.on_hover_text(label);
             if theme::icon_button(ui, icon::REFRESH, 11.0, "Refresh monitors").clicked() {
                 *monitors = None;
             }
@@ -880,15 +911,13 @@ fn about(ui: &mut Ui, c: &mut Ctx) {
             ("Settings", cv_core::paths::config_path().display().to_string()),
             ("Data", cv_core::paths::data_dir().display().to_string()),
         ];
-        egui::Grid::new("about").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            for (k, v) in rows {
-                ui.label(theme::label_dim(k));
-                ui.label(v);
-                ui.end_row();
-            }
-        });
+        for (k, v) in rows {
+            row(ui, k, "", |ui| {
+                ui.add(egui::Label::new(v).wrap());
+            });
+        }
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if theme::ghost_button(ui, Some(icon::FOLDER), "Open logs").clicked() {
                 let _ = std::process::Command::new("explorer.exe").arg(cv_core::paths::logs_dir()).spawn();
             }
@@ -915,6 +944,43 @@ fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     ui.add_space(14.0);
 }
 
+fn dialog_width(ui: &Ui, preferred: f32) -> f32 {
+    field_width(ui.ctx().content_rect().width(), preferred, 44.0)
+}
+
+fn field_width(available: f32, preferred: f32, trailing: f32) -> f32 {
+    (available - trailing).clamp(0.0, preferred)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn control_rows_and_long_paths_fit_across_the_reflow_boundary() {
+        for width in [310.0, 435.0, 592.0, 610.0, 630.0, 780.0] {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 512.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut path = format!("C:\\{}", "LongFolderName".repeat(18));
+                    group(ui, "Recording storage", |ui| {
+                        folder_row(ui, "Recording folder", "Where ClipVault stores continuous recordings.", &mut path);
+                        row(ui, "Data", "", |ui| {
+                            ui.add(egui::Label::new(&path).wrap());
+                        });
+                    });
+                    assert!(ui.min_rect().right() <= width + 0.5, "Settings row exceeded {width} points: {:?}", ui.min_rect());
+                },
+            );
+            output.textures_delta.clear();
+        }
+    }
+}
+
 fn row(ui: &mut Ui, label: &str, help: &str, add: impl FnOnce(&mut Ui)) {
     if ui.available_width() < 610.0 {
         if !label.is_empty() {
@@ -928,8 +994,9 @@ fn row(ui: &mut Ui, label: &str, help: &str, add: impl FnOnce(&mut Ui)) {
         return;
     }
     ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(Vec2::new(300.0, 20.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_width(300.0);
+        let label_width = (ui.available_width() * 0.43).min(300.0);
+        ui.allocate_ui_with_layout(Vec2::new(label_width, 20.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(label_width);
             if !label.is_empty() {
                 ui.label(RichText::new(label).color(theme::TEXT));
             }
@@ -951,8 +1018,8 @@ fn toggle_row(ui: &mut Ui, c: &Ctx, label: &str, help: &str, v: &mut bool) {
 
 fn folder_row(ui: &mut Ui, label: &str, help: &str, v: &mut String) {
     row(ui, label, help, |ui| {
-        let field_width = (ui.available_width() - 38.0).clamp(80.0, 300.0);
-        ui.add(egui::TextEdit::singleline(v).desired_width(field_width));
+        let width = field_width(ui.available_width(), 300.0, 38.0);
+        ui.add(egui::TextEdit::singleline(v).desired_width(width));
         if theme::icon_button(ui, icon::FOLDER, 13.0, "Browse").clicked() {
             let start = if v.is_empty() { cv_core::paths::data_dir() } else { std::path::PathBuf::from(&*v) };
             if let Some(p) = rfd::FileDialog::new().set_directory(start).pick_folder() {
@@ -964,7 +1031,8 @@ fn folder_row(ui: &mut Ui, label: &str, help: &str, v: &mut String) {
 
 fn file_row(ui: &mut Ui, label: &str, help: &str, v: &mut String, exts: &[&str]) {
     row(ui, label, help, |ui| {
-        ui.add(egui::TextEdit::singleline(v).desired_width(300.0));
+        let width = field_width(ui.available_width(), 300.0, 38.0);
+        ui.add(egui::TextEdit::singleline(v).desired_width(width));
         if theme::icon_button(ui, icon::FOLDER, 13.0, "Browse").clicked() {
             if let Some(p) = rfd::FileDialog::new().add_filter("file", exts).pick_file() {
                 *v = p.display().to_string();
@@ -980,7 +1048,8 @@ fn list_editor(ui: &mut Ui, list: &mut Vec<String>, new_item: &mut String, hint:
             for (i, item) in list.iter().enumerate() {
                 egui::Frame::NONE.fill(theme::SURFACE3).corner_radius(egui::CornerRadius::same(12)).inner_margin(Margin::symmetric(10, 3)).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(item);
+                        let label_width = field_width(ui.available_width(), 320.0, 38.0);
+                        ui.add_sized([label_width, 20.0], egui::Label::new(item).truncate()).on_hover_text(item);
                         if ui.add(egui::Button::new(theme::icon_text(icon::CLOSE, 9.0)).frame(false)).clicked() {
                             remove = Some(i);
                         }
@@ -991,8 +1060,9 @@ fn list_editor(ui: &mut Ui, list: &mut Vec<String>, new_item: &mut String, hint:
         if let Some(i) = remove {
             list.remove(i);
         }
-        ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(new_item).hint_text(hint).desired_width(200.0));
+        ui.horizontal_wrapped(|ui| {
+            let width = field_width(ui.available_width(), 200.0, 36.0);
+            let r = ui.add(egui::TextEdit::singleline(new_item).hint_text(hint).desired_width(width));
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             if (theme::icon_button(ui, icon::ADD, 11.0, "Add").clicked() || enter) && !new_item.trim().is_empty() {
                 let v = new_item.trim().to_string();

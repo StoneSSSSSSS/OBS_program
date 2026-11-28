@@ -1,3 +1,4 @@
+pub(crate) mod editor_layout;
 pub mod clips;
 pub mod home;
 pub mod recordings;

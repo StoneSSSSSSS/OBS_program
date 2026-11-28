@@ -43,17 +43,19 @@ fn main() -> eframe::Result<()> {
         });
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ClipVault")
-        .with_inner_size([1440.0, 900.0])
-        .with_min_inner_size([980.0, 640.0])
+        .with_inner_size([1180.0, 740.0])
+        .with_min_inner_size([690.0, 500.0])
         .with_app_id("ClipVault");
     if let Some(icon) = icon {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
+    let persistence_path = paths::uses_local_storage().then(|| paths::data_dir().join("gui.ron"));
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Glow,
+        centered: persistence_path.as_ref().is_some_and(|file| !file.exists()),
         persist_window: true,
-        persistence_path: paths::uses_local_storage().then(|| paths::data_dir().join("gui.ron")),
+        persistence_path,
         ..Default::default()
     };
     eframe::run_native("ClipVault", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, cfg)))))

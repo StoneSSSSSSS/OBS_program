@@ -50,7 +50,18 @@ pub fn submit(sh: &Shared, kind: JobKind) -> u64 {
         JobKind::Trim { .. } => ("trim", "Trimming clip".to_string()),
         JobKind::Export { title, target_size_mb, .. } => ("export", if title.is_empty() { match target_size_mb { Some(mb) => format!("Sharing (under {mb} MB)"), None => "Exporting".into() } } else { title.clone() }),
     };
-    let info = JobInfo { id, kind: label.into(), title, progress: 0.0, state: "queued".into(), ..Default::default() };
+    let source_clip_id = match &kind {
+        JobKind::Export { source: ExportSource::Clip { clip_id }, .. } => Some(*clip_id),
+        _ => None,
+    };
+    let info = JobInfo {
+        id,
+        kind: label.into(),
+        title,
+        state: "queued".into(),
+        source_clip_id,
+        ..Default::default()
+    };
     sh.jobs.lock().push(info.clone());
     sh.emit(Event::Job { job: info });
     let _ = sh.job_tx.send(JobRequest { id, kind, cancel });

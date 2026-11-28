@@ -42,25 +42,25 @@ impl HomeView {
         self.refresh(c);
         let status = c.service.status();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(theme::heading("Home"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let live = status.as_ref().is_some_and(|s| {
-                        s.recording.active && s.recording.written_until_ms > s.recording.started_ms
-                    });
-                    ui.add_enabled_ui(live, |ui| {
+                let live = status.as_ref().is_some_and(|s| {
+                    s.recording.active && s.recording.written_until_ms > s.recording.started_ms
+                });
+                ui.add_enabled_ui(live, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if theme::primary_button(ui, Some(icon::LIVE), "Watch live").clicked() {
+                            c.goto = Some(Page::Recordings);
+                            crate::views::recordings::request_go_live();
+                        }
                         if theme::ghost_button(ui, Some(icon::FLAG), "Add marker")
                             .on_hover_text("Bookmark this moment on the 24/7 timeline")
                             .clicked() && c.request(Request::AddMarker { label: String::new() }).is_some()
                         {
                             c.toast("info", "Marker added");
                         }
-                        if theme::primary_button(ui, Some(icon::LIVE), "Watch live").clicked() {
-                            c.goto = Some(Page::Recordings);
-                            crate::views::recordings::request_go_live();
-                        }
-                    }).response.on_disabled_hover_text("Available while recording full history.");
-                });
+                    });
+                }).response.on_disabled_hover_text("Available while recording full history.");
             });
             ui.add_space(14.0);
 
@@ -84,7 +84,7 @@ impl HomeView {
             self.recent_footage(ui, c, status.as_ref());
             ui.add_space(gap);
 
-            let cols = if ui.available_width() >= 960.0 { 4 } else { 2 };
+            let cols = health_columns(ui.available_width(), gap);
             let w = (ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32;
             let cards: [&dyn Fn(&mut Ui, &mut Ctx, Option<&Status>, f64); 4] = [&recording_card, &replay_card, &mic_card, &storage_card];
             for row in cards.chunks(cols) {
@@ -93,7 +93,7 @@ impl HomeView {
                     for card in row {
                         ui.allocate_ui_with_layout(Vec2::new(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                             theme::card().inner_margin(egui::Margin::same(13)).show(ui, |ui| {
-                                ui.set_width(w - 28.0);
+                                ui.set_width((w - 28.0).max(0.0));
                                 ui.set_min_height(130.0);
                                 ui.vertical(|ui| card(ui, c, status.as_ref(), self.footage_s));
                             });
@@ -130,7 +130,7 @@ impl HomeView {
                     ui.label(theme::label_dim("Nothing yet."));
                 }
                 for e in &self.events {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let color = match e.level.as_str() {
                             "error" => theme::DANGER,
                             "warn" => theme::WARNING,
@@ -147,7 +147,7 @@ impl HomeView {
                                 .size(12.0)
                                 .color(theme::TEXT_FAINT),
                         );
-                        ui.label(RichText::new(&e.message).color(theme::TEXT_DIM));
+                        ui.add(egui::Label::new(RichText::new(&e.message).color(theme::TEXT_DIM)).wrap());
                     });
                 }
             });
@@ -159,13 +159,11 @@ impl HomeView {
     fn recent_clips(&self, ui: &mut Ui, c: &mut Ctx) {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(theme::title("Recent clips"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.link("View all clips").clicked() {
-                        c.goto = Some(Page::Clips);
-                    }
-                });
+                if ui.link("View all clips").clicked() {
+                    c.goto = Some(Page::Clips);
+                }
             });
             if self.recent.is_empty() {
                 ui.label(theme::label_dim(format!("No clips yet. Press {} in game to save one.", c.cfg.hotkeys.save_clip)));
@@ -317,6 +315,32 @@ impl HomeView {
     }
 }
 
+fn health_columns(width: f32, gap: f32) -> usize {
+    const MIN_CARD_WIDTH: f32 = 220.0;
+    if width >= 4.0 * MIN_CARD_WIDTH + 3.0 * gap {
+        4
+    } else if width >= 2.0 * MIN_CARD_WIDTH + gap {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::health_columns;
+
+    #[test]
+    fn health_cards_keep_minimum_width_through_resize() {
+        let gap = 12.0;
+        for width in 280..=1380 {
+            let columns = health_columns(width as f32, gap) as f32;
+            let card_width = (width as f32 - gap * (columns - 1.0)) / columns;
+            assert!(card_width >= 220.0, "width {width}, {columns} columns");
+        }
+    }
+}
+
 fn live_audio(ui: &mut Ui, c: &mut Ctx) {
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -360,9 +384,9 @@ fn warning_banner(ui: &mut Ui, text: &str) {
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(theme::icon_text(icon::WARNING, 15.0).color(theme::WARNING));
-                ui.label(RichText::new(text).color(theme::TEXT));
+                ui.add(egui::Label::new(RichText::new(text).color(theme::TEXT)).wrap());
             });
         });
     ui.add_space(8.0);
@@ -527,11 +551,16 @@ fn recent_tile(ui: &mut Ui, c: &mut Ctx, clip: &Clip, w: f32) -> egui::Response 
             .rect_stroke(img, CornerRadius::same(10), Stroke::new(1.5, theme::TEXT_DIM), egui::StrokeKind::Inside);
     }
     crate::views::clips::duration_badge(ui, img, clip.duration);
-    ui.painter().text(
-        egui::pos2(rect.left() + 2.0, img.bottom() + 8.0),
-        egui::Align2::LEFT_TOP,
-        crate::views::clips::truncate(&clip.title, 28),
+    let mut title = egui::text::LayoutJob::simple(
+        clip.title.clone(),
         egui::FontId::new(13.0, theme::semibold()),
+        theme::TEXT,
+        w - 4.0,
+    );
+    title.wrap = egui::text::TextWrapping::truncate_at_width(w - 4.0);
+    p.galley(
+        egui::pos2(rect.left() + 2.0, img.bottom() + 8.0),
+        p.layout_job(title),
         theme::TEXT,
     );
     ui.painter().text(

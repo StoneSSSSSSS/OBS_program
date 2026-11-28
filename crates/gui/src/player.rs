@@ -289,8 +289,13 @@ impl Player {
         self.seek_relative(if forward { 1.0 / fps } else { -1.0 / fps });
     }
     pub fn video(&mut self, ui: &mut Ui, size: Vec2) -> egui::Response {
+        let size = size.max(Vec2::ZERO).min(ui.available_size().max(Vec2::ZERO));
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-        ui.painter().rect_filled(rect, CornerRadius::same(5), Color32::BLACK);
+        if !rect.is_positive() {
+            return response;
+        }
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::same(5), Color32::BLACK);
         let state = self.native.state();
         if self.path.is_some() {
             if let Some(frame) = self.native.frame() {
@@ -309,8 +314,7 @@ impl Player {
             let size = tex.size_vec2();
             let scale = (rect.width() / size.x).min(rect.height() / size.y);
             let dest = Rect::from_center_size(rect.center(), size * scale);
-            ui.painter()
-                .image(tex.id(), dest, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            painter.image(tex.id(), dest, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
         let message = if self.path.is_none() {
             Some("Choose a recording or clip".to_owned())
@@ -322,13 +326,17 @@ impl Player {
             None
         };
         if let Some(msg) = message {
-            let center = rect.center();
-            ui.painter()
-                .text(center, Align2::CENTER_CENTER, msg, FontId::new(15.0, theme::semibold()), theme::TEXT);
+            let mut job = egui::text::LayoutJob::simple(
+                msg, FontId::new(15.0, theme::semibold()), theme::TEXT, (rect.width() - 16.0).max(1.0),
+            );
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let galley = painter.layout_job(job);
+            painter.galley(rect.center() - galley.size() * 0.5, galley, theme::TEXT);
         }
         if !self.fullscreen {
             let border = if response.has_focus() { theme::TEXT } else { theme::BORDER_STRONG };
-            ui.painter().rect_stroke(rect, 5.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+            painter.rect_stroke(rect, 5.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
         }
         if response.double_clicked() {
             self.fullscreen = !self.fullscreen;
@@ -409,10 +417,10 @@ impl Player {
     }
 
     /// Play/pause, skip buttons, time, speed, volume, mixer toggle.
-    pub fn transport(&mut self, ui: &mut Ui, time_label: &str, cfg: &PlayerConfig) {
+    pub fn transport(&mut self, ui: &mut Ui, time_label: &str, cfg: &PlayerConfig) -> egui::Response {
         let st = self.state();
-        let compact = ui.available_width() < 770.0;
-        ui.horizontal_wrapped(|ui| {
+        let compact = ui.available_width() < crate::views::editor_layout::SINGLE_TRANSPORT_ROW_WIDTH;
+        let play = ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if theme::icon_button(ui, icon::REWIND, 16.0, &format!("Back {}s (Shift+←)", cfg.seek_large_secs)).clicked() {
                 self.seek_relative(-(cfg.seek_large_secs as f64));
@@ -421,7 +429,8 @@ impl Player {
                 self.seek_relative(-(cfg.seek_small_secs as f64));
             }
             let play_glyph = if st.paused || !st.loaded { icon::PLAY } else { icon::PAUSE };
-            if theme::icon_button(ui, play_glyph, 20.0, "Play/pause (Space)").clicked() {
+            let play = theme::icon_button(ui, play_glyph, 20.0, "Play/pause (Space)");
+            if play.clicked() {
                 self.toggle_pause();
             }
             if theme::icon_button(ui, icon::SKIP_FWD, 16.0, &format!("Forward {}s (→)", cfg.seek_small_secs)).clicked() {
@@ -431,17 +440,18 @@ impl Player {
                 self.seek_relative(cfg.seek_large_secs as f64);
             }
             ui.add_space(8.0);
-            ui.label(RichText::new(time_label).monospace().color(theme::TEXT_DIM));
+            ui.add(egui::Label::new(RichText::new(time_label).monospace().color(theme::TEXT_DIM)).truncate())
+                .on_hover_text(time_label);
 
             if !compact {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.transport_options(ui, st.speed);
-                });
+                self.transport_options(ui, st.speed);
             }
-        });
+            play
+        }).inner;
         if compact {
             ui.horizontal_wrapped(|ui| self.transport_options(ui, st.speed));
         }
+        play
     }
 
     fn transport_options(&mut self, ui: &mut Ui, speed: f64) {
@@ -480,7 +490,7 @@ impl Player {
                 }
             });
         // Volume
-        let slider_width = ui.spacing().slider_width.min(104.0);
+        let slider_width = ui.spacing().slider_width.min(104.0).min(ui.available_width().max(40.0));
         ui.spacing_mut().slider_width = slider_width;
         let mut vol = self.volume;
         let r = ui.add(egui::Slider::new(&mut vol, 0.0..=1.5).show_value(false).trailing_fill(true));
@@ -520,12 +530,12 @@ fn trim_float(v: f64) -> String {
 pub fn seek_bar(ui: &mut Ui, player: &mut Player, in_pt: &mut Option<f64>, out_pt: &mut Option<f64>, accent: Color32) -> Option<f64> {
     let st = player.state();
     let dur = st.duration.max(0.001);
-    let width = ui.available_width();
+    let width = ui.available_width().max(1.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click_and_drag());
-    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width() - 16.0, 6.0));
+    let track = Rect::from_center_size(rect.center(), Vec2::new((rect.width() - 16.0).max(1.0), 6.0));
     let x_of = |t: f64| track.left() + (t / dur).clamp(0.0, 1.0) as f32 * track.width();
     let t_of = |x: f32| (((x - track.left()) / track.width()).clamp(0.0, 1.0) as f64) * dur;
-    let p = ui.painter();
+    let p = ui.painter_at(rect);
     p.rect_filled(track, CornerRadius::same(3), theme::SURFACE3);
     // Selection
     if let (Some(a), Some(b)) = (*in_pt, *out_pt) {
@@ -538,7 +548,7 @@ pub fn seek_bar(ui: &mut Ui, player: &mut Player, in_pt: &mut Option<f64>, out_p
         if let Some(t) = pt {
             let x = x_of(t);
             p.line_segment([egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)], Stroke::new(2.0, accent));
-            p.text(egui::pos2(x, rect.top()), Align2::CENTER_BOTTOM, label, FontId::proportional(9.0), accent);
+            p.text(egui::pos2(x, rect.top()), Align2::CENTER_TOP, label, FontId::proportional(9.0), accent);
         }
     }
     let hx = x_of(st.time_pos);

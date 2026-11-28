@@ -2,7 +2,7 @@
 
 use super::ClipsView;
 use crate::app::Ctx;
-use crate::lanes::GUTTER;
+use crate::lanes::gutter_width;
 use crate::theme;
 use cv_core::util::format_duration_precise;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
@@ -35,27 +35,33 @@ impl ClipTimeline {
 
 impl ClipsView {
     pub(super) fn timeline_controls(&mut self, ui: &mut Ui, c: &mut Ctx, duration: f64, lanes_on: bool) {
-        ui.horizontal(|ui| {
-            if lanes_on {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(GUTTER - 8.0, 30.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        let view = &mut self.detail.timeline.view;
-                        let at = c.player.state().time_pos;
-                        for (label, factor, help) in [("−", 2.0, "Zoom out"), ("+", 0.5, "Zoom in at playhead")] {
-                            if ui.small_button(label).on_hover_text(help).clicked() {
-                                view.zoom(duration, factor, at, 0.5);
-                            }
-                        }
-                        if ui.small_button("Fit clip").clicked() {
-                            view.fit();
-                        }
-                    },
-                );
+        let at = c.player.state().time_pos;
+        let zoom = |view: &mut TimelineViewport, ui: &mut Ui| {
+            for (label, factor, help) in [("−", 2.0, "Zoom out"), ("+", 0.5, "Zoom in at playhead")] {
+                if ui.small_button(label).on_hover_text(help).clicked() {
+                    view.zoom(duration, factor, at, 0.5);
+                }
             }
+            if ui.small_button("Fit clip").clicked() {
+                view.fit();
+            }
+        };
+        if lanes_on && ui.available_width() < 395.0 {
+            ui.horizontal_wrapped(|ui| zoom(&mut self.detail.timeline.view, ui));
             self.clip_timeline(ui, c, duration);
-        });
+        } else {
+            let gutter = gutter_width(ui.available_width());
+            ui.horizontal(|ui| {
+                if lanes_on {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new((gutter - ui.spacing().item_spacing.x).max(1.0), 30.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| zoom(&mut self.detail.timeline.view, ui),
+                    );
+                }
+                self.clip_timeline(ui, c, duration);
+            });
+        }
     }
 
     pub(super) fn mark_in(&mut self, at: f64, duration: f64) -> Result<(), &'static str> {
@@ -101,10 +107,11 @@ impl ClipsView {
                 p.rect(selection, 2.0, c.accent.gamma_multiply(0.18), Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
             }
         }
-        for i in 0..=4 {
-            let at = window.time_at(i as f64 / 4.0);
+        let intervals = if width >= 360.0 { 4 } else if width >= 190.0 { 2 } else { 1 };
+        for i in 0..=intervals {
+            let at = window.time_at(i as f64 / f64::from(intervals));
             let x = x_of(at);
-            let align = match i { 0 => Align2::LEFT_TOP, 4 => Align2::RIGHT_TOP, _ => Align2::CENTER_TOP };
+            let align = if i == 0 { Align2::LEFT_TOP } else if i == intervals { Align2::RIGHT_TOP } else { Align2::CENTER_TOP };
             p.text(Pos2::new(x, rect.top() + 2.0), align, format_duration_precise(at), FontId::monospace(10.0), theme::TEXT_DIM);
         }
         for (mark, label) in [(self.detail.in_pt, "Start"), (self.detail.out_pt, "End")] {

@@ -1,11 +1,12 @@
 //! Clips library (grid with game/category filters) and the clip detail view
 //! (player, trim, mixer, export, organise).
 
+use super::editor_layout::{self, EditorLayout};
 use crate::app::Ctx;
 use crate::lanes::{self, LaneAction, LaneState, PreviewProgress, RangePreview, WaveSource};
 use crate::player::seek_bar;
 use crate::theme::{self, icon};
-use cv_core::ipc::{ExportSource, Request};
+use cv_core::ipc::{ExportSource, JobInfo, Request};
 use cv_core::model::{apply_edit, AudioEdit, Category, Clip, ClipFilter, ClipSort, Game};
 use cv_core::util::{format_duration, format_duration_precise, human_bytes, now_ms};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -59,6 +60,7 @@ struct Detail {
     timeline: timeline::ClipTimeline,
     preview: Option<RangePreview>,
     compact_inspector: bool,
+    qa_scroll_to_export: bool,
     game_search: String,
     /// Where this clip was when the player was last showing it.
     resume_pos: f64,
@@ -86,6 +88,28 @@ pub struct ClipsView {
 }
 
 impl ClipsView {
+    pub(crate) fn show_compact_inspector(&mut self) {
+        self.detail.compact_inspector = true;
+    }
+
+    pub(crate) fn qa_mark_trim(&mut self, c: &Ctx) -> bool {
+        let Some(clip) = self.detail.clip.as_ref() else { return false };
+        let duration = self.media_duration(c, clip);
+        if self.selection(duration).is_some() {
+            return true;
+        }
+        if !duration.is_finite() || duration < 0.5 {
+            return false;
+        }
+        self.detail.in_pt = Some(duration * 0.2);
+        self.detail.out_pt = Some(duration * 0.7);
+        self.selection(duration).is_some()
+    }
+
+    pub(crate) fn qa_show_export(&mut self) {
+        self.detail.qa_scroll_to_export = true;
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -214,30 +238,36 @@ impl ClipsView {
     // ------------------------------------------------------------ library
 
     fn library_ui(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        egui::Panel::left("clip_filters")
-            .exact_size(236.0)
-            .resizable(false)
-            .frame(egui::Frame::NONE.inner_margin(Margin { left: 0, right: 18, top: 0, bottom: 0 }))
-            .show(ui, |ui| self.filters_ui(ui, c));
+        if ui.available_width() >= 640.0 {
+            egui::Panel::left("clip_filters")
+                .exact_size(236.0)
+                .resizable(false)
+                .frame(egui::Frame::NONE.inner_margin(Margin { left: 0, right: 18, top: 0, bottom: 0 }))
+                .show(ui, |ui| self.filters_ui(ui, c));
+        } else {
+            ui.menu_button("Filters", |ui| self.filters_ui(ui, c));
+        }
 
-        // Header
-        ui.horizontal(|ui| {
-            ui.label(theme::heading(self.filter_title()));
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Label::new(theme::heading(self.filter_title())).truncate());
             ui.label(theme::label_dim(format!("{} clip{}", self.clips.len(), if self.clips.len() == 1 { "" } else { "s" })));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::Slider::new(&mut self.card_w, 180.0..=420.0).show_value(false)).on_hover_text("Card size");
-                let before = self.sort;
-                egui::ComboBox::from_id_salt("sort").selected_text(self.sort.label()).show_ui(ui, |ui| {
-                    for s in ClipSort::ALL {
-                        ui.selectable_value(&mut self.sort, s, s.label());
-                    }
-                });
-                if self.sort != before {
-                    self.dirty = true;
+            let before = self.sort;
+            egui::ComboBox::from_id_salt("sort").selected_text(self.sort.label()).show_ui(ui, |ui| {
+                for s in ClipSort::ALL {
+                    ui.selectable_value(&mut self.sort, s, s.label());
                 }
-                ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search clips, games, categories…").desired_width(260.0));
-                ui.label(theme::icon_text(icon::SEARCH, 14.0).color(theme::TEXT_FAINT));
             });
+            if self.sort != before {
+                self.dirty = true;
+            }
+            ui.add(egui::Slider::new(&mut self.card_w, 180.0..=420.0).show_value(false)).on_hover_text("Card size");
+        });
+        ui.horizontal(|ui| {
+            ui.label(theme::icon_text(icon::SEARCH, 14.0).color(theme::TEXT_FAINT));
+            ui.add(egui::TextEdit::singleline(&mut self.search)
+                .hint_text("Search clips, games, categories…")
+                .desired_width(ui.available_width().min(330.0).max(1.0))
+                .clip_text(true));
         });
         ui.add_space(8.0);
 
@@ -270,14 +300,16 @@ impl ClipsView {
         }
 
         let gap = 16.0;
-        let avail = ui.available_width();
+        let avail = (ui.available_width() - ui.spacing().scroll.allocated_width()).max(1.0);
         let cols = ((avail + gap) / (self.card_w + gap)).floor().max(1.0) as usize;
         let cw = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
         let ch = cw * 9.0 / 16.0 + 56.0;
         let rows = self.clips.len().div_ceil(cols);
         let clips = self.clips.clone();
         let mut open = None;
-        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ch + gap, rows, |ui, range| {
+        egui::ScrollArea::vertical().auto_shrink(false)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show_rows(ui, ch + gap, rows, |ui, range| {
             for r in range {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
@@ -315,7 +347,7 @@ impl ClipsView {
     }
 
     fn filters_ui(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        egui::ScrollArea::vertical().id_salt("filters").auto_shrink(false).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("filters").auto_shrink(false).max_height(460.0).show(ui, |ui| {
             theme::section(ui, "Library");
             for (f, glyph, label) in [
                 (Filter::All, icon::LIBRARY, "All clips"),
@@ -705,7 +737,7 @@ impl ClipsView {
             return;
         }
 
-        let compact = ui.available_width() < 840.0;
+        let compact = ui.available_width() < editor_layout::TWO_COLUMN_WIDTH;
         if compact {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.detail.compact_inspector, false, "Player");
@@ -717,37 +749,43 @@ impl ClipsView {
                 self.persist_audio(c, &clip);
                 return;
             }
-        } else {
-            let side_w = (ui.available_width() * 0.31).clamp(265.0, 340.0);
-            egui::Panel::right("clip_side")
-                .exact_size(side_w)
-                .resizable(false)
-                .frame(egui::Frame::NONE.inner_margin(Margin { left: 18, right: 0, top: 0, bottom: 0 }))
-                .show(ui, |ui| self.clip_inspector(ui, c, &clip));
         }
-
-        egui::Panel::bottom("clip_transport").resizable(false).frame(egui::Frame::NONE).show(ui, |ui| {
-            let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
-            c.player.transport(ui, &label, &c.cfg.player);
+        let width = ui.available_width();
+        let side_width = (!compact).then(|| (width * 0.31).clamp(265.0, 340.0));
+        let controls_height = if c.player.show_mixer { 330.0 } else { 42.0 };
+        let layout = EditorLayout::new(ui, side_width, controls_height, false);
+        if let Some(mut inspector) = layout.inspector {
+            inspector.min.x += 18.0;
+            editor_layout::region(ui, "clip_side", inspector, |ui| self.clip_inspector(ui, c, &clip));
+        }
+        editor_layout::region(ui, "clip_transport", layout.transport, |ui| {
+            editor_layout::controls(ui, "clip_transport_scroll", |ui| {
+                let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
+                c.player.transport(ui, &label, &c.cfg.player);
+            });
         });
-        let lane_budget = ui.available_height() - 155.0;
-        egui::Panel::bottom("clip_controls").resizable(false).frame(egui::Frame::NONE).show(ui, |ui| {
-            ui.add_space(4.0);
-            let lanes_on = c.player.show_mixer;
-            self.timeline_controls(ui, c, duration, lanes_on);
-            if lanes_on {
-                self.clip_lanes(ui, c, &clip, lane_budget);
-            }
+        editor_layout::region(ui, "clip_controls", layout.timeline, |ui| {
+            editor_layout::controls(ui, "clip_controls_scroll", |ui| {
+                ui.add_space(4.0);
+                let lanes_on = c.player.show_mixer;
+                self.timeline_controls(ui, c, duration, lanes_on);
+                if lanes_on {
+                    self.clip_lanes(ui, c, &clip, layout.timeline.height() - 40.0);
+                }
+            });
         });
-        let avail = ui.available_size();
-        let vh = (avail.x * 9.0 / 16.0).min(avail.y).max(0.0);
-        c.player.video(ui, Vec2::new(avail.x, vh));
+        editor_layout::region(ui, "clip_video", layout.video, |ui| {
+            let available = layout.video.size();
+            c.player.video(ui, Vec2::new(available.x, (available.x * 9.0 / 16.0).min(available.y)));
+        });
         self.persist_audio(c, &clip);
     }
 
     fn clip_inspector(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
-        self.trim_controls(ui, c, clip);
-        egui::ScrollArea::vertical().id_salt("clip_side_scroll").auto_shrink(false).show(ui, |ui| self.side_ui(ui, c, clip));
+        egui::ScrollArea::vertical().id_salt(("clip_side_scroll", clip.id)).auto_shrink(false).show(ui, |ui| {
+            self.trim_controls(ui, c, clip);
+            self.side_ui(ui, c, clip);
+        });
     }
 
     fn media_duration(&self, c: &Ctx, clip: &Clip) -> f64 {
@@ -882,13 +920,19 @@ impl ClipsView {
 
     fn fullscreen_player(&mut self, ui: &mut Ui, c: &mut Ctx) {
         let st = c.player.state();
-        egui::Panel::bottom("clip_fs_controls").resizable(false).frame(egui::Frame::NONE.fill(theme::BG).inner_margin(Margin::symmetric(16, 8))).show(ui, |ui| {
-            seek_bar(ui, &mut c.player, &mut self.detail.in_pt, &mut self.detail.out_pt, c.accent);
-            let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
-            c.player.transport(ui, &label, &c.cfg.player);
+        let layout = EditorLayout::new(ui, None, 38.0, false);
+        editor_layout::region(ui, "clip_fs_transport", layout.transport, |ui| {
+            editor_layout::controls(ui, "clip_fs_transport_scroll", |ui| {
+                let label = format!("{} / {}", format_duration_precise(st.time_pos), format_duration(st.duration));
+                c.player.transport(ui, &label, &c.cfg.player);
+            });
         });
-        let avail = ui.available_size();
-        c.player.video(ui, avail);
+        editor_layout::region(ui, "clip_fs_seek", layout.timeline, |ui| {
+            seek_bar(ui, &mut c.player, &mut self.detail.in_pt, &mut self.detail.out_pt, c.accent);
+        });
+        editor_layout::region(ui, "clip_fs_video", layout.video, |ui| {
+            c.player.video(ui, layout.video.size());
+        });
     }
 
     fn trim_controls(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
@@ -909,7 +953,8 @@ impl ClipsView {
                     self.stop_preview(c);
                     c.report_mark(self.mark_out(pos, duration));
                 }
-                if theme::icon_button(ui, icon::CLOSE, 12.0, "Clear").clicked() {
+                let can_clear = self.detail.in_pt.is_some() || self.detail.out_pt.is_some();
+                if ui.add_enabled(can_clear, egui::Button::new("Clear selection")).clicked() {
                     self.stop_preview(c);
                     self.detail.in_pt = None;
                     self.detail.out_pt = None;
@@ -979,7 +1024,10 @@ impl ClipsView {
         // Export / share.
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(theme::title("Export to share"));
+            let heading = ui.label(theme::title("Export to share"));
+            if std::mem::take(&mut self.detail.qa_scroll_to_export) {
+                heading.scroll_to_me_animation(Some(egui::Align::TOP), egui::style::ScrollAnimation::none());
+            }
             ui.label(theme::small("Exports use your current audio mix and the trim selection, if any."));
             ui.add_space(4.0);
             let range = self.selection(self.media_duration(c, clip));
@@ -1008,7 +1056,7 @@ impl ClipsView {
                     export(None);
                 }
             });
-            show_jobs(ui,c,true);
+            show_jobs(ui, c, Some(clip.id));
         });
         ui.add_space(12.0);
 
@@ -1021,7 +1069,7 @@ impl ClipsView {
             ui.horizontal(|ui| {
                 ui.label(theme::label_dim("Game"));
                 let current = clip.game_name.clone().unwrap_or_else(|| "Unknown".into());
-                egui::ComboBox::from_id_salt("clip_game").selected_text(current).width(220.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("clip_game").selected_text(truncate(&current, 22)).width((ui.available_width() - 10.0).clamp(60.0, 185.0)).show_ui(ui, |ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.detail.game_search).hint_text("Search games"));
                     let query = self.detail.game_search.trim().to_lowercase();
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
@@ -1175,15 +1223,19 @@ fn filter_row(ui: &mut Ui, selected: bool, glyph: &str, label: &str, count: Opti
 }
 
 pub fn jobs_list(ui: &mut Ui, c: &mut Ctx) {
-    show_jobs(ui,c,false);
+    show_jobs(ui, c, None);
 }
 
-fn show_jobs(ui:&mut Ui,c:&mut Ctx,exports_only:bool){
+fn show_job_for_clip(job: &JobInfo, clip_id: Option<i64>) -> bool {
+    clip_id.is_none_or(|id| job.kind == "export" && job.source_clip_id == Some(id))
+}
+
+fn show_jobs(ui: &mut Ui, c: &mut Ctx, clip_id: Option<i64>) {
     let jobs: Vec<_> = {
         let s = c.service.shared.lock();
         let mut v: Vec<_> = s.jobs.values().cloned().collect();
         v.sort_by_key(|j| std::cmp::Reverse(j.id));
-        v.into_iter().filter(|j|!exports_only || j.kind=="export").take(4).collect()
+        v.into_iter().filter(|job| show_job_for_clip(job, clip_id)).take(4).collect()
     };
     for j in jobs {
         ui.add_space(4.0);
@@ -1294,6 +1346,27 @@ pub fn set_repaint_ctx(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_export_results_require_an_explicit_matching_source() {
+        let exported = JobInfo {
+            kind: "export".into(),
+            state: "done".into(),
+            source_clip_id: Some(11),
+            ..Default::default()
+        };
+        assert!(show_job_for_clip(&exported, Some(11)));
+        assert!(!show_job_for_clip(&exported, Some(12)));
+        assert!(show_job_for_clip(&exported, None));
+
+        let legacy_or_recording_export = JobInfo { source_clip_id: None, ..exported.clone() };
+        assert!(!show_job_for_clip(&legacy_or_recording_export, Some(11)));
+        assert!(show_job_for_clip(&legacy_or_recording_export, None));
+
+        let saved = JobInfo { kind: "clip".into(), clip_id: Some(11), ..Default::default() };
+        assert!(!show_job_for_clip(&saved, Some(11)));
+        assert!(show_job_for_clip(&saved, None));
+    }
 
     #[test]
     fn reversed_marks_preserve_the_prior_selection() {
