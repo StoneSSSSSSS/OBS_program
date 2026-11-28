@@ -36,6 +36,7 @@ pub struct TrackInfo {
     pub edit: Option<(i64, u64)>,
     /// Total edit-list duration, including explicit empty edits, in movie ticks.
     movie_edit_duration: Option<u64>,
+    editor_scrub_layout: bool,
     /// Media duration in ticks from the header (0 for fragmented files).
     pub header_duration: u64,
 }
@@ -133,6 +134,7 @@ pub struct Mp4Reader {
     file: File,
     pub tracks: Vec<TrackInfo>,
     movie_timescale: u32,
+    movie_identity_matrix: bool,
     trex: HashMap<u32, Trex>,
     /// Regular files: every sample of every track.
     flat: Vec<Vec<Sample>>,
@@ -261,6 +263,7 @@ impl Mp4Reader {
             file,
             tracks: Vec::new(),
             movie_timescale: 1000,
+            movie_identity_matrix: false,
             trex: HashMap::new(),
             flat: Vec::new(),
             frags: Vec::new(),
@@ -419,6 +422,7 @@ impl Mp4Reader {
                 r.skip(8)?;
             }
             self.movie_timescale = r.u32()?.max(1);
+            self.movie_identity_matrix = identity_matrix(mvhd, if v == 1 { 48 } else { 36 });
         }
         if let Some(mvex) = child(moov, b"mvex") {
             for (t, body) in children(mvex) {
@@ -463,6 +467,7 @@ impl Mp4Reader {
             r.skip(8)?;
         }
         let id = r.u32()?;
+        let matrix_at = if v == 1 { 52 } else { 40 };
         let mdia = child(trak, b"mdia").context("mdia")?;
         let mdhd = child(mdia, b"mdhd").context("mdhd")?;
         let mut r = Rd::new(mdhd);
@@ -493,6 +498,13 @@ impl Mp4Reader {
         let stbl = child(minf, b"stbl").context("stbl")?;
         let stsd = child(stbl, b"stsd").context("stsd")?;
         let (codec, width, height) = parse_stsd(stsd)?;
+        let editor_scrub_layout = kind == TrackKind::Video
+            && !children(trak).iter().any(|(kind, _)| matches!(kind, b"edts" | b"tapt" | b"clip"))
+            && identity_matrix(tkhd, matrix_at)
+            && tkhd.get(matrix_at + 36..matrix_at + 44).is_some_and(|display| {
+                display[..4] == (width << 16).to_be_bytes() && display[4..] == (height << 16).to_be_bytes()
+            })
+            && simple_editor_sample_entry(stsd, width, height);
         let (edit, movie_edit_duration) = child(trak, b"edts").and_then(|e| child(e, b"elst"))
             .map(|list| track_edits(list, self.movie_timescale, timescale))
             .transpose()?.unwrap_or_default();
@@ -510,6 +522,7 @@ impl Mp4Reader {
                 edit,
                 header_duration: duration,
                 movie_edit_duration,
+                editor_scrub_layout,
             },
             samples,
         ))
@@ -691,6 +704,20 @@ impl Mp4Reader {
         (duration > 0).then_some((duration, track.timescale))
     }
 
+    /// A flat single-track AVC picture with no display or movie edit overrides.
+    /// Leaves ordinary recorder/player metadata and their choices untouched.
+    pub(crate) fn editor_scrub_track(&self) -> Option<(&TrackInfo, &[Sample])> {
+        if self.is_fragmented() || !self.movie_identity_matrix {
+            return None;
+        }
+        let mut pictures = self.tracks.iter().enumerate().filter(|(_, track)| track.kind == TrackKind::Video);
+        let (index, track) = pictures.next()?;
+        if pictures.next().is_some() || !track.editor_scrub_layout || !track.enabled {
+            return None;
+        }
+        Some((track, self.flat.get(index)?))
+    }
+
     /// Audio tracks we can decode, in file order.
     pub fn audio(&self) -> Vec<usize> {
         (0..self.tracks.len()).filter(|i| self.tracks[*i].kind == TrackKind::Audio && self.tracks[*i].codec.is_audio()).collect()
@@ -847,6 +874,37 @@ impl Mp4Reader {
         }
         out
     }
+}
+
+fn identity_matrix(bytes: &[u8], offset: usize) -> bool {
+    bytes.get(offset..offset + 36).is_some_and(|matrix| {
+        matrix.chunks_exact(4).zip(super::UNITY_MATRIX)
+            .all(|(bytes, value)| bytes == value.to_be_bytes())
+    })
+}
+
+fn simple_editor_sample_entry(stsd: &[u8], width: u32, height: u32) -> bool {
+    let Some(entries) = stsd.get(8..) else { return false; };
+    if stsd[4..8] != 1u32.to_be_bytes() {
+        return false;
+    }
+    let entries = children(entries);
+    let [(kind, sample)] = entries.as_slice() else { return false; };
+    if kind != b"avc1" || width == 0 || height == 0 || width >= 65_536 || height >= 65_536 {
+        return false;
+    }
+    let Some(extensions) = sample.get(78..) else { return false; };
+    let boxes = children(extensions);
+    let mut color = false;
+    for (kind, payload) in boxes {
+        match &kind {
+            b"colr" if !color && payload == b"nclx\x00\x01\x00\x01\x00\x01\x00" => color = true,
+            b"pasp" if payload == [0, 0, 0, 1, 0, 0, 0, 1] => {},
+            b"avcC" | b"btrt" => {},
+            _ => return false,
+        }
+    }
+    color
 }
 
 fn parse_stsd(stsd: &[u8]) -> Result<(Codec, u32, u32)> {

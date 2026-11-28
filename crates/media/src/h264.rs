@@ -214,18 +214,132 @@ fn unescape(nal: &[u8]) -> Vec<u8> {
 /// Coded picture size (after cropping) from an SPS NAL unit.
 pub fn sps_dimensions(sps: &[u8]) -> Option<(u32, u32)> {
     let raw = unescape(sps);
-    let mut b = Bits { d: &raw, pos: 8 };
+    let mut bits = Bits { d: &raw, pos: 8 };
+    let picture = sps_picture(&mut bits)?;
+    Some((picture.width, picture.height))
+}
+
+struct SpsPicture {
+    width: u32,
+    height: u32,
+    simple_layout: bool,
+}
+
+// The editor only bypasses WinRT for progressive 8-bit 4:2:0 material
+// whose bitstream agrees with a square-pixel BT.709 limited MP4 entry.
+pub(crate) fn editor_preview_dimensions(sps: &[u8]) -> Option<(u32, u32)> {
+    let raw = unescape(sps);
+    if !matches!(raw.get(1), Some(66 | 77 | 88 | 100)) {
+        return None;
+    }
+    let mut bits = Bits { d: &raw, pos: 8 };
+    let picture = sps_picture(&mut bits)?;
+    (picture.simple_layout && compatible_preview_vui(&mut bits)?)
+        .then_some((picture.width, picture.height))
+}
+
+/// Whether a supported access unit is a true IDR. Unfamiliar in-band
+/// parameter sets or SEI may change presentation outside the MP4 metadata.
+pub(crate) fn editor_preview_packet(sample: &[u8], length: usize, sps: &[u8], pps: &[u8]) -> Option<bool> {
+    if !(1..=4).contains(&length) || sample.is_empty() {
+        return None;
+    }
+    let mut bytes = sample;
+    let mut idr = false;
+    while !bytes.is_empty() {
+        let size = bytes.get(..length)?.iter().fold(0usize, |n, byte| (n << 8) | usize::from(*byte));
+        bytes = bytes.get(length..)?;
+        let nal = bytes.get(..size)?;
+        if nal.is_empty() {
+            return None;
+        }
+        match nal_type(nal) {
+            1 | 9 | 12 => {},
+            5 => idr = true,
+            7 if nal == sps => {},
+            8 if nal == pps => {},
+            6 if unregistered_user_data(nal) => {},
+            _ => return None,
+        }
+        bytes = bytes.get(size..)?;
+    }
+    Some(idr)
+}
+
+fn unregistered_user_data(nal: &[u8]) -> bool {
+    let unescaped = unescape(nal);
+    let mut data = &unescaped[1..];
+    while let Some((&kind, rest)) = data.split_first() {
+        if kind == 0x80 {
+            return rest.iter().all(|byte| *byte == 0);
+        }
+        if kind != 5 {
+            return false;
+        }
+        data = rest;
+        let mut size = 0usize;
+        loop {
+            let Some((&part, rest)) = data.split_first() else { return false; };
+            data = rest;
+            size += usize::from(part);
+            if part != 255 {
+                break;
+            }
+        }
+        let Some(rest) = data.get(size..) else { return false; };
+        data = rest;
+    }
+    false
+}
+
+fn compatible_preview_vui(bits: &mut Bits<'_>) -> Option<bool> {
+    if bits.bit()? == 0 {
+        return Some(true);
+    }
+    if bits.bit()? != 0 {
+        match bits.bits(8)? {
+            1 => {}
+            255 => {
+                let width = bits.bits(16)?;
+                if width == 0 || width != bits.bits(16)? {
+                    return Some(false);
+                }
+            }
+            _ => return Some(false),
+        }
+    }
+    if bits.bit()? != 0 && bits.bit()? != 0 {
+        return Some(false);
+    }
+    if bits.bit()? != 0 {
+        bits.bits(3)?; // video format
+        if bits.bit()? != 0 {
+            return Some(false);
+        }
+        if bits.bit()? != 0 && bits.bits(24)? != 0x01_01_01 {
+            return Some(false);
+        }
+    }
+    if bits.bit()? != 0 && (bits.ue()? != 0 || bits.ue()? != 0) {
+        return Some(false);
+    }
+    Some(true)
+}
+
+fn sps_picture(b: &mut Bits<'_>) -> Option<SpsPicture> {
     let profile = b.bits(8)?;
     b.bits(16)?; // constraints + level
     b.ue()?; // sps id
     let mut chroma = 1;
+    let mut eight_bits = true;
     if [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].contains(&profile) {
         chroma = b.ue()?;
         if chroma == 3 {
             b.bit()?;
         }
-        b.ue()?;
-        b.ue()?;
+        let luma_depth = b.ue()?;
+        let chroma_depth = b.ue()?;
+        eight_bits = luma_depth == 0 && chroma_depth == 0;
         b.bit()?;
         if b.bit()? == 1 {
             let lists = if chroma == 3 { 12 } else { 8 };
@@ -258,27 +372,29 @@ pub fn sps_dimensions(sps: &[u8]) -> Option<(u32, u32)> {
     }
     b.ue()?; // max refs
     b.bit()?;
-    let w_mbs = b.ue()? + 1;
-    let h_units = b.ue()? + 1;
+    let w_mbs = b.ue()?.checked_add(1)?;
+    let h_units = b.ue()?.checked_add(1)?;
     let frame_mbs_only = b.bit()?;
     if frame_mbs_only == 0 {
         b.bit()?;
     }
     b.bit()?;
-    let mut w = w_mbs * 16;
-    let mut h = h_units * 16 * (2 - frame_mbs_only);
+    let mut w = w_mbs.checked_mul(16)?;
+    let mut h = h_units.checked_mul(16)?.checked_mul(2 - frame_mbs_only)?;
+    let mut origin_zero = true;
     if b.bit()? == 1 {
         let (l, r, t, bo) = (b.ue()?, b.ue()?, b.ue()?, b.ue()?);
+        origin_zero = l == 0 && t == 0;
         let (cx, cy) = match chroma {
             0 => (1, 2 - frame_mbs_only),
             1 => (2, 2 * (2 - frame_mbs_only)),
             2 => (2, 2 - frame_mbs_only),
             _ => (1, 2 - frame_mbs_only),
         };
-        w = w.saturating_sub((l + r) * cx);
-        h = h.saturating_sub((t + bo) * cy);
+        w = w.saturating_sub(l.checked_add(r)?.checked_mul(cx)?);
+        h = h.saturating_sub(t.checked_add(bo)?.checked_mul(cy)?);
     }
-    Some((w, h))
+    Some(SpsPicture { width: w, height: h, simple_layout: frame_mbs_only == 1 && chroma == 1 && eight_bits && origin_zero })
 }
 
 #[cfg(test)]

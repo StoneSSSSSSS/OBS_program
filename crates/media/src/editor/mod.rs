@@ -4,6 +4,7 @@ mod cadence;
 mod captions;
 mod fades;
 mod reframe;
+mod scrub;
 #[cfg(test)]
 mod presentation_tests;
 mod stills;
@@ -500,6 +501,18 @@ pub fn thumbnail(project: &Project, at: u64, width: u32, height: u32) -> Result<
     let frame_length = TICKS_PER_SECOND.div_ceil(u64::from(project.canvas.fps));
     let at = at.min(project.duration().saturating_sub(frame_length));
     if at >= project.visual_duration() { return black_frame(project, at, width, height); }
+    match scrub::picture(project, at, width, height) {
+        Ok(Some(mut frame)) => {
+            captions::draw_at(&mut frame, project, at)?;
+            return Ok(frame);
+        }
+        Ok(None) => (),
+        Err(error) => tracing::debug!(%error, "Fall back to the Windows editor preview"),
+    }
+    thumbnail_winrt(project, at, width, height)
+}
+
+fn thumbnail_winrt(project: &Project, at: u64, width: u32, height: u32) -> Result<RgbaImage> {
     let _apartment = Apartment::enter()?;
     let scratch = cv_core::paths::data_dir().join("editor-preview");
     fs::create_dir_all(&scratch)?;
