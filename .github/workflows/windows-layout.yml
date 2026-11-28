@@ -1,0 +1,45 @@
+name: Windows layout
+
+on:
+  push:
+    branches: [rust-rewrite]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-layout.yml'
+  pull_request:
+    branches: [rust-rewrite]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-layout.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-layout-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  layout:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: rustup update stable --no-self-update
+      - name: Test editor geometry, responsive pages and pointer input
+        shell: pwsh
+        run: |
+          $env:CLIPVAULT_DATA_DIR = Join-Path $env:RUNNER_TEMP 'clipvault-layout'
+          foreach ($filter in 'views::', 'app::resize_check::', 'lanes::') {
+            cargo +stable test --locked -p clipvault-gui --bin clipvault $filter -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
