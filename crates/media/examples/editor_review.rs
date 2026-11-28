@@ -1,8 +1,9 @@
 //! Operator-only tools for disposable Editor review runs. Pass one JSON request on stdin.
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use cv_core::editor::{AssetKind, Canvas, Project, Span, TICKS_PER_SECOND};
-use cv_media::mf::h264dec::{nv12_to_rgb, DecodedFrame, VideoDecoder};
-use cv_media::mp4::{reader::Mp4Reader, Codec};
+use cv_media::mf::h264dec::nv12_to_rgb;
+use cv_media::thumb::frame_at_time;
+use cv_media::mp4::reader::Mp4Reader;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -211,7 +212,15 @@ fn inspect(run: &Path, output: &Path, frame_at: &[f64], audio_ranges: &[[f64; 2]
             ensure!(!pcm.is_empty(), "Audio sample window is too short");
             let sum = pcm.iter().map(|sample| f64::from(*sample).powi(2)).sum::<f64>();
             let peak = pcm.iter().map(|sample| sample.abs()).fold(0.0, f32::max);
+            let channel = |side: usize| {
+                let samples = pcm.iter().skip(side).step_by(2);
+                let power: f64 = samples.clone().map(|v| f64::from(*v).powi(2)).sum();
+                let peak = samples.map(|v| v.abs()).fold(0.0, f32::max);
+                json!({ "rms": (power / (pcm.len() / 2) as f64).sqrt(), "peak": peak })
+            };
+            let difference = pcm.chunks_exact(2).map(|lr| f64::from(lr[0] - lr[1]).powi(2)).sum::<f64>();
             levels.push(json!({
+                "left": channel(0), "right": channel(1), "stereo_difference_rms": (difference / (pcm.len() / 2) as f64).sqrt(),
                 "track": index + 1, "start_seconds": start, "end_seconds": end,
                 "rms": (sum / pcm.len() as f64).sqrt(), "peak": peak,
             }));
@@ -241,34 +250,4 @@ fn inspect(run: &Path, output: &Path, frame_at: &[f64], audio_ranges: &[[f64; 2]
         "video_codec": display.video_codec,
         "tracks": tracks, "frames": frames, "audio": levels,
     }))
-}
-
-fn frame_at_time(reader: &Mp4Reader, video: usize, at: f64) -> Result<(DecodedFrame, f64)> {
-    let track = &reader.tracks[video];
-    let Codec::H264 { avcc } = &track.codec else { bail!("Frame inspection requires H.264") };
-    let scale = i64::from(track.timescale);
-    ensure!(scale > 0, "Video track has no timebase");
-    let edit = track.edit.map(|(start, _)| start.max(0)).unwrap_or(0);
-    let media_at = ((at * scale as f64).floor() as i64).saturating_add(edit);
-    let from = media_at.saturating_sub(scale * 3).max(0) as u64;
-    let to = media_at.saturating_add(scale * 3) as u64;
-    let candidates = reader.samples(video, from, to)?;
-    let selected = candidates.iter().filter(|sample| sample.pts() <= media_at)
-        .max_by_key(|sample| sample.pts()).context("No video sample at this time")?;
-    let seek = reader.sync_at_or_before(video, selected.dts)?.context("No sync sample before this frame")?;
-    let samples = reader.samples(video, seek.dts, selected.dts.saturating_add(scale as u64 * 2))?;
-    let hns = |pts: i64| (i128::from(pts) * i128::from(SEC) / i128::from(scale)) as i64;
-    let target = hns(selected.pts());
-    let mut decoder = VideoDecoder::new(avcc, None, false)?;
-    let presented = (selected.pts() - edit).max(0) as f64 / scale as f64;
-    for sample in samples {
-        for frame in decoder.decode(&reader.read(&sample)?, hns(sample.pts()))? {
-            if frame.pts_hns == target {
-                return Ok((frame, presented));
-            }
-        }
-    }
-    let frame = decoder.drain()?.into_iter().find(|frame| frame.pts_hns == target)
-        .context("Decoder did not return the selected presentation sample")?;
-    Ok((frame, presented))
 }

@@ -3,7 +3,7 @@
 use crate::mf::h264dec::{nv12_to_rgb, DecodedFrame, VideoDecoder};
 use crate::mp4::reader::Mp4Reader;
 use crate::mp4::Codec;
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::path::Path;
 
 /// Decode the keyframe at or before `at_s` (presentation seconds).
@@ -20,6 +20,38 @@ pub fn keyframe_at(r: &Mp4Reader, at_s: f64) -> Result<DecodedFrame> {
         frames = dec.drain()?;
     }
     frames.into_iter().next().context("the decoder returned no picture")
+}
+
+/// Decode the picture whose presentation sample covers `at`, including reordered H.264 frames.
+pub fn frame_at_time(reader: &Mp4Reader, video: usize, at: f64) -> Result<(DecodedFrame, f64)> {
+    ensure!(at.is_finite() && at >= 0.0, "Choose a nonnegative presentation time");
+    let track = reader.tracks.get(video).context("Unknown video track")?;
+    let Codec::H264 { avcc } = &track.codec else { bail!("Frame inspection requires H.264") };
+    let scale = i64::from(track.timescale);
+    ensure!(scale > 0, "Video track has no timebase");
+    let edit = track.edit.map(|(start, _)| start.max(0)).unwrap_or(0);
+    let media_at = ((at * scale as f64).floor() as i64).saturating_add(edit);
+    let from = media_at.saturating_sub(scale * 3).max(0) as u64;
+    let to = media_at.saturating_add(scale * 3) as u64;
+    let candidates = reader.samples(video, from, to)?;
+    let selected = candidates.iter().filter(|sample| sample.pts() <= media_at)
+        .max_by_key(|sample| sample.pts()).context("No video sample at this time")?;
+    let seek = reader.sync_at_or_before(video, selected.dts)?.context("No sync sample before this frame")?;
+    let samples = reader.samples(video, seek.dts, selected.dts.saturating_add(scale as u64 * 2))?;
+    let hns = |pts: i64| (i128::from(pts) * i128::from(cv_core::editor::TICKS_PER_SECOND) / i128::from(scale)) as i64;
+    let target = hns(selected.pts());
+    let mut decoder = VideoDecoder::new(avcc, None, false)?;
+    let presented = (selected.pts() - edit).max(0) as f64 / scale as f64;
+    for sample in samples {
+        for frame in decoder.decode(&reader.read(&sample)?, hns(sample.pts()))? {
+            if frame.pts_hns == target {
+                return Ok((frame, presented));
+            }
+        }
+    }
+    let frame = decoder.drain()?.into_iter().find(|frame| frame.pts_hns == target)
+        .context("Decoder did not return the selected presentation sample")?;
+    Ok((frame, presented))
 }
 
 /// Decode a downscaled picture at `at_s` without writing a file.
