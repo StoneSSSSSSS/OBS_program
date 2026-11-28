@@ -905,17 +905,31 @@ impl RecordingsView {
             let steps = [MIN, 2 * MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN, HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR];
             let step = *steps.iter().find(|s| **s as f64 * px_per_ms >= 90.0).unwrap_or(&(24 * HOUR));
             let tz = Local.timestamp_millis_opt(start).single().map(|d| d.offset().local_minus_utc() as i64 * 1000).unwrap_or(0);
-            let mut t = ((start + tz) / step) * step - tz;
-            while t <= self.view_end {
-                let x = x_of(t);
-                if x >= rect.left() {
-                    let dt = Local.timestamp_millis_opt(t).single().unwrap_or_default();
-                    let midnight = dt.format("%H:%M").to_string() == "00:00";
-                    let label = if midnight || step >= 24 * HOUR { dt.format("%a %d").to_string() } else { dt.format("%H:%M").to_string() };
-                    p.line_segment([Pos2::new(x, ruler.bottom() - 4.0), Pos2::new(x, act_band.bottom())], Stroke::new(1.0, if midnight { theme::BORDER_STRONG } else { Color32::from_white_alpha(10) }));
-                    p.text(Pos2::new(x + 4.0, ruler.top() + 3.0), Align2::LEFT_TOP, label, FontId::proportional(11.0), if midnight { theme::TEXT_DIM } else { theme::TEXT_FAINT });
+            let mut t = (self.view_end + tz).div_euclid(step) * step - tz;
+            let label_area = ruler.shrink2(Vec2::new(1.0, 0.0));
+            let mut label_band = label_area;
+            // Reserve the rightmost tick first. Grid lines remain even when labels cannot fit.
+            while t >= start {
+                let x = x_of(t).clamp(rect.left(), rect.right());
+                let dt = Local.timestamp_millis_opt(t).single().unwrap_or_default();
+                let time = dt.format("%H:%M").to_string();
+                let midnight = time == "00:00";
+                let label = if midnight || step >= 24 * HOUR { dt.format("%a %d").to_string() } else { time };
+                p.line_segment([Pos2::new(x, ruler.bottom() - 4.0), Pos2::new(x, act_band.bottom())], Stroke::new(1.0, if midnight { theme::BORDER_STRONG } else { Color32::from_white_alpha(10) }));
+                if let Some(label) = paint_timeline_label(
+                    &p, label_band, x, label, FontId::proportional(11.0),
+                    if midnight { theme::TEXT_DIM } else { theme::TEXT_FAINT }, false,
+                ) {
+                    label_band.max.x = label.left() - 3.0;
                 }
-                t += step;
+                t -= step;
+            }
+            if label_band == label_area {
+                let time = Local.timestamp_millis_opt(start).single().unwrap_or_default();
+                paint_timeline_label(
+                    &p, label_band, rect.left(), time.format("%H:%M:%S").to_string(),
+                    FontId::proportional(11.0), theme::TEXT_DIM, false,
+                );
             }
 
             // Recording segments.
@@ -968,19 +982,26 @@ impl RecordingsView {
                 p.rect_filled(sr, CornerRadius::same(3), c.accent.gamma_multiply(0.16));
                 p.rect_stroke(sr, CornerRadius::same(3), Stroke::new(1.5, c.accent), egui::StrokeKind::Inside);
             }
-            for (pt, label) in [(self.in_ms, "START"), (self.out_ms, "END")] {
+            let mut trim_labels = Rect::from_x_y_ranges(rect.x_range(), act_band.bottom()..=row.bottom())
+                .shrink2(Vec2::new(1.0, 0.0));
+            for (pt, label, id, prefer_left) in [
+                (self.in_ms, "START", "trim_start", true),
+                (self.out_ms, "END", "trim_end", false),
+            ] {
                 if let Some(t) = pt {
                     let x = x_of(t);
                     p.line_segment([Pos2::new(x, seg_band.top() - 4.0), Pos2::new(x, act_band.bottom() + 4.0)], Stroke::new(2.0, c.accent));
                     let grip = Pos2::new(x, act_band.bottom() + 4.0);
                     p.circle_filled(grip, 5.0, c.accent);
                     if rect.x_range().contains(x) {
-                        let id = if label == "START" { "trim_start" } else { "trim_end" };
                         editor_layout::remember_interaction_rect(ui, id, Rect::from_center_size(grip, Vec2::splat(10.0)));
+                        if let Some(label) = paint_timeline_label(
+                            &p, trim_labels, x, label.to_owned(),
+                            FontId::new(10.0, theme::semibold()), c.accent, prefer_left,
+                        ) {
+                            trim_labels.min.x = label.right() + 3.0;
+                        }
                     }
-                    let align = if label == "START" { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM };
-                    let offset = if label == "START" { -4.0 } else { 4.0 };
-                    p.text(Pos2::new(x + offset, row.bottom() - 2.0), align, label, FontId::new(10.0, theme::semibold()), c.accent);
                 }
             }
             // Markers.
@@ -1554,6 +1575,30 @@ impl RecordingsView {
     }
 }
 
+fn paint_timeline_label(
+    painter: &egui::Painter,
+    band: Rect,
+    anchor: f32,
+    label: String,
+    font: FontId,
+    color: Color32,
+    prefer_left: bool,
+) -> Option<Rect> {
+    const GAP: f32 = 5.0;
+
+    let galley = painter.layout_no_wrap(label, font, color);
+    let size = galley.size();
+    let y = band.center().y - size.y / 2.0;
+    let left = anchor - GAP - size.x;
+    let right = anchor + GAP;
+    let positions = if prefer_left { [left, right] } else { [right, left] };
+    let bounds = positions.into_iter()
+        .map(|x| Rect::from_min_size(Pos2::new(x, y), size))
+        .find(|bounds| band.contains_rect(*bounds))?;
+    painter.galley(bounds.min, galley, color);
+    Some(bounds)
+}
+
 fn recording_file_row(
     ui: &mut Ui,
     play_label: String,
@@ -1846,6 +1891,80 @@ mod tests {
                 pointer = Some(transport.right_top() + Vec2::new(-36.0, 28.0));
             }
             assert!(visible, "Export and Marker cannot be fully revealed at {width}×{height}");
+        }
+    }
+
+    #[test]
+    fn regular_timeline_keeps_ticks_and_trim_labels_inside_the_axis() {
+        use egui::epaint::Shape;
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, theme::TEXT, 1.0);
+        let cfg = cv_core::config::Config::default();
+        let mut c = Ctx {
+            player: crate::player::Player::new(ctx.clone(), &cfg),
+            service: crate::service::Service::disconnected_for_test(),
+            thumbs: crate::thumbs::Thumbs::new(ctx.clone()),
+            waves: Default::default(),
+            db: None,
+            cfg,
+            accent: theme::TEXT,
+            toasts: Vec::new(),
+            goto: None,
+            open_recording_settings: false,
+        };
+        let edge = Local.with_ymd_and_hms(2026, 11, 28, 4, 40, 0).single().unwrap().timestamp_millis();
+        for (width, span, end, expected, trim) in [
+            (730.0, 10 * MIN, edge, "04:40", (0, 0)),
+            (440.0, 10 * MIN, edge + 17_000, "04:40", (0, 0)),
+            (161.0, MIN, edge - 15_000, "04:38:45", (0, 0)),
+            (170.0, 25 * 24 * HOUR, edge, "Sat 28", (-MIN, MIN)),
+        ] {
+            let mut view = RecordingsView {
+                view_span: span,
+                view_end: end,
+                in_ms: Some(end - span + trim.0),
+                out_ms: Some(end + trim.1),
+                ..Default::default()
+            };
+            let timeline = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 96.0));
+            let axis = lanes::axis_rect(timeline);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor_layout::region(ui, "test_recording_timeline", timeline, |ui| {
+                    view.timeline(ui, &mut c, false);
+                });
+            });
+            output.textures_delta.clear();
+
+            let mut labels: Vec<(&str, Rect)> = Vec::new();
+            for painted in &output.shapes {
+                if let Shape::Text(text) = &painted.shape {
+                    let bounds = text.visual_bounding_rect();
+                    if painted.clip_rect.x_range() != axis.x_range() {
+                        continue;
+                    }
+                    assert!(axis.contains_rect(bounds), "Clipped {:?} at width {width}: {bounds:?}", text.galley.text());
+                    assert!(painted.clip_rect.contains_rect(bounds));
+                    assert!(labels.iter().all(|(_, other)| !bounds.intersects(*other)),
+                        "Overlapping {:?} at width {width}", text.galley.text());
+                    labels.push((text.galley.text(), bounds));
+                }
+            }
+            let label = |want| labels.iter().find(|(text, _)| *text == want).map(|(_, rect)| *rect);
+            let reference = label(expected).unwrap_or_else(|| panic!("Missing {expected} at width {width}"));
+            if trim == (0, 0) {
+                let start = label("START").expect("left-edge trim label");
+                let end = label("END").expect("right-edge trim label");
+                assert!(start.left() - axis.left() < 8.0);
+                assert!(axis.right() - end.right() < 8.0);
+            } else {
+                assert!(label("START").is_none() && label("END").is_none());
+            }
+            if width == 730.0 {
+                assert!(axis.right() - reference.right() < 8.0);
+                assert!(label("04:30").is_some());
+            }
         }
     }
 
