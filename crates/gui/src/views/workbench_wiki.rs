@@ -43,35 +43,36 @@ const GUIDES: &[Guide] = &[
         steps: &["Select your video in the Media Bin to see its source frame rate. Above Preview open the fps menu and choose Match selected source or 25 fps. One frame at 25 fps lasts 0.040 seconds.",
         "Select the shot, move to the first unwanted frame and choose Split. Use the frame controls to move forward exactly once.",
         "Split the following piece at the new position. Use the timeline item picker to select the tiny middle piece, then choose Remove.",
-        "Step through the join and check both neighboring frames. Undo restores the removed piece if you want to try again."] },
+        "Step through the join and check both neighboring frames. After exporting, check the first and last pictures and the movie duration. Removing one frame from a 100-frame, 25 fps source leaves 99 frames lasting 3.960 seconds."] },
     Guide { section: "Timeline", title: "Reorder shots and revise a cut", terms: "move shot to beginning end front first last earlier later reorder rearrange duplicate copy undo redo client revision version save as",
         intro: "Each timeline occurrence has its own trims and volume, even when two shots use the same source.",
         steps: &["Use Project → Save Project As… to start a named revision of an existing edit.",
-        "Select the ending shot and choose Move Earlier until it reaches the beginning. Move Later sends a shot toward the end. Duplicate inserts a second occurrence immediately after the selection.",
-        "Drag the duplicate’s right trim handle left to try a shorter version. For an exact trim enter Source Out in the Inspector and choose Apply Changes. Undo restores the previous end time.",
+        "Select the closing shot or title and choose Move Earlier until it reaches the front. Move Later sends a shot toward the end. Duplicate inserts a second occurrence immediately after the selection.",
+        "Drag the duplicate’s right trim handle left to try a shorter version. For an exact change, enter Duration for a title, color or still, or Source Out for a video. Choose Apply Changes. Undo restores the previous length.",
         "Save the revision and reopen it to check the order before exporting."] },
     Guide { section: "Timeline", title: "Navigate a long sequence", terms: "zoom pan scroll horizontal scrub fit overview navigate playhead long timeline seek",
         intro: "The playhead is a position in the assembled video. A source start refers to time inside an imported file.",
         steps: &["Choose Fit to see the entire sequence. Select the shot near the edit and zoom into the timeline.",
-        "Pan along the ruler to keep the current section in view. Clicking a time on the ruler moves the playhead there.",
-        "Use the frame controls to check a cut at close range. Fit returns to the full sequence."] },
-    Guide { section: "Sound", title: "Mix narration and music", terms: "voiceover voice over dialog dialogue gain quiet lower music soundtrack duck audio level volume tutorial",
+        "Choose Pan → Pan Left or Pan Right to move the visible time window. Click or drag on the ruler to seek within it.",
+        "Use the frame controls to check a cut. Fit returns to the full sequence. On a narrow screen choose Timeline. Use View for Fit, Zoom or Pan when space is tight. Drag the divider beneath the preview to change its height when available."] },
+    Guide { section: "Sound", title: "Mix narration and music", terms: "voiceover voice over dialog dialogue gain quiet lower music soundtrack duck ducking audio level volume tutorial",
         intro: "Give narration, music and effects their own timeline items so you can change timing and volume independently.",
         steps: &["Add the picture first. Import your voiceover and music, then add each to its corresponding audio lane.",
         "Set the narration's timeline start for a short lead-in. Source start trims the beginning of the sound itself.",
         "Select the music, lower Gain in the Inspector and choose Apply Changes. Select the video to adjust its original sound separately.",
-        "To lower music only under speech, split it at the start and end of the narration and adjust the middle piece. Preview the entrances and exits together."] },
+        "For ducking, split the music at the start and end of the narration and lower the middle piece. Sound splits use the exact playhead time. Picture splits use the nearest project frame."] },
     Guide { section: "Sound", title: "Place repeated sound effects", terms: "cue effects sfx beats audio snip repeat delayed delay timing offset silent credits half volume quiet quieter loud level gain percentage",
         intro: "Independent cues let one sound play at several points with a different level each time.",
         steps: &["Import the cue and select it in the Media Bin. Set the timeline Playhead field to the first entrance time. Select Effects and choose Add to Timeline, or drag the source onto the Effects lane.",
         "Duplicate the cue for each additional entrance. In the Inspector set Start on Timeline, then choose Apply Changes or press Enter.",
         "Set Gain to 50% for half volume on an individual occurrence. Apply Changes, then preview. Source Out trims the cue itself before the credits.",
         "Preview the last beat and the ending. Audio extending beyond the last picture can extend the export with a black background."] },
-    Guide { section: "Pictures", title: "Make a portrait or square montage", terms: "vertical portrait horizontal landscape aspect 9:16 16:9 square canvas resolution still photo montage social fit framing letterbox letterboxing black bars pillarbox border",
+    Guide { section: "Pictures", title: "Make a portrait or square montage", terms: "vertical portrait horizontal landscape aspect 9:16 16:9 square canvas resolution still photo montage social fit fill crop reframe zoom in focus subject left right top bottom framing letterbox letterboxing black bars pillarbox border",
         intro: "Choose the output shape first so you can check how landscape footage and portrait stills fit inside it.",
         steps: &["In Project Settings choose a portrait or square Canvas, then Apply Project Settings. The 1080 × 1920 portrait preset is full HD. Add pictures and videos in viewing order.",
-        "Select each still, set Duration in the Inspector, then choose Apply Changes. Pictures fit inside the canvas. Black bars keep a source with a different shape fully visible.",
-        "Add a title card and move it to the opening. Check text, framing and the final image in Preview.",
+        "Select each still, set Duration in the Inspector, then choose Apply Changes. Under Framing, Fit keeps the whole source visible and can leave black bars. Fill crops the picture to cover the canvas.",
+        "With Fill selected, adjust Horizontal Focus toward the left or right subject, or Vertical Focus toward the top or bottom. Choose Apply Changes and check Preview. Each shot keeps its own framing.",
+        "For an opener, choose + Title and select Beginning. Check text, framing and the final image in Preview.",
         "Export MP4… creates a file using the selected canvas and frame rate."] },
     Guide { section: "Pictures", title: "Rotate or mirror a picture", terms: "sideways rotate rotation upside down flip horizontal mirror orientation photo video",
         intro: "An orientation change applies to the selected occurrence of a video or still.",
@@ -83,20 +84,20 @@ const GUIDES: &[Guide] = &[
         steps: &["Select a sound occurrence or a video shot with audio. In the Inspector set Fade in or Fade out in seconds.",
         "Choose Apply Changes and play across the boundary. Set a fade back to zero to remove it.",
         "Splitting a sound during a fade preserves the level on both sides of the cut."] },
-    Guide { section: "Pictures", title: "Add timed captions or import subtitles", terms: "subtitle subtitles caption captions accessibility srt subrip transcript closed open burned burn text karaoke",
+    Guide { section: "Pictures", title: "Add timed captions or import subtitles", terms: "bilingual multilingual subtitle subtitles caption captions accessibility srt subrip transcript closed open burned burn text position bottom top background",
         intro: "Time a subtitle to speech, burn it into the shared MP4, or save a separate SubRip file.",
-        steps: &["Open Captions… and choose New at Playhead. Enter Caption text, set Start and End in seconds, then choose Add Caption.",
+        steps: &["Open Captions… and choose New at Playhead. Enter Caption text. Click a time, use Ctrl+A and type seconds or minutes:seconds, then press Enter. Choose Add Caption.",
         "Choose a cue from the list to jump to its start. Edit its text or times and choose Save Caption.",
-        "Use Import SRT… for existing subtitles. Export SRT… writes a separate subtitle file. Choose a fresh filename.",
-        "Close Captions and check the first and last captioned frames using Previous Frame and Next Frame. Export MP4… includes the captions in the picture."] },
+        "Use Import SRT… for existing subtitles. Caption position moves subtitles to the top or bottom of the picture so important detail stays visible. Export SRT… writes a separate subtitle file. Choose a fresh filename.",
+        "Start is the first included time and End is the first time without that cue. Check both sides with Previous Frame and Next Frame. Export MP4… includes the captions in the picture."] },
     Guide { section: "Timeline", title: "Keyboard shortcuts and a larger preview", terms: "keys keyboard hotkeys shortcuts shortcut play pause step nudge enlarge expand restore save undo",
         intro: "Use these shortcuts when editing in the Workbench.",
-        steps: &["Space plays or pauses. Comma steps back one frame and period steps forward. S splits the selected item and Delete removes it.",
+        steps: &["Click the playback clock to open Go to time. Type seconds or minutes:seconds and press Enter. Space plays or pauses. Comma steps back one frame and period steps forward. S splits the selected item and Delete removes it.",
         "Ctrl+Z undoes and Ctrl+Y redoes. Ctrl+I imports media. Ctrl+O opens a project, Ctrl+S saves, and Ctrl+Shift+S saves a new version.",
         "Choose Expand Preview above the picture for a larger monitor. Use the scrub bar beneath it to seek. Choose Restore Preview for the editing layout."] },
     Guide { section: "Pictures", title: "Add a title card or solid color", terms: "slate title text credit opening chapter intertitle black blank color matte",
         intro: "Title cards and color frames occupy time in the picture sequence.",
-        steps: &["Use + Title for an opening, chapter break or credit. Enter the text and choose the card duration.",
+        steps: &["Choose + Title, enter the text and duration, then choose Beginning for an opener or End for credits. Add to Timeline inserts the card in one step.",
         "Use + Color to add a plain frame. A short color frame can separate sections or give the soundtrack an intentional tail.",
         "Select the card to adjust its properties, then move it into position. Check it in the preview at the final canvas shape."] },
     Guide { section: "Files", title: "Save, reopen and move a project", terms: "save as open cvproj portable external file preserve share move handoff editable revision",
@@ -120,7 +121,7 @@ const GUIDES: &[Guide] = &[
         steps: &["In 24/7 Recordings, mark the play and save a selected clip. A range may cross adjacent recording files.",
         "Import the saved clip and a second camera angle into the Editor. Add the wide shot, then the replay.",
         "Trim each shot to the useful action. Step through the cut and adjust the replay's source start.",
-        "Balance the original sound on each shot, save the project, then export the highlight."] },
+        "Match the footage using the fps menu above Preview. Use Previous Frame and Next Frame, or comma and period, to check both sides of the cut. Balance each shot, save, then export."] },
 ];
 
 fn rank(guide: &Guide, query: &str) -> Option<usize> {
@@ -128,15 +129,19 @@ fn rank(guide: &Guide, query: &str) -> Option<usize> {
     let title = guide.title.to_lowercase();
     let body = format!("{} {} {} {}", guide.section, guide.intro, guide.terms, guide.steps.join(" ")).to_lowercase();
     let mut score = 0;
+    let mut terms = 0;
+    let mut matched = 0;
     let query = query.to_lowercase();
     for word in query.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
         if matches!(word, "a" | "an" | "the" | "how" | "do" | "does" | "i" | "my" | "it" | "to" | "can" | "t" | "what" | "where" | "is" | "with" | "for" | "of" | "and") { continue; }
-        if title.contains(word) { score += 5; }
-        else if guide.terms.contains(word) { score += 3; }
-        else if body.contains(word) { score += 1; }
-        else { return None; }
+        terms += 1;
+        let weight = if title.contains(word) { 5 } else if guide.terms.contains(word) { 3 }
+            else if body.contains(word) { 1 } else { 0 };
+        if weight > 0 { matched += 1; score += weight; }
     }
-    Some(score)
+    if terms == 0 { return Some(0); }
+    // A descriptive extra word should not hide a guide that matches the rest of a question.
+    (matched * 3 >= terms * 2).then_some(score + if terms == matched { 20 } else { 0 })
 }
 
 pub(crate) fn show(ui: &mut Ui, state: &mut Wiki) {
@@ -223,7 +228,7 @@ mod tests {
     fn search_finds_workflows_by_user_vocabulary() {
         for (query, expected) in [("missing file", "relink"), ("how do I nudge a frame", "one frame"),
             ("voiceover music", "narration"), ("portrait montage", "portrait"), ("cancel export", "Export"),
-            ("move shot to beginning", "Reorder"), ("save as revision", "revise"), ("effects cue", "effects"), ("half volume", "effects"), ("letterbox", "portrait")] {
+            ("move shot to beginning", "Reorder"), ("move title to front", "Reorder"), ("move closing chaptercard to front", "Reorder"), ("save as revision", "revise"), ("effects cue", "effects"), ("half volume", "effects"), ("letterbox", "portrait"), ("crop fill focus", "portrait")] {
             assert!(GUIDES.iter().any(|g| g.title.to_lowercase().contains(&expected.to_lowercase()) && rank(g, query).is_some()), "{query}");
         }
         assert!(GUIDES.iter().all(|g| rank(g, "unfindable0001").is_none()));

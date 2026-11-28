@@ -34,6 +34,8 @@ pub struct TrackInfo {
     /// Edit list: (media time where presentation starts, presented duration in
     /// track ticks, or 0 if unknown).
     pub edit: Option<(i64, u64)>,
+    /// Total edit-list duration, including explicit empty edits, in movie ticks.
+    movie_edit_duration: Option<u64>,
     /// Media duration in ticks from the header (0 for fragmented files).
     pub header_duration: u64,
 }
@@ -66,6 +68,45 @@ impl Sample {
     }
 }
 
+fn track_edits(edit_list: &[u8], movie_scale: u32, track_scale: u32) -> Result<(Option<(i64, u64)>, Option<u64>)> {
+    let mut reader = Rd::new(edit_list);
+    let (version, _) = reader.full()?;
+    let count = reader.u32()?;
+    let complete = count as usize <= reader.left() / if version == 1 { 20 } else { 12 };
+    let mut first = None;
+    let mut total = complete.then_some(0u64);
+    for _ in 0..count {
+        let (duration, media) = if version == 1 {
+            (reader.u64()?, reader.u64()? as i64)
+        } else {
+            (u64::from(reader.u32()?), i64::from(reader.u32()? as i32))
+        };
+        reader.u32()?; // edit rate
+        if media >= 0 {
+            if first.is_none() {
+                let track_duration = (u128::from(duration) * u128::from(track_scale) / u128::from(movie_scale)) as u64;
+                first = Some((media, track_duration));
+                // Older inputs may have a valid first edit and damaged
+                // trailing entries. Preserve the existing first-edit reading.
+                if !complete {
+                    break;
+                }
+            }
+            if duration == 0 {
+                total = None;
+            }
+        }
+        total = total.and_then(|t| t.checked_add(duration));
+    }
+    Ok((first, total.filter(|duration| *duration > 0)))
+}
+
+fn picture_sample_end(samples: &[Sample]) -> u64 {
+    samples.iter().filter(|sample| sample.size > 0 && sample.duration > 0)
+        .filter_map(|sample| sample.dts.checked_add_signed(i64::from(sample.cts) + i64::from(sample.duration)))
+        .max().unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Trex {
     duration: u32,
@@ -78,6 +119,7 @@ struct FragRef {
     start: u64,
     end: u64,
     frag: u32,
+    picture_end: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +201,7 @@ impl<'a> Rd<'a> {
 }
 
 /// Iterate child boxes of a payload: (type, body).
-fn children(b: &[u8]) -> Vec<([u8; 4], &[u8])> {
+pub(super) fn children(b: &[u8]) -> Vec<([u8; 4], &[u8])> {
     let mut out = Vec::new();
     let mut p = 0usize;
     while p + 8 <= b.len() {
@@ -451,25 +493,9 @@ impl Mp4Reader {
         let stbl = child(minf, b"stbl").context("stbl")?;
         let stsd = child(stbl, b"stsd").context("stsd")?;
         let (codec, width, height) = parse_stsd(stsd)?;
-        let mut edit = None;
-        if let Some(elst) = child(trak, b"edts").and_then(|e| child(e, b"elst")) {
-            let mut r = Rd::new(elst);
-            let (v, _) = r.full()?;
-            let n = r.u32()?;
-            let mut empty_movie = 0u64;
-            for _ in 0..n {
-                let (seg, media) = if v == 1 { (r.u64()?, r.u64()? as i64) } else { (r.u32()? as u64, r.u32()? as i32 as i64) };
-                r.u32()?;
-                if media < 0 {
-                    empty_movie += seg; // initial delay; we ignore it but keep scanning
-                    continue;
-                }
-                let dur = (seg as u128 * timescale as u128 / self.movie_timescale as u128) as u64;
-                edit = Some((media, dur));
-                break;
-            }
-            let _ = empty_movie;
-        }
+        let (edit, movie_edit_duration) = child(trak, b"edts").and_then(|e| child(e, b"elst"))
+            .map(|list| track_edits(list, self.movie_timescale, timescale))
+            .transpose()?.unwrap_or_default();
         let samples = parse_sample_tables(stbl, kind == TrackKind::Video).unwrap_or_default();
         Ok((
             TrackInfo {
@@ -483,6 +509,7 @@ impl Mp4Reader {
                 enabled: flags & 1 != 0,
                 edit,
                 header_duration: duration,
+                movie_edit_duration,
             },
             samples,
         ))
@@ -497,7 +524,8 @@ impl Mp4Reader {
         for (track_id, samples) in &parsed {
             let Some(ti) = self.tracks.iter().position(|t| t.id == *track_id) else { continue };
             let (Some(first), Some(last)) = (samples.first(), samples.last()) else { continue };
-            self.track_frags[ti].push(FragRef { start: first.dts, end: last.end(), frag: idx });
+            let picture_end = if self.tracks[ti].kind == TrackKind::Video { picture_sample_end(samples) } else { 0 };
+            self.track_frags[ti].push(FragRef { start: first.dts, end: last.end(), frag: idx, picture_end });
             any = true;
         }
         if any {
@@ -639,6 +667,28 @@ impl Mp4Reader {
     /// First video track.
     pub fn video(&self) -> Option<usize> {
         self.tracks.iter().position(|t| t.kind == TrackKind::Video && t.codec.is_video())
+    }
+
+    /// Presentation extent of an unambiguous picture track, with its own timebase.
+    /// Container-wide duration may include a longer audio track.
+    pub(crate) fn picture_duration(&self) -> Option<(u64, u32)> {
+        let mut pictures = self.tracks.iter().enumerate().filter(|(_, track)| track.kind == TrackKind::Video);
+        let (index, track) = pictures.next()?;
+        if pictures.next().is_some() {
+            return None;
+        }
+        if let Some(duration) = track.movie_edit_duration {
+            return Some((duration, self.movie_timescale));
+        }
+        if track.edit.is_some() {
+            // The edit list did not declare an extent. Let the native
+            // media source resolve the available range and any gaps.
+            return None;
+        }
+        let samples = picture_sample_end(&self.flat[index]);
+        let fragments = self.track_frags[index].iter().map(|frag| frag.picture_end).max().unwrap_or(0);
+        let duration = samples.max(fragments);
+        (duration > 0).then_some((duration, track.timescale))
     }
 
     /// Audio tracks we can decode, in file order.
@@ -1031,4 +1081,22 @@ fn parse_sample_tables(stbl: &[u8], video: bool) -> Result<Vec<Sample>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod picture_edit_tests {
+    use super::track_edits;
+
+    #[test]
+    fn picture_edit_extent_keeps_empty_leading_time() {
+        let mut entries = Vec::new();
+        entries.extend(0u32.to_be_bytes()); // version and flags
+        entries.extend(2u32.to_be_bytes());
+        for (duration, media) in [(100u32, -1i32), (137, 512)] {
+            entries.extend(duration.to_be_bytes());
+            entries.extend(media.to_be_bytes());
+            entries.extend(0x0001_0000u32.to_be_bytes());
+        }
+        assert_eq!(track_edits(&entries, 1000, 90_000).unwrap(), (Some((512, 12_330)), Some(237)));
+    }
 }

@@ -112,6 +112,21 @@ fn restores_the_reviewers_frame_grid_with_three_timed_cues() -> Result<()> {
     Ok(())
 }
 
+fn numbered_frames(reader: &Mp4Reader) -> Result<Vec<Option<u32>>> {
+    let index = reader.video().context("Missing numbered video")?;
+    let Codec::H264 { avcc } = &reader.tracks[index].codec else { anyhow::bail!("Expected H.264") };
+    let mut decoder = VideoDecoder::new(avcc, None, false)?;
+    let mut frames = Vec::new();
+    for sample in reader.samples(index, 0, u64::MAX)? {
+        let pts = sample.pts() * S as i64 / i64::from(reader.tracks[index].timescale);
+        frames.extend(decoder.decode(&reader.read(&sample)?, pts)?);
+    }
+    frames.extend(decoder.drain()?);
+    frames.sort_by_key(|frame| frame.pts_hns);
+    Ok(frames.iter().map(number).collect())
+}
+
+
 fn number(frame: &DecodedFrame) -> Option<u32> {
     const SEGMENTS: [(usize, usize); 7] = [(2,0), (4,2), (4,6), (2,8), (0,6), (0,2), (2,4)];
     const DIGITS: [u8; 10] = [0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f];
@@ -145,17 +160,8 @@ fn retains_046_and_048_and_projects_multiple_half_frame_trims() -> Result<()> {
 
     let result = render(&project, &work.path().join("Precisely removed 047.mp4"))?;
     check_grid(&result, &project)?;
-    let index = result.video().context("Missing numbered video")?;
-    let Codec::H264 { avcc } = &result.tracks[index].codec else { panic!("Expected H.264") };
-    let mut decoder = VideoDecoder::new(avcc, None, false)?;
-    let mut frames = Vec::new();
-    for sample in result.samples(index, 0, u64::MAX)? {
-        let pts = sample.pts() * S as i64 / i64::from(result.tracks[index].timescale);
-        frames.extend(decoder.decode(&result.read(&sample)?, pts)?);
-    }
-    frames.extend(decoder.drain()?);
-    frames.sort_by_key(|frame| frame.pts_hns);
-    let numbers = [number(&frames[45]), number(&frames[46]), number(&frames[47]), number(&frames[48])];
+    let frames = numbered_frames(&result)?;
+    let numbers = [frames[45], frames[46], frames[47], frames[48]];
     eprintln!("Numbered decoded seam: {numbers:?}");
     assert_eq!(numbers, [Some(45), Some(46), Some(48), Some(49)]);
 
@@ -266,5 +272,83 @@ fn incoming_picture_wins_duplicate_timestamp_at_each_portrait_cut() -> Result<()
     assert!(first_portrait > before_portrait + 12);
     assert_eq!(fs::read(&old)?, old_bytes);
     assert_eq!(fs::read(&project_path)?, saved_bytes);
+    Ok(())
+}
+
+#[test]
+#[ignore = "uses the independent frame reviewer's synthetic numbered source and saved edit"]
+fn default_import_removes_061_without_importing_the_aac_tail() -> Result<()> {
+    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.clipvault-local").canonicalize()?;
+    let root = local.join("qa/editor-reviews/frame-rereview-50910c39");
+    let source = root.join("inputs/Frame counter.mp4");
+    let previous_output = root.join("tmp/first-export-with-extra-tail.mp4");
+    let legacy_document = root.join("output/Frame counter without 061.cvproj");
+    let source_bytes = fs::read(&source)?;
+    let document_bytes = fs::read(&legacy_document)?;
+    let work = tempfile::Builder::new().prefix("editor-picture-source-").tempdir_in(root.parent().unwrap())?;
+
+    let original = Mp4Reader::open(&source)?;
+    let original_video = original.video().context("Missing numbered source video")?;
+    assert!(original.duration_secs() > 4.0);
+    assert_eq!(original.end_secs(original_video), 4.0);
+    let original_numbers = numbered_frames(&original)?;
+    assert_eq!(original_numbers, (0..100).map(Some).collect::<Vec<_>>());
+
+    let info = editor::probe(&source)?;
+    assert_eq!(info.duration, 4 * S);
+    let mut project = Project::default();
+    project.canvas = Canvas { width: info.width, height: info.height, fps: 25 };
+    let asset = project.import(source.clone(), info)?;
+    let shot = project.append(asset)?;
+    assert_eq!(project.shots[0].range.end, 4 * S);
+    let removed = project.split(shot, 61 * FRAME)?;
+    project.split(removed, 62 * FRAME)?;
+    project.remove(removed)?;
+    assert_eq!(project.duration(), 99 * FRAME);
+    assert_eq!(project.shots[1].range.end, 4 * S);
+
+    let edited = render(&project, &work.path().join("Imported frame 061 removed.mp4"))?;
+    check_grid(&edited, &project)?;
+    assert!((edited.duration_secs() - 3.960).abs() < 1e-8);
+    let expected: Vec<_> = original_numbers.into_iter().filter(|number| *number != Some(61)).collect();
+    let actual = numbered_frames(&edited)?;
+    assert_eq!(actual, expected);
+    eprintln!("Default imported end 4.000s. Removed 061, retained 060 and 062, and final 099 appears once in 99 frames");
+    let previous = Mp4Reader::open(&previous_output)?;
+    assert!(video_samples(&previous)?.1.len() > actual.len());
+    assert!(previous.duration_secs() > edited.duration_secs());
+
+    // A legacy project retains its authored source spans even though its
+    // stored asset probe was longer. The reviewer had already set out to 4s.
+    let mut legacy = Project::load(&legacy_document)?;
+    assert_eq!(legacy.assets[0].info.duration, 4 * S + S / 100);
+    assert_eq!(legacy.shots[1].range, project.shots[1].range);
+    legacy.canvas = project.canvas;
+    let rebuilt_legacy = render(&legacy, &work.path().join("Existing authored 4s out.mp4"))?;
+    assert_eq!(numbered_frames(&rebuilt_legacy)?, actual);
+    legacy.shots[1].range.end = legacy.assets[0].info.duration;
+    let old_authored = work.path().join("Saved legacy explicit tail.cvproj");
+    legacy.save(&old_authored)?;
+    assert_eq!(Project::load(&old_authored)?.shots[1].range.end, 4 * S + S / 100);
+
+    let sound = work.path().join("Intentional 4.010s audio.wav");
+    let len = 192_480u32 * 2;
+    let mut wave = b"RIFF".to_vec();
+    wave.extend((36 + len).to_le_bytes());
+    wave.extend(b"WAVEfmt ");
+    wave.extend(16u32.to_le_bytes());
+    wave.extend(1u16.to_le_bytes());
+    wave.extend(1u16.to_le_bytes());
+    wave.extend(48_000u32.to_le_bytes());
+    wave.extend(96_000u32.to_le_bytes());
+    wave.extend(2u16.to_le_bytes());
+    wave.extend(16u16.to_le_bytes());
+    wave.extend(b"data");
+    wave.extend(len.to_le_bytes());
+    wave.resize(wave.len() + len as usize, 0);
+    fs::write(&sound, wave)?;
+    assert_eq!(editor::probe(&sound)?.duration, 4 * S + S / 100);
+    assert_eq!(fs::read(&source)?, source_bytes);
+    assert_eq!(fs::read(&legacy_document)?, document_bytes);
     Ok(())
 }

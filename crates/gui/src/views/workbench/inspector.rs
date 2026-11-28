@@ -2,7 +2,7 @@
 use super::{clock, filename, frame_tick, role_picker, seconds, ticks, Selection, Workbench};
 use crate::theme;
 use anyhow::{ensure, Context as _, Result};
-use cv_core::editor::{AssetKind, AudioFade, Canvas, Project, Rotation, SoundRole, Source, Span, VisualTransform};
+use cv_core::editor::{AssetKind, AudioFade, Canvas, Framing, Project, Rotation, SoundRole, Source, Span, VisualTransform};
 use eframe::egui::{self, RichText, Ui};
 
 #[derive(Clone, PartialEq)]
@@ -30,6 +30,7 @@ impl Workbench {
             state.canvas = Some(self.history.project.canvas);
             state.selection = None;
             state.properties = None;
+            state.original = None;
         }
         if state.selection != self.selected {
             state.selection = self.selected;
@@ -40,7 +41,9 @@ impl Workbench {
         let apply = ui.horizontal_wrapped(|ui| {
             ui.strong("Inspector");
             let label = if self.selected.is_some() { "Apply Changes" } else { "Apply Project Settings" };
-            let pending = state.properties != state.original;
+            let pending = if self.selected.is_some() { state.properties != state.original } else {
+                state.name != self.history.project.name || state.canvas != Some(self.history.project.canvas)
+            };
             let button = ui.button(label).on_hover_text("Apply edited fields. Enter also applies changes to a selected item.");
             if pending { ui.label(theme::small("Unapplied edits")); }
             button.clicked()
@@ -59,6 +62,7 @@ impl Workbench {
             });
         let enter = self.selected.is_some() && state.properties != state.original && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if apply || enter {
+            self.notice = None;
             if let (Some(selection), Some(values)) = (self.selected, state.properties.as_ref()) {
                 if state.original.as_ref() != Some(values) {
                     self.apply_item(ui.ctx(), selection, values.clone());
@@ -247,7 +251,8 @@ pub(super) fn time_field(ui: &mut Ui, label: &str, value: &mut f64, limit: f64) 
     ui.horizontal_wrapped(|ui| {
         let text = ui.label(label);
         ui.add(egui::DragValue::new(value).range(0.0..=limit).speed(0.02).max_decimals(7)
-            .suffix(" s").update_while_editing(false)).labelled_by(text.id)
+            .suffix(" s").custom_parser(super::parse_time).update_while_editing(false)).labelled_by(text.id)
+            .on_hover_text("Click to type seconds or minutes:seconds. Ctrl+A replaces the value. Drag to adjust.")
     }).inner
 }
 
@@ -301,6 +306,33 @@ fn visual_transform_fields(ui: &mut Ui, transform: &mut VisualTransform) {
     });
     ui.checkbox(&mut transform.mirror, "Mirror Horizontally")
         .on_hover_text("Flip left to right after rotation");
+
+    ui.horizontal_wrapped(|ui| {
+        let label = ui.label("Framing");
+        let mut fill = matches!(transform.framing, Framing::Fill { .. });
+        let was_fill = fill;
+        egui::ComboBox::from_id_salt("editor-shot-framing")
+            .selected_text(if fill { "Fill" } else { "Fit" })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut fill, false, "Fit").on_hover_text("Show the whole picture");
+                ui.selectable_value(&mut fill, true, "Fill").on_hover_text("Crop to fill the canvas");
+            })
+            .response
+            .labelled_by(label.id);
+        if fill != was_fill {
+            transform.framing = if fill {
+                Framing::Fill { horizontal: 50, vertical: 50 }
+            } else {
+                Framing::Fit
+            };
+        }
+    });
+    if let Framing::Fill { horizontal, vertical } = &mut transform.framing {
+        ui.add(egui::Slider::new(horizontal, 0..=100).suffix("%").text("Horizontal Focus"))
+            .on_hover_text("0% left · 50% center · 100% right");
+        ui.add(egui::Slider::new(vertical, 0..=100).suffix("%").text("Vertical Focus"))
+            .on_hover_text("0% top · 50% center · 100% bottom");
+    }
 }
 
 fn gain_field(ui: &mut Ui, value: &mut f64) {

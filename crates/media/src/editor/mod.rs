@@ -4,6 +4,8 @@ mod cadence;
 mod captions;
 mod fades;
 mod reframe;
+#[cfg(test)]
+mod presentation_tests;
 mod stills;
 mod title;
 mod visual_transforms;
@@ -88,7 +90,17 @@ fn storage_file(path: &Path) -> Result<StorageFile> {
         .with_context(|| format!("Open {}", path.display()))
 }
 
-fn video_info(clip: &MediaClip) -> Result<AssetInfo> {
+fn picture_duration(reader: &crate::mp4::reader::Mp4Reader) -> Option<u64> {
+    let (ticks, scale) = reader.picture_duration()?;
+    let scale = u128::from(scale);
+    let duration = (u128::from(ticks) * u128::from(TICKS_PER_SECOND) + scale / 2) / scale;
+    u64::try_from(duration).ok().filter(|duration| (1..=i64::MAX as u64).contains(duration))
+}
+
+fn video_info(clip: &MediaClip, path: &Path) -> Result<AssetInfo> {
+    let native_duration = positive_ticks(clip.OriginalDuration()?)?;
+    let duration = crate::mp4::reader::Mp4Reader::open(path).ok()
+        .and_then(|reader| picture_duration(&reader)).unwrap_or(native_duration).min(native_duration);
     let props = clip.GetVideoEncodingProperties()?;
     let (width, height) = (props.Width()?, props.Height()?);
     ensure!(width > 0 && height > 0, "Media has no video picture");
@@ -99,7 +111,7 @@ fn video_info(clip: &MediaClip) -> Result<AssetInfo> {
             let d = u64::from(rate.Denominator().ok()?);
             u32::try_from((n * 1000 + d / 2).checked_div(d)?).ok().filter(|rate| *rate > 0)
         }),
-        duration: positive_ticks(clip.OriginalDuration()?)?,
+        duration,
         width,
         height,
     })
@@ -129,14 +141,16 @@ pub fn probe(path: &Path) -> Result<AssetInfo> {
         _ => MediaClip::CreateFromFileAsync(&file)
             .and_then(|operation| operation.get())
             .map_err(anyhow::Error::from)
-            .and_then(|clip| video_info(&clip))
+            .and_then(|clip| video_info(&clip, path))
             .or_else(|video_error| {
-                if let Ok(info) = crate::probe::probe(path) {
+                if let Ok(reader) = crate::mp4::reader::Mp4Reader::open(path) {
+                    let info = crate::probe::probe_reader(&reader);
                     if info.fragmented && info.video_codec == "h264" && info.duration > 0.0 {
                         return Ok(AssetInfo {
                             kind: AssetKind::Video,
                             fps_milli: (info.fps > 0.0).then(|| (info.fps * 1000.0).round() as u32),
-                            duration: (info.duration * TICKS_PER_SECOND as f64).round() as u64,
+                            duration: picture_duration(&reader)
+                                .unwrap_or_else(|| (info.duration * TICKS_PER_SECOND as f64).round() as u64),
                             width: info.width,
                             height: info.height,
                         });
@@ -277,8 +291,8 @@ fn build(project: &Project, work: &Path, control: &RenderControl) -> Result<Medi
                                     }
                                 }
                                 return visual_transforms::video(
-                                    &file, range, shot.visual_transform, project.canvas,
-                                    &work.join(format!("orientation-{}.mp4", shot.id)), control,
+                                    &file, &clip, range, shot.visual_transform, project.canvas,
+                                    &work.join(format!("picture-{}.mp4", shot.id)), control,
                                 );
                             }
                             return Ok((clip, range));
@@ -439,6 +453,9 @@ pub fn render(project: &Project, destination: &Path, control: &RenderControl) ->
         info.duration > 0.0 && (info.duration - expected_duration).abs() <= tolerance,
         "Windows produced {:.3} seconds for a {:.3}-second timeline", info.duration, expected_duration,
     );
+    control.check()?;
+    crate::mp4::presentation::limit(&staged, project.duration())
+        .context("Set the exact presentation duration on the rendered MP4")?;
     fs::OpenOptions::new().write(true).open(&staged)?.sync_all()?;
     let from = HSTRING::from(staged.as_os_str());
     let to = HSTRING::from(absolute.as_os_str());

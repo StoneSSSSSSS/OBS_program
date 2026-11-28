@@ -255,8 +255,7 @@ impl Preview {
     fn ensure_proxy(&mut self, ctx: &egui::Context, project: &Project, at: u64) {
         let total = project.duration();
         if total == 0 { return; }
-        let start = at.min(total - 1) / PROXY_LENGTH * PROXY_LENGTH;
-        let span = Span { start, end: total.min(start.saturating_add(PROXY_LENGTH)) };
+        let span = playback_span(total, at, project.canvas.fps);
         if self.task.as_ref().is_some_and(|task| task.span.start == span.start && task.span.end == span.end) { return; }
         if let Some(player) = &self.player { player.clear(); }
         self.proxy = None;
@@ -347,6 +346,10 @@ impl Preview {
             Some((format!("Loading frame at {}…", super::clock(at)), theme::TEXT))
         };
         if let Some((message, color)) = message {
+            let message = if rect.width() >= 110.0 { message }
+                else if self.error.is_some() { "Error".into() }
+                else if project.duration() == 0 { "Empty".into() }
+                else { "Loading…".into() };
             let mut text = egui::text::LayoutJob::simple(message, FontId::proportional(13.0), color, (rect.width() - 16.0).max(1.0));
             text.wrap.max_rows = 2;
             text.wrap.break_anywhere = true;
@@ -357,6 +360,24 @@ impl Preview {
             painter.galley(pos, galley, color);
         }
     }
+}
+
+fn playback_span(total: u64, at: u64, fps: u32) -> Span {
+    let frame = TICKS_PER_SECOND.div_ceil(u64::from(fps.max(1)));
+    let mut start = at.min(total.saturating_sub(1)) / PROXY_LENGTH * PROXY_LENGTH;
+    if total.saturating_sub(start) < frame { start = start.saturating_sub(PROXY_LENGTH); }
+    let boundary = start.saturating_add(PROXY_LENGTH);
+    let end = if total.saturating_sub(boundary) < frame { total } else { boundary };
+    Span { start, end }
+}
+
+#[test]
+fn preview_keeps_a_subframe_audio_tail_with_the_last_picture() {
+    let total = PROXY_LENGTH + TICKS_PER_SECOND / 100;
+    for at in [0, PROXY_LENGTH - 1, PROXY_LENGTH, total] {
+        assert_eq!(playback_span(total, at, 30), Span { start: 0, end: total });
+    }
+    assert_eq!(playback_span(3 * PROXY_LENGTH, PROXY_LENGTH, 30), Span { start: PROXY_LENGTH, end: 2 * PROXY_LENGTH });
 }
 
 fn preview_error(project: &Project, error: &anyhow::Error) -> String {
@@ -379,7 +400,7 @@ fn relative_time(span: Span, at: u64) -> f64 {
 }
 
 pub(super) enum ExportStatus {
-    Running(f32),
+    Running(f32, String),
     Saved(PathBuf),
     Failed(String),
 }
@@ -388,14 +409,18 @@ pub(super) enum ExportStatus {
 pub(super) struct Export {
     task: Option<Worker>,
     completed: Option<Result<PathBuf>>,
+    filename: String,
 }
 
 impl Export {
     pub(super) fn idle(&self) -> bool { self.task.is_none() }
 
+    pub(super) fn clear_result(&mut self) { self.completed = None; }
+
     pub(super) fn start(&mut self, ctx: &egui::Context, project: Project, destination: PathBuf) -> Result<()> {
-        ensure_new(&destination)?;
         self.completed = None;
+        ensure_new(&destination)?;
+        self.filename = super::filename(&destination);
         self.task = Some(Worker::spawn(ctx, "clipvault-editor-export", move |control| {
             create_new(&destination, |staging| editor::render(&project, staging, control))?;
             Ok(destination)
@@ -412,7 +437,7 @@ impl Export {
 
     pub(super) fn status(&self) -> Option<ExportStatus> {
         if let Some(task) = &self.task {
-            return Some(ExportStatus::Running(task.control.progress()));
+            return Some(ExportStatus::Running(task.control.progress(), self.filename.clone()));
         }
         self.completed.as_ref().map(|result| match result {
             Ok(path) => ExportStatus::Saved(path.clone()),

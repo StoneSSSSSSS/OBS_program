@@ -148,6 +148,18 @@ pub fn install_fonts(ctx: &egui::Context) {
         fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "consolas".into());
     }
     ctx.set_fonts(fonts);
+    ctx.add_font_provider(Arc::new(windows_text_fallback));
+}
+
+fn windows_text_fallback(request: &egui::epaint::text::FallbackRequest<'_>) -> Option<egui::epaint::text::FontInsert> {
+    let character = request.cluster.chars().next()? as u32;
+    let names: &[&str] = match character {
+        0x1100..=0x11ff | 0x3130..=0x318f | 0xac00..=0xd7af => &["malgun.ttf"],
+        0x3000..=0x30ff | 0x3400..=0x9fff | 0xf900..=0xfaff | 0xff00..=0xffef => &["msgothic.ttc", "msyh.ttc", "YuGothR.ttc"],
+        _ => return None,
+    };
+    let (name, bytes) = names.iter().find_map(|name| load_system_font(name).map(|bytes| (*name, bytes)))?;
+    Some(egui::epaint::text::FontInsert::new(name, FontData::from_owned(bytes), Vec::new()))
 }
 
 pub fn apply(ctx: &egui::Context, accent_color: Color32, scale: f32) {

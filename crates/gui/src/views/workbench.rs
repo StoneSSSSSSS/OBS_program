@@ -68,6 +68,7 @@ enum Generated {
 
 struct Generator {
     kind: Generated,
+    at_start: bool,
     text: String,
     rgb: [u8; 3],
     duration: f64,
@@ -91,6 +92,8 @@ pub struct Workbench {
     dock: Dock,
     dock_open: bool,
     preview_expanded: bool,
+    compact_preview_height: Option<f32>,
+    seek_input: Option<(String, bool)>,
     selected_asset: Option<Id>,
     selected: Option<Selection>,
     audio_role: SoundRole,
@@ -123,6 +126,8 @@ impl Default for Workbench {
             dock: Dock::default(),
             dock_open: false,
             preview_expanded: false,
+            compact_preview_height: None,
+            seek_input: None,
             selected_asset: None,
             selected: None,
             audio_role: SoundRole::Music,
@@ -157,6 +162,7 @@ impl Workbench {
         self.history = History::new(project);
         self.selected = Some(Selection::Shot(id));
         self.dock = Dock::Inspector;
+        self.dock_open = page == "workbench_short_inspector";
         self.preview_expanded = page == "workbench_preview";
         self.tab = if page == "workbench_wiki" { Tab::Wiki } else { Tab::Workbench };
     }
@@ -201,13 +207,17 @@ impl Workbench {
         let compact = ui.available_width() < 600.0 || self.preview_expanded;
         if compact {
             ui.horizontal_wrapped(|ui| {
+                if ui.selectable_label(!self.dock_open, "Timeline").clicked() { self.dock_open = false; }
                 self.dock_button(ui, Dock::Media, "Media Bin");
                 self.dock_button(ui, Dock::Inspector, "Inspector");
             });
         }
         self.output_status(ui);
         ui.add_space(6.0);
-        egui::ScrollArea::vertical()
+        if ui.available_width() < 600.0 && !self.preview_expanded {
+            self.compact_workspace(ui, frame, ctx.accent);
+        } else {
+            egui::ScrollArea::vertical()
             .id_salt("editor-workbench")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -215,8 +225,10 @@ impl Workbench {
                 ui.add_space(10.0);
                 self.timeline(ui, ctx.accent);
             });
+        }
 
-        self.shortcuts(ui, frame);
+        if self.seek_input.is_none() { self.shortcuts(ui, frame); }
+        self.seek_dialog(ui.ctx());
         self.replace_prompt(ui.ctx(), frame);
         self.generator_prompt(ui.ctx());
         self.caption_window(ui.ctx(), frame);
@@ -268,9 +280,10 @@ impl Workbench {
         if let Some(status) = self.export.status() {
             row = true;
             ui.horizontal_wrapped(|ui| match status {
-                preview::ExportStatus::Running(progress) => {
+                preview::ExportStatus::Running(progress, name) => {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
-                    ui.add(egui::ProgressBar::new(progress).desired_width(104.0).show_percentage());
+                    ui.add(egui::ProgressBar::new(progress).desired_width(104.0).show_percentage())
+                        .on_hover_text(format!("Exporting {name}"));
                     if ui.button("Cancel Export").clicked() {
                         self.export.cancel();
                     }
@@ -307,7 +320,7 @@ impl Workbench {
             ui.add(egui::Label::new(RichText::new(message).color(color)).truncate())
                 .on_hover_text(message);
         }
-        if !row { ui.add_space(17.0); }
+        if !row && ui.ctx().viewport_rect().height() >= 590.0 { ui.add_space(17.0); }
     }
 
     fn dock_button(&mut self, ui: &mut Ui, dock: Dock, label: &str) {
@@ -317,14 +330,49 @@ impl Workbench {
         }
     }
 
+    fn compact_workspace(&mut self, ui: &mut Ui, frame: &eframe::Frame, accent: Color32) {
+        let width = ui.available_width();
+        let available = ui.available_height();
+        if available < 265.0 {
+            ui.horizontal(|ui| {
+                let (picture, open) = ui.allocate_exact_size(egui::vec2(70.0, 40.0), Sense::click());
+                self.preview.picture(ui, picture, &self.history.project, accent, self.revision, self.playhead);
+                if open.on_hover_text("Expand preview").clicked() { self.preview_expanded = true; }
+                let duration = self.history.project.duration();
+                if ui.add_enabled(duration > 0, egui::Button::new(if self.preview.playing() { "Pause" } else { "Play" })).clicked() { self.toggle_play(ui.ctx()); }
+                if ui.add_enabled(duration > 0, egui::Button::new(clock(self.playhead))).on_hover_text("Go to time…").clicked() {
+                    self.seek_input = Some((String::new(), true));
+                }
+                if ui.small_button("Expand").clicked() { self.preview_expanded = true; }
+            });
+        } else {
+            let maximum = (available - 138.0).max(123.0);
+            let preferred = self.compact_preview_height.unwrap_or(available * 0.40);
+            let height = preferred.clamp(123.0, maximum);
+            let (stage, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+            region(ui, "editor-stage", stage, |ui| self.stage_card(ui, accent));
+            let (grip, drag) = ui.allocate_exact_size(egui::vec2(width, 13.0), Sense::click_and_drag());
+            let drag = drag.on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                .on_hover_text("Drag to resize the preview. Double-click to reset.");
+            ui.painter().hline(grip.x_range(), grip.center().y, egui::Stroke::new(1.0, theme::BORDER));
+            let center = egui::Rect::from_center_size(grip.center(), egui::vec2(38.0, 3.0));
+            ui.painter().rect_filled(center, 2.0, theme::TEXT_FAINT);
+            if drag.double_clicked() { self.compact_preview_height = None; }
+            else if drag.dragged() { self.compact_preview_height = Some((height + drag.drag_delta().y).clamp(123.0, maximum)); }
+        }
+        if self.dock_open {
+            let (dock, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+            region(ui, "editor-compact-dock", dock, |ui| self.dock_card(ui, frame, false));
+        } else {
+            egui::ScrollArea::vertical().id_salt("editor-compact-timeline").auto_shrink([false, false])
+                .show(ui, |ui| self.timeline(ui, accent));
+        }
+    }
+
     fn upper(&mut self, ui: &mut Ui, frame: &eframe::Frame, accent: Color32) {
         let width = ui.available_width();
-        if width < 600.0 || self.preview_expanded {
-            let height = if self.preview_expanded {
-                (ui.clip_rect().height() * 0.80).clamp(220.0, 565.0)
-            } else {
-                (width * 0.48 + 78.0).clamp(188.0, 318.0)
-            };
+        if self.preview_expanded {
+            let height = (ui.clip_rect().height() * 0.80).clamp(220.0, 565.0);
             let (stage, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
             region(ui, "editor-stage", stage, |ui| self.stage_card(ui, accent));
             if self.dock_open {
@@ -445,10 +493,30 @@ impl Workbench {
                 }
                 let position = clock(self.playhead);
                 let shown = format!("{} / {}", position, clock(duration));
-                ui.add(egui::Label::new(RichText::new(shown).monospace()).truncate())
-                    .on_hover_text(format!("Frame {}", frame_number(self.playhead, self.history.project.canvas.fps) + 1));
+                let goto = ui.add_enabled(duration > 0, egui::Button::new(RichText::new(shown).monospace()).truncate())
+                    .on_hover_text(format!("Go to time… · Frame {}", frame_number(self.playhead, self.history.project.canvas.fps) + 1));
+                if goto.clicked() { self.seek_input = Some((String::new(), true)); }
             });
         });
+    }
+
+    fn seek_dialog(&mut self, ctx: &egui::Context) {
+        let Some((text, first)) = &mut self.seek_input else { return };
+        let mut open = true;
+        let mut target = None;
+        let duration = self.history.project.duration();
+        egui::Window::new("Go to time").open(&mut open).collapsible(false).resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Seconds or minutes:seconds");
+                let edit = ui.add(egui::TextEdit::singleline(text).hint_text("1.88 or 01:23.400").desired_width(180.0));
+                if *first { edit.request_focus(); *first = false; }
+                let parsed = parse_time(text).map(ticks).filter(|&at| at <= duration);
+                let go = ui.add_enabled(parsed.is_some(), egui::Button::new("Go"));
+                if go.clicked() || ui.input(|i| i.key_pressed(Key::Enter)) { target = parsed; }
+                if !text.is_empty() && parsed.is_none() { ui.label(format!("Enter a time up to {}.", clock(duration))); }
+            });
+        if let Some(at) = target { self.seek(at, ctx); }
+        if target.is_some() || !open || ctx.input(|i| i.key_pressed(Key::Escape)) { self.seek_input = None; }
     }
 
     fn bin(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
@@ -533,15 +601,22 @@ impl Workbench {
         };
         self.imports = None;
         let mut errors = Vec::new();
+        let mut imported_message = None;
         let mut accepted = Vec::new();
         for (path, result) in files {
             match result {
                 Ok(info) => accepted.push((path, info)),
-                Err(error) => errors.push(format!("{}: {error:#}", filename(&path))),
+                Err(error) => {
+                    let name = filename(&path);
+                    let reason = error.root_cause().to_string();
+                    let problem = if path.is_file() { "Unsupported or unreadable media" } else { "Missing file" };
+                    errors.push(format!("{problem} · {name}. {reason}"));
+                }
             }
         }
         if !accepted.is_empty() {
-            let count = accepted.len();
+            let total = accepted.len();
+            let before = self.history.project.assets.len();
             if let Some(first) = self.change(ctx, |project| {
                 let mut first = None;
                 for (path, info) in accepted {
@@ -551,10 +626,21 @@ impl Workbench {
                 first.context("No media selected")
             }) {
                 self.selected_asset = Some(first);
-                self.notice = Some(Notice::Info(format!("Imported {count} media {}", if count == 1 { "file" } else { "files" })));
+                let added = self.history.project.assets.len().saturating_sub(before);
+                let info = match (added, total - added) {
+                    (0, _) => "Already in the Media Bin.".to_owned(),
+                    (n, 0) => format!("Imported {n} media {}", if n == 1 { "file" } else { "files" }),
+                    (n, seen) => format!("Imported {n} · {seen} already in the Media Bin"),
+                };
+                imported_message = Some(info);
             }
         }
-        if !errors.is_empty() { self.notice = Some(Notice::Error(errors.join("  ·  "))); }
+        if errors.is_empty() {
+            if let Some(message) = imported_message { self.notice = Some(Notice::Info(message)); }
+        } else {
+            let prefix = imported_message.map_or_else(String::new, |message| format!("{message} · "));
+            self.notice = Some(Notice::Error(format!("{prefix}Skipped {} · {}", errors.len(), errors.join("  ·  "))));
+        }
     }
 
     fn pick_media(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
@@ -736,6 +822,11 @@ impl Workbench {
         self.playhead = 0;
         self.imports = None;
         self.relink_task = None;
+        self.inspector = inspector::Inspector::default();
+        self.captions = captions::Captions::default();
+        self.seek_input = None;
+        self.generator = None;
+        self.export.clear_result();
         self.timeline = timeline::Timeline::default();
         self.notice = None;
         self.revision = self.revision.wrapping_add(1);
@@ -818,7 +909,7 @@ impl Workbench {
 
     fn start_generator(&mut self, kind: Generated) {
         self.pause();
-        self.generator = Some(Generator { kind, text: "Title".into(), rgb: [26, 37, 52], duration: 2.0 });
+        self.generator = Some(Generator { kind, at_start: self.playhead == 0, text: "Title".into(), rgb: [38; 3], duration: 2.0 });
     }
 
     fn generator_prompt(&mut self, ctx: &egui::Context) {
@@ -842,6 +933,11 @@ impl Workbench {
                 ui.add(egui::DragValue::new(&mut draft.duration).range(0.04..=600.0).speed(0.1).suffix(" s"));
             });
             ui.horizontal(|ui| {
+                ui.label("Placement");
+                ui.selectable_value(&mut draft.at_start, true, "Beginning");
+                ui.selectable_value(&mut draft.at_start, false, "End");
+            });
+            ui.horizontal(|ui| {
                 accept = ui.button("Add to Timeline").clicked();
                 cancel = ui.button("Cancel").clicked();
             });
@@ -850,11 +946,17 @@ impl Workbench {
         if accept {
             let Some(draft) = self.generator.take() else { return; };
             let duration = ticks(draft.duration);
-            if let Some(id) = self.change(ctx, |project| match draft.kind {
-                Generated::Title => project.title(draft.text, duration),
-                Generated::Color => project.color(draft.rgb, duration),
+            if let Some(id) = self.change(ctx, |project| {
+                let id = match draft.kind {
+                    Generated::Title => project.title(draft.text, duration)?,
+                    Generated::Color => project.color(draft.rgb, duration)?,
+                };
+                if draft.at_start { project.move_shot(id, 0)?; }
+                Ok(id)
             }) {
                 self.selected = Some(Selection::Shot(id));
+                let at = self.history.project.shot_start(id).unwrap_or(0);
+                self.seek(at, ctx);
             }
         }
     }
@@ -909,6 +1011,22 @@ fn card(ui: &mut Ui, draw: impl FnOnce(&mut Ui)) {
             ui.set_min_size((size - egui::vec2(20.0, 20.0)).max(Vec2::ZERO));
             draw(ui);
         });
+}
+
+fn parse_time(text: &str) -> Option<f64> {
+    let text = text.trim().trim_end_matches('s').trim();
+    let parts: Vec<_> = text.split(':').collect();
+    if parts.is_empty() || parts.len() > 3 { return None; }
+    let mut total = 0.0;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit() || (c == b'.' && i + 1 == parts.len())) {
+            return None;
+        }
+        let value: f64 = part.parse().ok()?;
+        if !value.is_finite() || (i > 0 && value >= 60.0) { return None; }
+        total = 60.0 * total + value;
+    }
+    total.is_finite().then_some(total)
 }
 
 fn format_fps(milli: u32) -> String {
@@ -1023,6 +1141,15 @@ fn role_name(role: SoundRole) -> &'static str {
 #[cfg(test)]
 mod workbench_tests {
     use super::*;
+
+    #[test]
+    fn accepts_seconds_and_clock_values() {
+        assert_eq!(parse_time("1:23.400"), Some(83.4));
+        assert_eq!(parse_time("1.880 s"), Some(1.88));
+        assert_eq!(parse_time("1:00:01.25"), Some(3601.25));
+        assert_eq!(parse_time("1:60"), None);
+        assert_eq!(parse_time("-3"), None);
+    }
 
     #[test]
     fn undo_to_saved_project_clears_unsaved_state() {

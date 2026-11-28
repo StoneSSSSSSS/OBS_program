@@ -157,6 +157,7 @@ fn copy_with_grid(
     }
     let mut positions = vec![0; tracks.len()];
     let mut writer = FlatWriter::new(destination, &specs, 0)?;
+    writer.reserve_presentation_edit_space();
     loop {
         control.check()?;
         let next = packet_tracks.iter().enumerate().filter_map(|(i, packets)| {

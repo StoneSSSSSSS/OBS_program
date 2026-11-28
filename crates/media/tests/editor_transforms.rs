@@ -89,7 +89,7 @@ fn imported_shots_rotate_and_mirror_in_preview_and_mp4() -> Result<()> {
                 project.append(asset)?;
                 let shot = project.shots.last_mut().context("Missing appended fixture")?;
                 shot.range = Span { start: S / 5, end: S / 5 + SHOT_LENGTH };
-                shot.visual_transform = VisualTransform { rotation, mirror };
+                shot.visual_transform = VisualTransform { rotation, mirror, ..VisualTransform::default() };
                 if asset == media && mirror { shot.gain = 0.5; }
             }
         }

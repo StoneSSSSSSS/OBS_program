@@ -260,3 +260,34 @@ fn corrupt_tail_keeps_good_part_and_refresh_never_duplicates() {
         assert_eq!(r.samples(0, 0, u64::MAX).unwrap().len(), 90, "refresh must not add fragments again");
     }
 }
+
+#[test]
+fn picture_duration_keeps_gaps_composition_offsets_and_short_last_picture() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Short picture with an audio tail.mp4");
+    let mut writer = FragWriter::create(&path, &tracks()[..2], 0, None).unwrap();
+    let first = vsample(0);
+    let second = vsample(30);
+    let audio = asample(0, 0xA0);
+    writer.write_fragment(&[TrackRun {
+        track_id: 1,
+        base_time: 0,
+        samples: &[SampleRef { data: &first, duration: 3600, sync: true, cts: 0 }],
+    }]).unwrap();
+    writer.write_fragment(&[
+        TrackRun {
+            track_id: 1,
+            base_time: 8100,
+            samples: &[SampleRef { data: &second, duration: 900, sync: true, cts: 900 }],
+        },
+        TrackRun {
+            track_id: 2,
+            base_time: 0,
+            samples: &[SampleRef { data: &audio, duration: 16_000, sync: true, cts: 0 }],
+        },
+    ]).unwrap();
+    writer.finish().unwrap();
+    let reader = Mp4Reader::open(&path).unwrap();
+    assert!(reader.duration_secs() > 0.3);
+    assert_eq!(reader.picture_duration(), Some((9900, 90_000)));
+}

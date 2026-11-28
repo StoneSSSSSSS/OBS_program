@@ -24,6 +24,8 @@ const PAGES: &[(&str, &str)] = &[
     ("workbench", "Workbench"),
     ("workbench_preview", "Workbench"),
     ("workbench_wiki", "Editor Wiki"),
+    ("workbench_short_timeline", "Video"),
+    ("workbench_short_inspector", "Apply Changes"),
     ("settings_general", "Startup"),
     ("settings_recording", "Recording history"),
     ("settings_clips", "Saved clip length"),
@@ -205,6 +207,8 @@ fn inspect(
             "editor_export" => &["Export to size limit", "Export full quality"],
             "workbench" | "workbench_preview" => &["Project", "Import Media…", "Export MP4…"],
             "workbench_wiki" => &["All topics", "Clear"],
+            "workbench_short_timeline" => &["Edit", "View", "Selected Item"],
+            "workbench_short_inspector" => &["Inspector", "Apply Changes"],
             page if page.starts_with("settings_") => &["Save", "Discard"],
             _ => &[],
         };
@@ -400,7 +404,10 @@ impl Sweep {
             }
         }
 
-        let widths = if PAGES[self.page].0.starts_with("workbench") { WORKBENCH_WIDTHS } else { WIDTHS };
+        let page = PAGES[self.page].0;
+        let short_editor = page.starts_with("workbench_short");
+        let widths: &[f32] = if short_editor { &[500., 528., 576., 620.] }
+            else if page.starts_with("workbench") { WORKBENCH_WIDTHS } else { WIDTHS };
         let size = ctx.viewport_rect().size();
         if let Some((wanted, since)) = self.requested {
             let (page, label) = PAGES[self.page];
@@ -441,7 +448,7 @@ impl Sweep {
             let capture = if matches!(
                 page,
                 "editor" | "recordings" | "editor_trim" | "editor_export" | "workbench" | "workbench_preview" | "workbench_wiki"
-            ) {
+            ) || short_editor {
                 (page.starts_with("workbench") && self.step == widths.len() - 1)
                     || [0, 8, 10, 12, 16, 22, widths.len() + 9].contains(&self.step)
             } else {
@@ -500,7 +507,9 @@ impl Sweep {
             self.step - widths.len()
         };
         let width = widths[index];
-        let height = if self.step < widths.len() {
+        let height = if short_editor {
+            if self.step < widths.len() { 384. } else { 480. }
+        } else if self.step < widths.len() {
             671.
         } else {
             510. + 0.27 * (width - widths[0])

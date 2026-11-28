@@ -33,6 +33,7 @@ pub struct FlatWriter {
     tracks: Vec<Track>,
     last_track: Option<usize>,
     created: u64,
+    movie_padding: u64,
 }
 
 impl FlatWriter {
@@ -47,7 +48,13 @@ impl FlatWriter {
             tracks: tracks.iter().map(|s| Track { spec: s.clone(), samples: Vec::new(), chunks: Vec::new(), edit: None }).collect(),
             last_track: None,
             created: created_unix_s + MP4_EPOCH_OFFSET,
+            movie_padding: 0,
         })
+    }
+
+    /// Keep the fast-start layout when appending an editor presentation edit.
+    pub(crate) fn reserve_presentation_edit_space(&mut self) {
+        self.movie_padding = 1024;
     }
 
     /// Index of the track with this id.
@@ -101,14 +108,19 @@ impl FlatWriter {
         // moov size doesn't depend on the chunk offsets' values, only on
         // whether they need 64 bits: build once to measure, once for real.
         let probe = build_moov(&self.tracks, self.created, 0, false);
-        let mut base = ftyp_len + probe.len() as u64 + meta_len + mdat_hdr;
+        let mut base = ftyp_len + probe.len() as u64 + meta_len + self.movie_padding + mdat_hdr;
         let co64 = base + self.data_len > u32::MAX as u64;
         if co64 {
             let probe = build_moov(&self.tracks, self.created, 0, true);
-            base = ftyp_len + probe.len() as u64 + meta_len + mdat_hdr;
+            base = ftyp_len + probe.len() as u64 + meta_len + self.movie_padding + mdat_hdr;
         }
         let moov = build_moov(&self.tracks, self.created, base, co64);
         head.bytes(&moov.0);
+        if self.movie_padding != 0 {
+            let free = head.begin(b"free");
+            head.zeros(self.movie_padding as usize - 8);
+            head.end(free);
+        }
         if let Some(m) = meta {
             write_meta_box(&mut head, m);
         }

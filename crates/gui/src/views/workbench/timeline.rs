@@ -78,45 +78,61 @@ impl Workbench {
             .corner_radius(7).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                 let width = ui.available_width();
                 ui.set_min_width(width);
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("Timeline");
-                    if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() { self.undo(ui.ctx()); }
-                    if ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo")).on_hover_text("Ctrl+Shift+Z").clicked() { self.redo(ui.ctx()); }
-                    let selected = self.selected.is_some();
-                    if ui.add_enabled(selected, egui::Button::new("Split")).on_hover_text("S · split selected item at playhead").clicked() { self.split(ui.ctx()); }
-                    if ui.add_enabled(selected, egui::Button::new("Duplicate")).clicked() { self.duplicate(ui.ctx()); }
-                    if ui.add_enabled(selected, egui::Button::new("Remove")).on_hover_text("Delete").clicked() { self.remove_selection(ui.ctx()); }
-                    if ui.button("+ Title").clicked() { self.start_generator(Generated::Title); }
-                    if ui.button("+ Color").clicked() { self.start_generator(Generated::Color); }
-                    let shots = &self.history.project.shots;
-                    let earlier = matches!(self.selected, Some(Selection::Shot(id)) if shots.first().is_some_and(|shot| shot.id != id));
-                    let later = matches!(self.selected, Some(Selection::Shot(id)) if shots.last().is_some_and(|shot| shot.id != id));
-                    if ui.add_enabled(earlier, egui::Button::new("Move Earlier")).clicked() { self.move_selected(-1, ui.ctx()); }
-                    if ui.add_enabled(later, egui::Button::new("Move Later")).clicked() { self.move_selected(1, ui.ctx()); }
-                });
-
+                let short = ui.ctx().viewport_rect().height() < 590.0 && width < 600.0;
                 let duration = self.history.project.duration();
                 let domain = duration.max(2 * TICKS_PER_SECOND);
-                ui.horizontal_wrapped(|ui| {
-                    let mut seek = seconds(self.playhead);
-                    if super::inspector::time_field(ui, "Playhead", &mut seek, seconds(duration)).changed() {
-                        self.seek(ticks(seek), ui.ctx());
-                    }
-                    self.item_picker(ui);
-                    if ui.button("Fit").on_hover_text("Fit the full timeline").clicked() { self.timeline.window = None; }
-                    for (title, factor) in [("Zoom Out", 1.6), ("Zoom In", 0.625)] {
-                        let button = ui.button(if factor > 1.0 { "−" } else { "+" });
-                        button.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, title));
-                        if button.on_hover_text(title).clicked() { self.zoom(domain, factor, self.playhead, 0.5); }
-                    }
-                    ui.menu_button("Pan", |ui| {
-                        if ui.button("Pan Left").clicked() { self.pan(domain, -0.3); ui.close(); }
-                        if ui.button("Pan Right").clicked() { self.pan(domain, 0.3); ui.close(); }
+                if short {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.menu_button("Edit", |ui| self.edit_actions(ui));
+                        ui.menu_button("View", |ui| self.navigation_actions(ui, domain, true));
+                        self.item_picker(ui);
                     });
-                });
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("Timeline");
+                        self.edit_actions(ui);
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let mut seek = seconds(self.playhead);
+                        if super::inspector::time_field(ui, "Playhead", &mut seek, seconds(duration)).changed() {
+                            self.seek(ticks(seek), ui.ctx());
+                        }
+                        self.item_picker(ui);
+                        self.navigation_actions(ui, domain, false);
+                    });
+                }
                 ui.add_space(5.0);
                 self.board(ui, domain, accent);
             });
+    }
+
+    fn edit_actions(&mut self, ui: &mut Ui) {
+        if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() { self.undo(ui.ctx()); }
+        if ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo")).on_hover_text("Ctrl+Shift+Z").clicked() { self.redo(ui.ctx()); }
+        let selected = self.selected.is_some();
+        if ui.add_enabled(selected, egui::Button::new("Split")).on_hover_text("S · split selected item at playhead").clicked() { self.split(ui.ctx()); }
+        if ui.add_enabled(selected, egui::Button::new("Duplicate")).clicked() { self.duplicate(ui.ctx()); }
+        if ui.add_enabled(selected, egui::Button::new("Remove")).on_hover_text("Delete").clicked() { self.remove_selection(ui.ctx()); }
+        if ui.button("+ Title").clicked() { self.start_generator(Generated::Title); }
+        if ui.button("+ Color").clicked() { self.start_generator(Generated::Color); }
+        let shots = &self.history.project.shots;
+        let earlier = matches!(self.selected, Some(Selection::Shot(id)) if shots.first().is_some_and(|shot| shot.id != id));
+        let later = matches!(self.selected, Some(Selection::Shot(id)) if shots.last().is_some_and(|shot| shot.id != id));
+        if ui.add_enabled(earlier, egui::Button::new("Move Earlier")).clicked() { self.move_selected(-1, ui.ctx()); }
+        if ui.add_enabled(later, egui::Button::new("Move Later")).clicked() { self.move_selected(1, ui.ctx()); }
+    }
+
+    fn navigation_actions(&mut self, ui: &mut Ui, domain: u64, menu: bool) {
+        if ui.button("Fit").on_hover_text("Fit the full timeline").clicked() { self.timeline.window = None; }
+        for (title, factor) in [("Zoom Out", 1.6), ("Zoom In", 0.625)] {
+            let button = ui.button(if menu { title } else if factor > 1.0 { "−" } else { "+" });
+            button.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, title));
+            if button.on_hover_text(title).clicked() { self.zoom(domain, factor, self.playhead, 0.5); }
+        }
+        ui.menu_button("Pan", |ui| {
+            if ui.button("Pan Left").clicked() { self.pan(domain, -0.3); ui.close(); }
+            if ui.button("Pan Right").clicked() { self.pan(domain, 0.3); ui.close(); }
+        });
     }
 
     fn item_picker(&mut self, ui: &mut Ui) {
@@ -348,7 +364,7 @@ impl Workbench {
 
     pub(super) fn split(&mut self, ctx: &egui::Context) {
         let Some(selection) = self.selected else { return; };
-        let at = self.snap(self.playhead);
+        let at = match selection { Selection::Shot(_) => self.snap(self.playhead), Selection::Sound(_) => self.playhead };
         if let Some(id) = self.change(ctx, |project| project.split(selection.id(), at)) {
             self.selected = Some(match selection { Selection::Shot(_) => Selection::Shot(id), Selection::Sound(_) => Selection::Sound(id) });
         }

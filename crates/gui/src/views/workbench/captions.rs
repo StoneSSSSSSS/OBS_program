@@ -1,6 +1,6 @@
 use super::{clock, seconds, ticks, Workbench};
 use crate::qa_driver;
-use cv_core::editor::{Id, Span};
+use cv_core::editor::{CaptionPosition, Id, Span};
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -25,7 +25,7 @@ impl Captions {
     }
 }
 
-enum Action { Apply, Remove, Import(PathBuf), Export(PathBuf), Go(u64) }
+enum Action { Apply, Remove, Import(PathBuf), Export(PathBuf), Go(u64), Position(CaptionPosition) }
 
 impl Workbench {
     pub(super) fn caption_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -58,6 +58,13 @@ impl Workbench {
                             .set_file_name("Subtitles.srt").add_filter("SubRip subtitles", &["srt"]).save_file()) { action = Some(Action::Export(path)); }
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Caption position");
+                    for (position, label) in [(CaptionPosition::Bottom, "Bottom"), (CaptionPosition::Top, "Top")] {
+                        if ui.selectable_label(project.caption_position == position, label).clicked()
+                            && position != project.caption_position { action = Some(Action::Position(position)); }
+                    }
+                });
                 if !project.captions.is_empty() {
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical().id_salt("editor-caption-list").max_height(130.0).show(ui, |ui| {
@@ -81,9 +88,9 @@ impl Workbench {
                 ui.add(egui::TextEdit::multiline(&mut state.text).desired_width(f32::INFINITY).desired_rows(2));
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Start");
-                    ui.add(egui::DragValue::new(&mut state.start).range(0.0..=i64::MAX as f64 / 1e7).speed(0.04).max_decimals(3).suffix(" s"));
+                    ui.add(egui::DragValue::new(&mut state.start).range(0.0..=i64::MAX as f64 / 1e7).speed(0.04).max_decimals(3).suffix(" s").custom_parser(super::parse_time)).on_hover_text("Click to type. Ctrl+A selects the whole time.");
                     ui.label("End");
-                    ui.add(egui::DragValue::new(&mut state.end).range(0.0..=i64::MAX as f64 / 1e7).speed(0.04).max_decimals(3).suffix(" s"));
+                    ui.add(egui::DragValue::new(&mut state.end).range(0.0..=i64::MAX as f64 / 1e7).speed(0.04).max_decimals(3).suffix(" s").custom_parser(super::parse_time)).on_hover_text("Click to type. Ctrl+A selects the whole time.");
                 });
                 let valid = !state.text.trim().is_empty() && ticks(state.end) > ticks(state.start);
                 ui.horizontal_wrapped(|ui| {
@@ -127,6 +134,7 @@ impl Workbench {
                 Err(error) => state.message = format!("{error:#}"),
             },
             Some(Action::Go(tick)) => self.seek(tick, ctx),
+            Some(Action::Position(position)) => { self.change(ctx, |p| { p.caption_position = position; Ok(()) }); }
             None => {}
         }
         self.captions = state;

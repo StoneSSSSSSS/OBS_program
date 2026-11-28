@@ -16,6 +16,7 @@
 pub mod flat;
 pub mod frag;
 pub mod reader;
+pub(crate) mod presentation;
 
 /// Payloads of `free` boxes that start with these bytes are ClipVault metadata.
 pub const META_MAGIC: &[u8; 8] = b"CVMETA1\0";

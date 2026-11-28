@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 mod captions;
 mod storage;
-pub use captions::{Caption, CaptionRun};
+pub use captions::{Caption, CaptionPosition, CaptionRun};
 #[cfg(test)]
 mod tests;
 
@@ -74,11 +74,27 @@ pub enum Rotation {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Framing {
+    #[default]
+    Fit,
+    /// Each percentage moves the crop from one edge to the other in the oriented picture.
+    Fill { horizontal: u8, vertical: u8 },
+}
+
+impl Framing {
+    fn is_fit(&self) -> bool {
+        *self == Self::Fit
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VisualTransform {
     pub rotation: Rotation,
     /// Horizontal reflection in the rotated picture's coordinates.
     pub mirror: bool,
+    #[serde(skip_serializing_if = "Framing::is_fit")]
+    pub framing: Framing,
 }
 
 impl VisualTransform {
@@ -165,6 +181,8 @@ pub struct Project {
     pub sounds: Vec<Sound>,
     #[serde(default)]
     pub captions: Vec<Caption>,
+    #[serde(default)]
+    pub caption_position: CaptionPosition,
 }
 
 impl Default for Project {
@@ -172,7 +190,7 @@ impl Default for Project {
         Self {
             format: "clipvault-editor".into(), version: 1, next_id: 1, name: "Untitled".into(),
             canvas: Canvas { width: 1280, height: 720, fps: 30 },
-            assets: Vec::new(), shots: Vec::new(), sounds: Vec::new(), captions: Vec::new(),
+            assets: Vec::new(), shots: Vec::new(), sounds: Vec::new(), captions: Vec::new(), caption_position: CaptionPosition::default(),
         }
     }
 }
@@ -373,7 +391,10 @@ impl Project {
                 Source::Color(_) => i64::MAX as u64,
             };
             ensure!(matches!(shot.source, Source::Asset(_)) || shot.visual_transform.is_identity(),
-                "Rotation and mirroring require an imported video or picture.");
+                "Picture transforms require an imported video or picture.");
+            if let Framing::Fill { horizontal, vertical } = shot.visual_transform.framing {
+                ensure!(horizontal <= 100 && vertical <= 100, "Choose crop positions between 0% and 100%.");
+            }
             shot.range.check(limit)?;
             check_gain(shot.gain)?;
             if let Some(fade) = shot.audio_fade { fade.validate()?; }

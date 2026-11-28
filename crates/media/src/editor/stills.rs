@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use cv_core::editor::{AssetInfo, AssetKind, Canvas, VisualTransform};
+use cv_core::editor::{AssetInfo, AssetKind, Canvas, Framing, VisualTransform};
 use image::{imageops, Rgba, RgbaImage};
 use std::{fs::File, io::{BufWriter, Write}, path::Path};
 use windows::{
@@ -43,6 +43,18 @@ pub(super) fn decode(file: &StorageFile, canvas: Canvas, orientation: VisualTran
     let image = RgbaImage::from_raw(width, height, data.to_vec()).context("Invalid decoded image dimensions")?;
     let image = super::visual_transforms::image(image, orientation);
     let (width, height) = image.dimensions();
+    if let Framing::Fill { horizontal, vertical } = orientation.framing {
+        let crop = super::visual_transforms::fill_rect((width, height), canvas, (horizontal, vertical), 1.0);
+        let left = (crop.X.round() as u32).min(width - 1);
+        let top = (crop.Y.round() as u32).min(height - 1);
+        let right = ((crop.X + crop.Width).round() as u32).clamp(left + 1, width);
+        let bottom = ((crop.Y + crop.Height).round() as u32).clamp(top + 1, height);
+        let cropped = imageops::crop_imm(&image, left, top, right - left, bottom - top).to_image();
+        let fitted = imageops::resize(&cropped, canvas.width, canvas.height, imageops::FilterType::Triangle);
+        let mut frame = solid(canvas, [0, 0, 0]);
+        imageops::overlay(&mut frame, &fitted, 0, 0);
+        return Ok(frame);
+    }
     let scale = (canvas.width as f64 / width as f64).min(canvas.height as f64 / height as f64);
     let target = (
         (width as f64 * scale).round().max(1.0) as u32,

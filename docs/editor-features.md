@@ -13,6 +13,6 @@ Open **Editor → Workbench** to assemble footage. Open **Editor → Wiki** for 
 | 7 | Revise safely | Undo and redo picture or audio edits, save a named revision and reopen it. Saving a project keeps edit decisions separate from source media. |
 | 8 | Work on a long timeline | Zoom around the playhead, pan, fit the full sequence and navigate directly by time or item. |
 | 9 | Add readable text | Insert and edit title and color cards. Add timed captions, import or export SubRip subtitles, and burn the timed captions into the finished video. |
-| 10 | Correct orientation | Rotate videos or stills by quarter turns and mirror the result horizontally. Preview the orientation before exporting. |
+| 10 | Reframe pictures | Rotate or mirror a video or still. Use Fit for the whole picture or Fill to cover the canvas, then move the crop toward the subject. Each shot keeps its own settings. |
 
 The editing challenges cover different outcomes, from removing one numbered frame to handing a portable revision to a second editor. [Independent editing challenges](editor-challenges.md)
