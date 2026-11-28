@@ -8,6 +8,7 @@
 pub mod audio_names;
 pub mod config;
 pub mod db;
+pub mod editor;
 pub mod filenames;
 pub mod games;
 pub mod hotkey;
