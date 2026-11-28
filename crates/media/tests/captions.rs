@@ -95,3 +95,40 @@ fn scrub_before_and_during_a_credit_after_the_last_picture() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires the synthetic numbered source and native Windows encoders"]
+fn a_single_frame_credit_switches_on_the_requested_presentation_frame() -> Result<()> {
+    let kit = PathBuf::from(std::env::var_os("CLIPVAULT_EDITOR_TEST_FIXTURES").context("choose the synthetic editor kit")?);
+    let path = kit.join("inputs").join("Frame counter.mp4");
+    let base = PathBuf::from(std::env::var_os("CLIPVAULT_DATA_DIR").context("choose a test profile")?);
+    let temp = tempfile::Builder::new().prefix("cue-splice-").tempdir_in(&base)?;
+    let mut failures = Vec::new();
+    for fps in [24, 30, 60] {
+        let mut project = Project::default();
+        project.canvas = Canvas { width: 640, height: 360, fps };
+        project.caption_position = CaptionPosition::Top;
+        let asset = project.import(path.clone(), probe(&path)?)?;
+        project.append(asset)?;
+        let splice = 55 * S / 10;
+        let end = splice + 15 * S / 1000;
+        project.caption("I".into(), Span { start: 4 * S, end: splice })?;
+        project.caption("WIDE OPEN SCREENING CREDIT".into(), Span { start: splice, end })?;
+        project.caption("I".into(), Span { start: end, end: 6 * S })?;
+        let movie = temp.path().join(format!("credit-{fps}.mp4"));
+        render(&project, &movie, &RenderControl::default())?;
+        let reader = Mp4Reader::open(&movie)?;
+        let video = reader.video().context("No exported video")?;
+        let half_frame = S / (2 * u64::from(fps));
+        for (sample_time, expected_wide) in [(splice - half_frame, false), (splice, true), (splice + 3 * half_frame, false)] {
+            let (frame, pts) = frame_at_time(&reader, video, sample_time as f64 / S as f64)?;
+            let image = nv12_to_rgb(&frame, 640);
+            let xs = (12..110).flat_map(|y| (0..640).filter(|&x| image.get_pixel(x, y)[0] > 150).collect::<Vec<_>>());
+            let bounds = xs.fold(None::<(u32, u32)>, |bounds, x| Some(bounds.map_or((x,x), |(l,r)| (l.min(x), r.max(x)))));
+            let width = bounds.map_or(0, |(left,right)| right-left+1);
+            if width == 0 || (width > 90) != expected_wide { failures.push((fps, sample_time, pts, width, expected_wide)); }
+        }
+    }
+    ensure!(failures.is_empty(), "Caption changes landed on the wrong published frame: {failures:?}");
+    Ok(())
+}

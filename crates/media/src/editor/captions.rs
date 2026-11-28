@@ -1,7 +1,7 @@
 //! Render the same caption card in the native export and the scrub preview.
 use super::{stills, title, RenderControl};
 use anyhow::Result;
-use cv_core::editor::{Canvas, CaptionPosition, Project};
+use cv_core::editor::{Canvas, CaptionPosition, Project, TICKS_PER_SECOND};
 use std::path::Path;
 use windows::Foundation::{Rect, TimeSpan};
 use windows::Media::Editing::{MediaComposition, MediaOverlay, MediaOverlayLayer};
@@ -54,19 +54,32 @@ pub(super) fn draw_at(frame: &mut image::RgbaImage, project: &Project, at: u64) 
     Ok(())
 }
 
+/// Position a WinRT overlay change between the last excluded output frame and the first
+/// included frame. The compositor can sample a few 100 ns ticks before a nominal PTS.
+fn overlay_boundary(tick: u64, fps: u32) -> u64 {
+    let rate = u128::from(fps);
+    let scale = u128::from(TICKS_PER_SECOND);
+    let first = (u128::from(tick) * rate).saturating_sub(rate / 2).div_ceil(scale);
+    if first == 0 { return 0; }
+    (((2 * first - 1) * scale) / (2 * rate)) as u64
+}
+
 pub(super) fn apply(composition: &MediaComposition, project: &Project, work: &Path, control: &RenderControl) -> Result<()> {
     if project.captions.is_empty() { return Ok(()); }
     let layer = MediaOverlayLayer::new()?;
     let overlays = layer.Overlays()?;
     for (i, run) in project.caption_runs().iter().enumerate() {
         control.check()?;
+        let start = overlay_boundary(run.range.start, project.canvas.fps);
+        let end = overlay_boundary(run.range.end, project.canvas.fps);
+        if end <= start { continue; } // No published frame falls in this cue.
         let (frame, x, y) = panel(project, &run.text)?;
         let area = Rect { X: x as f32, Y: y as f32, Width: frame.width() as f32, Height: frame.height() as f32 };
         // WinRT paints the overlay at its end timestamp as well as its start.
-        let duration = run.range.len().saturating_sub(1).max(1);
+        let duration = (end - start).saturating_sub(1).max(1);
         let clip = stills::clip(frame, TimeSpan { Duration: duration as i64 }, &work.join(format!("caption-{i}.jpg")))?;
         let overlay = MediaOverlay::CreateWithPositionAndOpacity(&clip, area, 1.0)?;
-        overlay.SetDelay(TimeSpan { Duration: run.range.start as i64 })?;
+        overlay.SetDelay(TimeSpan { Duration: start as i64 })?;
         overlays.Append(&overlay)?;
     }
     composition.OverlayLayers()?.Append(&layer)?;
