@@ -18,6 +18,11 @@ pub fn init() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
+    startup();
+}
+
+/// Start Media Foundation on a thread with COM already initialized.
+pub(crate) fn startup() {
     STARTUP.call_once(|| unsafe {
         if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_LITE) {
             tracing::error!("Media Foundation failed to start: {e}");

@@ -11,6 +11,7 @@ pub mod capture;
 pub mod clock;
 pub mod cut;
 pub mod d3d;
+pub mod editor;
 pub mod export;
 pub mod h264;
 pub mod mf;

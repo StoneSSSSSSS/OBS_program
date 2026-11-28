@@ -22,12 +22,22 @@ parking_lot.workspace = true
 image.workspace = true
 once_cell.workspace = true
 windows-core = "0.58"
+tempfile.workspace = true
 
 [dependencies.windows]
 workspace = true
 features = [
     "implement",
     "Foundation",
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Editing",
+    "Media_Effects",
+    "Media_MediaProperties",
+    "Media_Transcoding",
+    "Storage",
+    "Storage_Streams",
+    "Win32_Storage_FileSystem",
     "Graphics",
     "Graphics_Capture",
     "Graphics_DirectX",
@@ -63,6 +73,3 @@ features = [
 
 [features]
 qa-window = []
-
-[dev-dependencies]
-tempfile.workspace = true
