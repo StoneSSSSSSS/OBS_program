@@ -4,7 +4,7 @@
 
 mod app;
 mod lanes;
-mod mpv;
+mod native_player;
 mod player;
 mod service;
 mod theme;

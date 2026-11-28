@@ -3,12 +3,13 @@
 //! with non-destructive region edits, live playback and clip-from-range.
 
 use crate::app::Ctx;
-use crate::lanes::{self, LaneAction, LaneState, WaveSource, GUTTER};
+use crate::lanes::{self, LaneAction, LaneState, PreviewProgress, RangePreview, WaveSource, GUTTER};
 use crate::theme::{self, icon};
 use chrono::{Local, TimeZone};
-use cv_core::ipc::Request;
-use cv_core::model::{apply_edit, ActivitySpan, AudioEdit, Category, Clip, Game, Marker, Recording};
-use cv_core::timeline::{locate, Segment};
+use cv_core::ipc::{ExportSource, Request};
+use cv_core::mixer::MixSettings;
+use cv_core::model::{apply_edit, rebase_edits, ActivitySpan, AudioEdit, Category, Clip, Game, Marker, Recording};
+use cv_core::timeline::{locate, plan_cut, plan_duration_s, Segment};
 use cv_core::util::{format_duration, human_bytes, now_ms};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::path::PathBuf;
@@ -62,7 +63,8 @@ struct CutDialog {
     title: String,
     game_id: Option<i64>,
     cats: Vec<i64>,
-    precise: bool,
+    game_search: String,
+    target_size_mb: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -97,9 +99,24 @@ pub struct RecordingsView {
     /// Non-destructive edits on the 24/7 timeline (wall-clock seconds).
     edits: Vec<AudioEdit>,
     edits_dirty: Option<Instant>,
+    edit_history: lanes::EditHistory,
+    mix: Option<MixSettings>,
+    mix_dirty: Option<Instant>,
+    preview: Option<RangePreview>,
+    hold_at_eof: bool,
+    written_live: Option<(String, i64)>,
+    session_search: String,
+    footage_search: String,
+    marker_search: String,
+    share_mb: u32,
+    waveform_media: std::collections::HashMap<String, (Instant, Option<cv_media::probe::MediaInfo>)>,
     lane_state: LaneState,
     /// Playhead when the player was last showing our file.
     resume_ms: Option<i64>,
+}
+
+fn timeline_mix_file() -> PathBuf {
+    cv_core::paths::data_dir().join("timeline_mix.json")
 }
 
 fn edits_file() -> PathBuf {
@@ -112,6 +129,10 @@ impl RecordingsView {
     }
 
     fn refresh(&mut self, c: &mut Ctx) {
+        self.written_live = c.service.status().and_then(|s| {
+            (s.recording.active && s.recording.written_until_ms > 0)
+                .then_some((s.recording.path, s.recording.written_until_ms))
+        });
         let stale = self.loaded.map(|t| t.elapsed() > Duration::from_secs(10)).unwrap_or(true);
         if !(self.dirty || stale) {
             return;
@@ -132,31 +153,34 @@ impl RecordingsView {
         self.dirty = false;
     }
 
-    fn seg_end(r: &Recording) -> i64 {
+    fn seg_end(&self, r: &Recording) -> i64 {
         if r.is_live() {
-            now_ms()
-        } else {
-            r.start_ms + (r.duration.max(0.0) * 1000.0) as i64
+            if let Some((_, end)) = self.written_live.as_ref().filter(|(path, _)| path == &r.path) {
+                return (*end).max(r.start_ms);
+            }
         }
+        r.start_ms + (r.duration.max(0.0) * 1000.0) as i64
     }
 
     fn extent(&self) -> (i64, i64) {
         let start = self.recs.iter().map(|r| r.start_ms).min().unwrap_or(now_ms() - 6 * HOUR);
-        let end = self.recs.iter().map(Self::seg_end).max().unwrap_or(now_ms()).max(now_ms());
+        let end = self.recs.iter().map(|r| self.seg_end(r)).max().unwrap_or(now_ms()).max(now_ms());
         (start, end)
     }
 
     fn segments(&self) -> Vec<Segment> {
         self.recs
             .iter()
-            .map(|r| Segment { path: PathBuf::from(&r.path), start_ms: r.start_ms, duration_ms: Self::seg_end(r) - r.start_ms, live: r.is_live() })
+            .map(|r| Segment { path: PathBuf::from(&r.path), start_ms: r.start_ms, duration_ms: self.seg_end(r) - r.start_ms, live: r.is_live() })
             .collect()
     }
 
     fn playhead(&self, c: &Ctx) -> Option<i64> {
         let i = self.cur?;
         let r = self.recs.get(i)?;
-        Some(r.start_ms + (c.player.state().time_pos * 1000.0) as i64)
+        let state = c.player.state();
+        (state.loaded && c.player.path.as_deref() == Some(r.path.as_str()))
+            .then(|| r.start_ms + (state.time_pos * 1000.0) as i64)
     }
 
     fn tracks_for(&self, c: &Ctx, r: &Recording) -> usize {
@@ -173,12 +197,8 @@ impl RecordingsView {
     fn segment_edits(&self) -> Vec<AudioEdit> {
         let Some(r) = self.cur.and_then(|i| self.recs.get(i)) else { return Vec::new() };
         let s0 = r.start_ms as f64 / 1000.0;
-        let s1 = Self::seg_end(r) as f64 / 1000.0 + 3600.0; // live files keep growing
-        self.edits
-            .iter()
-            .filter(|e| e.overlaps(s0, s1))
-            .map(|e| AudioEdit { track: e.track, start: e.start - s0, end: e.end - s0, gain: e.gain })
-            .collect()
+        let s1 = if r.is_live() { f64::INFINITY } else { self.seg_end(r) as f64 / 1000.0 };
+        rebase_edits(&self.edits, s0, s1)
     }
 
     /// Start playing at wall-clock time `t`.
@@ -189,30 +209,31 @@ impl RecordingsView {
             return;
         };
         let rec = self.recs[loc.index].clone();
+        if self.seg_end(&rec) <= rec.start_ms {
+            c.toast("info", "The recorder has not written playable footage yet");
+            return;
+        }
+        self.hold_at_eof = false;
         let offset = loc.offset_ms as f64 / 1000.0;
         let same = self.cur == Some(loc.index) && c.player.path.as_deref() == Some(rec.path.as_str()) && c.player.state().loaded;
-        let mpv_dur = c.player.state().duration;
+        let loaded_duration = c.player.state().duration;
         self.cur = Some(loc.index);
         self.cur_path = Some(rec.path.clone());
-        if same && !(rec.is_live() && offset > mpv_dur - 1.0) {
+        if same && !(rec.is_live() && offset > loaded_duration - 1.0) {
             c.player.seek(offset, true);
-            if autoplay {
-                if let Some(m) = &c.player.mpv {
-                    m.set_pause(false);
-                }
-            }
+            c.player.set_paused(!autoplay);
         } else {
             let tracks = self.tracks_for(c, &rec);
-            c.player.edits = self.segment_edits();
-            c.player.path = None; // force reload (live files need a fresh duration)
-            c.player.open(&rec.path, offset, tracks, &[], None, rec.is_live(), autoplay, &c.cfg.player);
+            c.player.open(&rec.path, offset, tracks, &[], self.mix.as_ref(), rec.is_live(), autoplay, &c.cfg.player);
+            c.player.set_edits(self.segment_edits());
+            c.player.set_loop(false);
         }
     }
 
     /// Fast seek while dragging the playhead.
     fn scrub_to(&mut self, c: &mut Ctx, t: i64) {
         let segs = self.segments();
-        let Some(loc) = locate(&segs, t.min(now_ms() - 2000)) else { return };
+        let Some(loc) = locate(&segs, t) else { return };
         let throttle = self.last_scrub.map(|i| i.elapsed() < Duration::from_millis(45)).unwrap_or(false);
         if self.cur == Some(loc.index) && c.player.state().loaded {
             if !throttle {
@@ -227,31 +248,112 @@ impl RecordingsView {
 
     fn go_live(&mut self, c: &mut Ctx) {
         self.refresh(c);
-        let t = now_ms() - c.cfg.player.live_offset_secs as i64 * 1000;
+        let Some(rec) = self.recs.iter().rev().find(|r| r.is_live() && self.seg_end(r) > r.start_ms) else {
+            c.toast("info", "No live footage is ready");
+            return;
+        };
+        let offset = i64::from(c.cfg.player.live_offset_secs) * 1000;
+        let t = (now_ms() - offset).min(self.seg_end(rec) - 1).max(rec.start_ms);
         self.follow_live = true;
         self.view_end = now_ms() + self.view_span / 20;
         self.play_at(c, t, true);
     }
 
     fn load_edits(&mut self) {
+        self.mix = std::fs::read(timeline_mix_file()).ok()
+            .and_then(|data| serde_json::from_slice(&data).ok());
         if let Ok(text) = std::fs::read_to_string(edits_file()) {
             self.edits = serde_json::from_str(&text).unwrap_or_default();
         }
     }
 
     fn save_edits_if_due(&mut self) {
-        if let Some(t) = self.edits_dirty {
-            if t.elapsed() > Duration::from_millis(800) {
-                // Forget edits for footage that no longer exists.
-                if let Some(oldest) = self.recs.iter().map(|r| r.start_ms).min() {
-                    let cutoff = oldest as f64 / 1000.0;
-                    self.edits.retain(|e| e.end > cutoff);
-                }
-                if let Ok(s) = serde_json::to_string(&self.edits) {
-                    let _ = cv_core::util::write_atomic(&edits_file(), s.as_bytes());
-                }
-                self.edits_dirty = None;
+        let due = [self.edits_dirty, self.mix_dirty].into_iter().flatten()
+            .any(|changed| changed.elapsed() >= Duration::from_millis(800));
+        if due {
+            // Forget edits for footage that no longer exists.
+            if let Some(oldest) = self.recs.iter().map(|r| r.start_ms).min() {
+                let cutoff = oldest as f64 / 1000.0;
+                self.edits.retain(|e| e.end > cutoff);
             }
+            self.flush_edits();
+        }
+    }
+
+    pub fn flush_edits(&mut self) {
+        if self.edits_dirty.is_some() {
+            if let Ok(data) = serde_json::to_vec(&self.edits) {
+                if cv_core::util::write_atomic(&edits_file(), &data).is_ok() {
+                    self.edits_dirty = None;
+                }
+            }
+        }
+        if let Some(mix) = self.mix.as_ref().filter(|_| self.mix_dirty.is_some()) {
+            if let Ok(data) = serde_json::to_vec(mix) {
+                if cv_core::util::write_atomic(&timeline_mix_file(), &data).is_ok() {
+                    self.mix_dirty = None;
+                }
+            }
+        }
+    }
+
+    pub fn leave(&mut self, c: &mut Ctx) {
+        self.stop_preview(c);
+        self.flush_edits();
+    }
+
+    fn selection(&self) -> Option<(i64, i64)> {
+        let (a, b) = (self.in_ms?, self.out_ms?);
+        let (from, to) = (a.min(b), a.max(b));
+        let start = self.recs.iter()
+            .filter(|r| self.seg_end(r) > from && r.start_ms < to)
+            .map(|r| r.start_ms.max(from)).min()?;
+        let end = self.recs.iter()
+            .filter(|r| self.seg_end(r) > from && r.start_ms < to)
+            .map(|r| self.seg_end(r).min(to)).max()?;
+        let segments = self.segments();
+        let parts = plan_cut(&segments, start, end);
+        (plan_duration_s(&parts, &segments) > 0.1).then_some((start, end))
+    }
+
+    fn stop_preview(&mut self, c: &mut Ctx) {
+        if self.preview.take().is_some() {
+            self.hold_at_eof = true;
+            c.player.set_paused(true);
+        }
+    }
+
+    fn set_start(&mut self, at: i64) {
+        self.in_ms = Some(self.out_ms.map_or(at, |end| at.min(end.saturating_sub(101))));
+    }
+
+    fn set_end(&mut self, at: i64) {
+        self.out_ms = Some(self.in_ms.map_or(at, |start| at.max(start.saturating_add(101))));
+    }
+
+    fn frame_recording(&mut self, at:i64) {
+        if let Some(r)=self.recs.iter().find(|r|r.start_ms<=at && self.seg_end(r)>at) {
+            let duration=self.seg_end(r)-r.start_ms;
+            self.view_span=(duration+duration/8).clamp(MIN,6*HOUR);
+            self.view_end=at+self.view_span/2;
+            self.follow_live=false;
+        }
+    }
+
+    fn export_selection(&mut self, c: &mut Ctx, target_size_mb: Option<u32>, title: String) {
+        let Some((from_ms, to_ms)) = self.selection() else { return };
+        let edits = self.edits.iter()
+            .filter(|edit| edit.overlaps(from_ms as f64 / 1000.0, to_ms as f64 / 1000.0))
+            .cloned().collect();
+        if c.request(Request::Export {
+            source: ExportSource::Recording { from_ms, to_ms },
+            range: None,
+            mix: self.mix.clone().unwrap_or_else(|| c.player.mix.clone()),
+            edits: Some(edits),
+            target_size_mb,
+            title,
+        }).is_some() {
+            c.toast("info", "Exporting selection…");
         }
     }
 
@@ -263,12 +365,16 @@ impl RecordingsView {
             self.follow_live = true;
             self.dirty = true;
             self.load_edits();
+            self.share_mb = c.cfg.export.target_size_mb;
             if c.player.track_count == 0 {
                 c.player.show_mixer = true;
             }
         }
         self.refresh(c);
         self.save_edits_if_due();
+        if self.edits_dirty.is_some() || self.mix_dirty.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
         // The player is shared with the clip view: take it back if needed.
         if let Some(p) = self.cur_path.clone() {
             if c.player.path.as_deref() == Some(p.as_str()) {
@@ -281,19 +387,46 @@ impl RecordingsView {
             }
         }
         if GO_LIVE.swap(false, Ordering::SeqCst) {
+            self.stop_preview(c);
             self.go_live(c);
         }
         let jump = PLAY_AT.swap(0, Ordering::SeqCst);
         if jump != 0 {
+            self.stop_preview(c);
             self.refresh(c);
             self.follow_live = false;
-            self.view_end = jump + self.view_span / 2;
+            self.frame_recording(jump);
             self.play_at(c, jump, true);
         }
-        // Auto-advance to the next file at the end of a segment.
+        if self.cur.is_none() && jump==0 {
+            if let Some(start)=self.recs.iter().rev().find(|r|self.seg_end(r)>r.start_ms).map(|r|r.start_ms){
+                self.frame_recording(start);
+                self.play_at(c,start,false);
+            }
+        }
         let st = c.player.state();
-        if let Some(i) = self.cur {
-            if st.eof && st.loaded && i + 1 < self.recs.len() && c.player.path.is_some() && self.drag_mode.is_none() {
+        let playhead = self.playhead(c).map(|at| at as f64 / 1000.0);
+        if let Some(preview) = &mut self.preview {
+            match preview.progress(playhead, st.paused, st.eof) {
+                PreviewProgress::Playing => ui.ctx().request_repaint_after(Duration::from_millis(30)),
+                PreviewProgress::Finished => self.stop_preview(c),
+                PreviewProgress::EndOfFile => {
+                    let end = preview.end;
+                    let next = self.cur.and_then(|i| self.recs.get(i + 1))
+                        .map(|r| r.start_ms).filter(|next| (*next as f64 / 1000.0) < end);
+                    if let Some(next) = next {
+                        self.play_at(c, next, true);
+                        self.preview = Some(RangePreview::new(next as f64 / 1000.0, end));
+                    } else {
+                        self.stop_preview(c);
+                    }
+                }
+            }
+        } else if let Some(i) = self.cur {
+            if !st.eof && !st.paused {
+                self.hold_at_eof = false;
+            }
+            if st.eof && st.loaded && !self.hold_at_eof && i + 1 < self.recs.len() && c.player.path.is_some() && self.drag_mode.is_none() {
                 let next = self.recs[i + 1].start_ms;
                 self.play_at(c, next, true);
             }
@@ -313,10 +446,12 @@ impl RecordingsView {
 
         let hits = c.player.shortcuts(ui, &c.cfg.player);
         if hits.mark_in {
-            self.in_ms = self.playhead(c);
+            self.stop_preview(c);
+            if let Some(at)=self.playhead(c){self.set_start(at);}
         }
         if hits.mark_out {
-            self.out_ms = self.playhead(c);
+            self.stop_preview(c);
+            if let Some(at)=self.playhead(c){self.set_end(at);}
         }
 
         let fullscreen = c.player.fullscreen;
@@ -340,7 +475,22 @@ impl RecordingsView {
             ui.vertical_centered(|ui| {
                 ui.label(theme::icon_text(icon::HISTORY, 40.0).color(theme::TEXT_FAINT));
                 ui.label(theme::title("No recordings yet"));
-                ui.label(theme::label_dim("Once OBS is recording, everything shows up here."));
+                let replay_only = c.cfg.recording.rolling_seconds().is_some();
+                if replay_only {
+                    ui.label(theme::label_dim("Replay only is on. Save a replay from Home, then open it in Clips."));
+                    if ui.button("Go to Home").clicked() {
+                        c.goto = Some(crate::app::Page::Home);
+                    }
+                } else if !c.service.connected() {
+                    ui.label(theme::label_dim("Waiting for ClipVault Service to connect. You can choose your recording settings now."));
+                } else if c.service.status().is_some_and(|s| s.recording.active) {
+                    ui.label(theme::label_dim("Recording has started. The first playable footage will appear here shortly."));
+                } else {
+                    ui.label(theme::label_dim("Turn on full-history recording to start a timeline."));
+                }
+                if ui.button("Open recording settings").clicked() {
+                    c.open_recording_settings = true;
+                }
             });
             return;
         }
@@ -373,10 +523,21 @@ impl RecordingsView {
     fn header(&mut self, ui: &mut Ui, c: &mut Ctx) {
         ui.horizontal(|ui| {
             ui.label(theme::heading("24/7 Recordings"));
-            let total: f64 = self.recs.iter().filter(|r| !r.kept).map(|r| (Self::seg_end(r) - r.start_ms) as f64 / 1000.0).sum();
-            ui.label(theme::label_dim(format!("{:.1} h stored · keeps {} h", total / 3600.0, c.cfg.recording.retention_hours)));
+            let total = self.recs.iter().filter(|r| !r.kept).fold(0.0, |seconds, r| {
+                seconds + (self.seg_end(r) - r.start_ms) as f64 / 1000.0
+            });
+            let stored = cv_core::util::format_span_short(total as i64);
+            let history = if c.cfg.recording.rolling_seconds().is_some() {
+                format!("{stored} archived · Replay only is on")
+            } else {
+                format!("{stored} stored · keeps {} h", c.cfg.recording.retention_hours)
+            };
+            ui.label(theme::label_dim(history));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::accent_button(ui, Some(icon::LIVE), "Go live", theme::LIVE).on_hover_text("Jump to what's being recorded right now").clicked() {
+                let live = self.written_live.is_some();
+                if ui.add_enabled_ui(live, |ui| theme::accent_button(ui, Some(icon::LIVE), "Go live", theme::LIVE))
+                    .inner.on_hover_text("Jump to the current recording").on_disabled_hover_text("Available while recording full history.").clicked() {
+                    self.stop_preview(c);
                     self.go_live(c);
                 }
                 ui.add_space(6.0);
@@ -463,7 +624,7 @@ impl RecordingsView {
 
         // Recording segments.
         for r in &self.recs {
-            let (a, b) = (r.start_ms, Self::seg_end(r));
+            let (a, b) = (r.start_ms, self.seg_end(r));
             if b < start || a > self.view_end {
                 continue;
             }
@@ -547,9 +708,8 @@ impl RecordingsView {
             self.drag_mode = Some(if on_ruler || secondary { DragMode::Pan } else { DragMode::Scrub });
             if self.drag_mode == Some(DragMode::Scrub) {
                 self.scrub_resume = !c.player.state().paused;
-                if let Some(m) = &c.player.mpv {
-                    m.set_pause(true);
-                }
+                self.stop_preview(c);
+                c.player.set_paused(true);
                 c.player.scrubbing = true;
                 self.follow_live = false;
             }
@@ -579,7 +739,7 @@ impl RecordingsView {
             if self.drag_mode == Some(DragMode::Scrub) {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let t = t_of(pos.x.clamp(rect.left(), rect.right()));
-                    self.play_at(c, t.min(now_ms() - 2000), self.scrub_resume);
+                    self.play_at(c, t, self.scrub_resume);
                 }
                 c.player.scrubbing = false;
             }
@@ -595,15 +755,17 @@ impl RecordingsView {
             if let Some(m) = self.markers.iter().find(|m| (x_of(m.at_ms) - pos.x).abs() < 6.0) {
                 tip.push_str(&format!("\nMarker{}", if m.label.is_empty() { String::new() } else { format!(": {}", m.label) }));
             }
-            if !self.recs.iter().any(|r| r.start_ms <= t && Self::seg_end(r) >= t) {
+            if !self.recs.iter().any(|r| r.start_ms <= t && self.seg_end(r) >= t) {
                 tip.push_str("\nNot recorded");
             }
             if self.drag_mode.is_none() {
                 egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::unique("tl_tip"), egui::PopupAnchor::Pointer).show(|ui| ui.label(tip));
             }
             let (dx, dy) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y));
-            if dx.abs() > 0.1 {
-                self.view_end -= (dx as f64 / px_per_ms) as i64;
+            let shift = ui.input(|i| i.modifiers.shift);
+            if dx.abs() > 0.1 || shift && dy.abs() > 0.1 {
+                let delta = if dx.abs() > 0.1 { dx } else { dy };
+                self.view_end -= (delta as f64 / px_per_ms) as i64;
                 self.follow_live = false;
             } else if dy.abs() > 0.1 {
                 let factor = (1.0 - dy as f64 * 0.0025).clamp(0.5, 2.0);
@@ -619,14 +781,15 @@ impl RecordingsView {
         }
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
+                self.stop_preview(c);
                 let t = t_of(pos.x);
                 if ui.input(|i| i.modifiers.shift) {
                     match (self.in_ms, self.out_ms) {
-                        (Some(a), _) if t > a => self.out_ms = Some(t),
-                        _ => self.in_ms = Some(t),
+                        (Some(a), _) if t > a => self.set_end(t),
+                        _ => self.set_start(t),
                     }
                 } else {
-                    self.play_at(c, t.min(now_ms() - 2000), true);
+                    self.play_at(c, t, true);
                 }
             }
         }
@@ -647,75 +810,151 @@ impl RecordingsView {
         });
         ui.horizontal(|ui| {
             ui.add_space(GUTTER + lanes::AXIS_INSET);
-            ui.label(theme::small("Drag to scrub · drag the time ruler to pan · scroll to zoom · Shift+scroll to pan · Shift+click or I / O to select"));
+            ui.label(theme::label_dim("Click to seek, then use Set start (I) and Set end (O). Scroll to zoom or drag the ruler to pan."));
         });
     }
 
     fn audio_lanes(&mut self, ui: &mut Ui, c: &mut Ctx) {
+        let bounds = self.extent();
+        self.waveform_media.retain(|path, _| self.recs.iter().any(|recording| recording.path == *path));
         let span = self.view_span.max(MIN);
         let t0 = (self.view_end - span) as f64 / 1000.0;
         let t1 = self.view_end as f64 / 1000.0;
         // Waveforms for every visible recording file.
-        let visible: Vec<(String, f64, f64)> = self
+        let visible: Vec<(String, f64, f64, bool)> = self
             .recs
             .iter()
-            .filter(|r| Self::seg_end(r) as f64 / 1000.0 > t0 && (r.start_ms as f64 / 1000.0) < t1)
-            .map(|r| (r.path.clone(), r.start_ms as f64 / 1000.0, Self::seg_end(r) as f64 / 1000.0))
+            .filter(|r| self.seg_end(r) as f64 / 1000.0 > t0 && (r.start_ms as f64 / 1000.0) < t1)
+            .map(|r| (r.path.clone(), r.start_ms as f64 / 1000.0, self.seg_end(r) as f64 / 1000.0, r.is_live()))
             .collect();
         let mut owned = Vec::new();
-        for (path, a, b) in &visible {
+        for (path, a, b, live) in &visible {
             if let Some(w) = c.waves.get(path) {
-                owned.push((w.clone(), *a, *b));
+                let refresh = self.waveform_media.get(path).is_none_or(|(checked, info)| {
+                    (*live || info.is_none()) && checked.elapsed() >= Duration::from_secs(10)
+                });
+                if refresh {
+                    let info = cv_media::probe::probe(std::path::Path::new(path)).ok();
+                    self.waveform_media.insert(path.clone(), (Instant::now(), info));
+                }
+                let tracks = self.waveform_media.get(path).and_then(|(_, info)| info.as_ref())
+                    .map(|info| lanes::waveform_tracks(info, b - a, &c.cfg.audio.app_categories));
+                owned.push((w, *a, *b, tracks));
             }
         }
-        let sources: Vec<WaveSource> = owned.iter().map(|(w, a, b)| WaveSource { start: *a, end: *b, wave: w }).collect();
+        let sources: Vec<WaveSource> = owned.iter().map(|(w, a, b, tracks)| {
+            WaveSource { start: *a, end: *b, wave: w, tracks: tracks.as_ref() }
+        }).collect();
         let playhead = self.playhead(c).map(|t| t as f64 / 1000.0);
-        let acts = lanes::lanes(ui, &mut c.player, t0, t1, true, &sources, &self.edits, playhead, &mut self.lane_state, c.accent);
+        let edit_bounds = (bounds.0 as f64 / 1000.0, bounds.1 as f64 / 1000.0);
+        let default_range = self.selection().or_else(|| {
+            self.cur.and_then(|i| self.recs.get(i)).map(|r| (r.start_ms, self.seg_end(r)))
+        }).map(|(start, end)| (start as f64 / 1000.0, end as f64 / 1000.0)).unwrap_or(edit_bounds);
+        let acts = lanes::lanes(ui, &mut c.player, t0, t1, true, &sources, &self.edits, playhead, &mut self.lane_state, c.accent, self.edit_history.can_undo(), None, edit_bounds, default_range);
+        let mut region_saved = false;
         for a in acts {
             match a {
-                LaneAction::Seek(t) => self.play_at(c, (t * 1000.0) as i64, !c.player.state().paused),
-                LaneAction::Edit { tracks, a, b, gain } => {
-                    for tr in &tracks {
-                        apply_edit(&mut self.edits, *tr, a, b, gain);
+                LaneAction::Seek(t) => {
+                    self.stop_preview(c);
+                    self.play_at(c, (t * 1000.0) as i64, !c.player.state().paused);
+                }
+                LaneAction::Edit { lanes, a, b, gain } => {
+                    if !region_saved {
+                        self.edit_history.save(&self.edits, c.player.mix.clone());
+                        region_saved = true;
                     }
-                    if tracks.iter().any(|t| *t > 0) && c.player.mode == crate::player::MixMode::Full && gain != 1.0 {
-                        c.player.set_mode(crate::player::MixMode::Separate);
-                        c.toast("info", "Switched to separate tracks so the edit is audible");
+                    for lane in &lanes {
+                        apply_edit(&mut self.edits, lane, a, b, gain);
+                    }
+                    if let Some(mode) = lanes::mode_for_edit(&lanes, gain).filter(|mode| *mode != c.player.mix.mode) {
+                        c.player.set_mode(mode);
+                        self.mix = Some(c.player.mix.clone());
+                        self.mix_dirty = Some(Instant::now());
                     }
                     self.edits_dirty = Some(Instant::now());
                     let e = self.segment_edits();
                     c.player.set_edits(e);
                 }
-                LaneAction::MixChanged => {}
+                LaneAction::MixChanged { previous } => {
+                    if let Some(previous) = previous {
+                        self.edit_history.save(&self.edits, previous);
+                    }
+                    self.mix = Some(c.player.mix.clone());
+                    self.mix_dirty = Some(Instant::now());
+                }
+                LaneAction::DisplayChanged => {}
+                LaneAction::Undo => {
+                    if let Some(snapshot) = self.edit_history.undo() {
+                        let now = Instant::now();
+                        if snapshot.mix != c.player.mix {
+                            self.mix = Some(snapshot.mix.clone());
+                            self.mix_dirty = Some(now);
+                        }
+                        if snapshot.edits != self.edits {
+                            self.edits_dirty = Some(now);
+                        }
+                        self.edits = snapshot.edits;
+                        c.player.restore_audio(snapshot.mix, self.segment_edits());
+                    }
+                }
             }
         }
     }
 
     fn cut_bar(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let ph = self.playhead(c);
             let fmt = |t: Option<i64>| t.and_then(|t| Local.timestamp_millis_opt(t).single()).map(|d| d.format("%H:%M:%S").to_string()).unwrap_or("—".into());
             ui.add_enabled_ui(ph.is_some(), |ui| {
-                if ui.button(format!("In {}", fmt(self.in_ms))).on_hover_text("Mark in at playhead (I)").clicked() {
-                    self.in_ms = ph;
+                if ui.button(format!("Set start  {}", fmt(self.in_ms))).on_hover_text("Use the current frame as the start (I)").clicked() {
+                    self.stop_preview(c);
+                    if let Some(at)=ph{self.set_start(at);}
                 }
-                if ui.button(format!("Out {}", fmt(self.out_ms))).on_hover_text("Mark out at playhead (O)").clicked() {
-                    self.out_ms = ph;
+                if ui.button(format!("Set end  {}", fmt(self.out_ms))).on_hover_text("Use the current frame as the end (O)").clicked() {
+                    self.stop_preview(c);
+                    if let Some(at)=ph{self.set_end(at);}
                 }
             });
             if theme::icon_button(ui, icon::CLOSE, 12.0, "Clear selection").clicked() {
+                self.stop_preview(c);
                 self.in_ms = None;
                 self.out_ms = None;
             }
-            let valid = matches!((self.in_ms, self.out_ms), (Some(a), Some(b)) if (b - a).abs() > 500);
-            if let (Some(a), Some(b)) = (self.in_ms, self.out_ms) {
-                ui.label(theme::label_dim(format_duration((b - a).abs() as f64 / 1000.0)));
-            }
-            ui.add_enabled_ui(valid, |ui| {
-                if theme::primary_button(ui, Some(icon::SCISSORS), "Create clip").clicked() {
-                    self.dialog = Some(CutDialog { title: String::new(), game_id: None, cats: Vec::new(), precise: c.cfg.export.precise_cuts });
+            let selection = self.selection();
+            if let Some((a, b)) = selection {
+                ui.label(theme::label_dim(format_duration((b - a) as f64 / 1000.0)));
+                let previewing = self.preview.is_some();
+                if ui.button(if previewing { "Stop preview" } else { "Preview" }).clicked() {
+                    if previewing {
+                        self.stop_preview(c);
+                    } else {
+                        self.follow_live = false;
+                        self.play_at(c, a, true);
+                        self.preview = Some(RangePreview::new(a as f64 / 1000.0, b as f64 / 1000.0));
+                    }
                 }
-            });
+                if theme::primary_button(ui, Some(icon::SCISSORS), "Save selected clip").clicked() {
+                    self.dialog = Some(CutDialog {
+                        title: String::new(), game_id: None, cats: Vec::new(),
+                        game_search: String::new(), target_size_mb: self.share_mb,
+                    });
+                }
+                ui.menu_button("Export", |ui| {
+                    ui.add(egui::DragValue::new(&mut self.share_mb).range(1..=4000).suffix(" MB"));
+                    if ui.button(format!("Under {} MB", self.share_mb)).clicked() {
+                        self.export_selection(c, Some(self.share_mb), String::new());
+                        ui.close();
+                    }
+                    if ui.button("Full quality").clicked() {
+                        self.export_selection(c, None, String::new());
+                        ui.close();
+                    }
+                });
+            } else if self.in_ms.is_some() && self.out_ms.is_some() {
+                ui.label(theme::small("No footage in this selection"));
+            } else {
+                ui.add_enabled(false,egui::Button::new("Save selected clip")).on_disabled_hover_text("Set the start and end first.");
+            }
             ui.add_space(8.0);
             if theme::ghost_button(ui, Some(icon::FLAG), "Marker").on_hover_text("Add a marker at the playhead").clicked() {
                 let t = ph.unwrap_or_else(now_ms);
@@ -728,7 +967,9 @@ impl RecordingsView {
                 ui.add_space(8.0);
                 ui.label(theme::small(format!("{} audio edit{}", self.edits.len(), if self.edits.len() == 1 { "" } else { "s" })));
                 if ui.small_button("Clear edits").on_hover_text("Remove every mute/volume edit on the timeline").clicked() {
+                    self.edit_history.save(&self.edits, c.player.mix.clone());
                     self.edits.clear();
+                    c.player.set_edits(Vec::new());
                     self.edits_dirty = Some(Instant::now());
                 }
             }
@@ -736,18 +977,16 @@ impl RecordingsView {
     }
 
     fn cut_dialog(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        let Some(d) = &mut self.dialog else { return };
-        let (a, b) = match (self.in_ms, self.out_ms) {
-            (Some(a), Some(b)) => (a.min(b), a.max(b)),
-            _ => {
-                self.dialog = None;
-                return;
-            }
+        let Some((a, b)) = self.selection() else {
+            self.dialog = None;
+            return;
         };
+        let Some(d) = &mut self.dialog else { return };
         let (a_s, b_s) = (a as f64 / 1000.0, b as f64 / 1000.0);
-        let edits_in: Vec<AudioEdit> = self.edits.iter().filter(|e| e.overlaps(a_s, b_s)).copied().collect();
+        let edits_in: Vec<AudioEdit> = self.edits.iter().filter(|e| e.overlaps(a_s, b_s)).cloned().collect();
         let mut close = false;
         let mut create = false;
+        let mut export = None;
         egui::Modal::new(egui::Id::unique("cut_dialog")).show(ui.ctx(), |ui| {
             ui.set_width(440.0);
             ui.label(theme::title("Create clip from recording"));
@@ -761,8 +1000,10 @@ impl RecordingsView {
             let name = d.game_id.and_then(|g| self.games.iter().find(|x| x.id == g)).map(|g| g.name.clone()).unwrap_or_else(|| "Detect automatically".into());
             egui::ComboBox::from_id_salt("cut_game").selected_text(name).width(300.0).show_ui(ui, |ui| {
                 ui.selectable_value(&mut d.game_id, None, "Detect automatically");
+                ui.add(egui::TextEdit::singleline(&mut d.game_search).hint_text("Search games"));
+                let query = d.game_search.trim().to_lowercase();
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    for g in &self.games {
+                    for g in self.games.iter().filter(|g| g.name.to_lowercase().contains(&query)) {
                         ui.selectable_value(&mut d.game_id, Some(g.id), &g.name);
                     }
                 });
@@ -784,9 +1025,6 @@ impl RecordingsView {
                 });
             }
             ui.add_space(4.0);
-            ui.checkbox(&mut d.precise, "Frame-exact cut (re-encodes; slower)");
-            ui.label(theme::small("Off: instant lossless cut, may start up to a couple of seconds early."));
-            ui.add_space(4.0);
             let mix_note = if edits_in.is_empty() { "Your current track volumes are saved with the clip." } else { "Your track volumes and the audio edits in this range are saved with the clip." };
             ui.label(theme::small(format!("{mix_note} All original audio tracks are kept, so you can change them later.")));
             ui.add_space(10.0);
@@ -794,6 +1032,17 @@ impl RecordingsView {
                 if theme::primary_button(ui, Some(icon::SCISSORS), "Create").clicked() {
                     create = true;
                 }
+                ui.menu_button("Export only", |ui| {
+                    ui.add(egui::DragValue::new(&mut d.target_size_mb).range(1..=4000).suffix(" MB"));
+                    if ui.button(format!("Under {} MB", d.target_size_mb)).clicked() {
+                        export = Some(Some(d.target_size_mb));
+                        ui.close();
+                    }
+                    if ui.button("Full quality").clicked() {
+                        export = Some(None);
+                        ui.close();
+                    }
+                });
                 if theme::ghost_button(ui, None, "Cancel").clicked() {
                     close = true;
                 }
@@ -801,18 +1050,21 @@ impl RecordingsView {
         });
         if create {
             let d = self.dialog.take().unwrap();
-            let gains = if c.player.track_count > 1 { c.player.effective_gains() } else { Vec::new() };
-            c.request(Request::CutRange {
+            if c.request(Request::CutRange {
                 from_ms: a,
                 to_ms: b,
                 title: d.title,
                 game_id: d.game_id,
                 category_ids: d.cats,
-                precise: Some(d.precise),
-                gains,
+                mix: self.mix.clone().or_else(|| Some(c.player.mix.clone())),
                 audio_edits: edits_in,
-            });
-            c.toast("info", "Creating clip… it'll appear in Clips when done");
+            }).is_some() {
+                c.toast("info", "Creating clip… it'll appear in Clips when done");
+            }
+        } else if let Some(target) = export {
+            let d = self.dialog.take().unwrap();
+            self.share_mb = d.target_size_mb;
+            self.export_selection(c, target, d.title);
         } else if close {
             self.dialog = None;
         }
@@ -833,15 +1085,16 @@ impl RecordingsView {
             theme::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(theme::title("Game sessions"));
-                ui.label(theme::small("Click to jump to the start."));
-                ui.add_space(4.0);
-                for s in sessions.iter().take(25) {
+                ui.add(egui::TextEdit::singleline(&mut self.session_search).hint_text("Search games"));
+                let query = self.session_search.trim().to_lowercase();
+                for s in sessions.iter().filter(|s| s.name.to_lowercase().contains(&query)).take(25) {
                     let dt = Local.timestamp_millis_opt(s.start_ms).single().unwrap_or_default();
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
                         ui.painter().circle_filled(r.center(), 4.0, theme::game_color(s.game_id.unwrap_or(0)));
                         let label = format!("{}  ·  {}", crate::views::clips::truncate(&s.name, 20), dt.format("%a %H:%M"));
                         if ui.add(egui::Label::new(RichText::new(label).color(theme::TEXT)).truncate().sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.stop_preview(c);
                             self.follow_live = false;
                             // Frame the whole session with a little margin on both sides.
                             let dur = s.end_ms - s.start_ms;
@@ -861,11 +1114,14 @@ impl RecordingsView {
             theme::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(theme::title("Markers"));
-                for m in self.markers.clone().iter().rev().take(30) {
+                ui.add(egui::TextEdit::singleline(&mut self.marker_search).hint_text("Search marker labels"));
+                let query = self.marker_search.trim().to_lowercase();
+                for m in self.markers.clone().iter().rev().filter(|m| m.label.to_lowercase().contains(&query)).take(30) {
                     ui.horizontal(|ui| {
                         let dt = Local.timestamp_millis_opt(m.at_ms).single().unwrap_or_default();
                         if ui.link(dt.format("%a %H:%M:%S").to_string()).clicked() {
-                            self.play_at(c, m.at_ms - 10_000, true);
+                            self.stop_preview(c);
+                            self.play_at(c, m.at_ms, true);
                         }
                         let editing = matches!(&self.rename_marker, Some((id, _)) if *id == m.id);
                         if editing {
@@ -906,12 +1162,16 @@ impl RecordingsView {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(theme::title("Recording files"));
-            ui.label(theme::small("Locked files are never deleted automatically."));
-            ui.add_space(4.0);
+            ui.add(egui::TextEdit::singleline(&mut self.footage_search).hint_text("Search file name or date"));
+            let query = self.footage_search.trim().to_lowercase();
             let mut last_day = String::new();
             for (i, r) in self.recs.clone().iter().enumerate().rev() {
                 let dt = Local.timestamp_millis_opt(r.start_ms).single().unwrap_or_default();
                 let day = dt.format("%A %d %B").to_string();
+                let date = dt.format("%Y-%m-%d %H:%M").to_string();
+                if !r.path.to_lowercase().contains(&query) && !day.to_lowercase().contains(&query) && !date.contains(&query) {
+                    continue;
+                }
                 if day != last_day {
                     ui.add_space(4.0);
                     ui.label(RichText::new(&day).size(12.0).color(theme::TEXT_FAINT));
@@ -919,10 +1179,11 @@ impl RecordingsView {
                 }
                 ui.horizontal(|ui| {
                     let playing = self.cur == Some(i);
-                    let dur = (Self::seg_end(r) - r.start_ms) as f64 / 1000.0;
-                    let text = format!("{}  {}", dt.format("%H:%M"), format_duration(dur));
+                    let dur = (self.seg_end(r) - r.start_ms) as f64 / 1000.0;
+                    let text = format!("Play {}  ·  {}", dt.format("%H:%M"), format_duration(dur));
                     let rt = RichText::new(text).color(if playing { theme::TEXT } else { theme::TEXT_DIM });
                     if ui.add(egui::Button::selectable(playing, rt)).clicked() {
+                        self.frame_recording(r.start_ms);
                         self.play_at(c, r.start_ms, true);
                     }
                     if r.is_live() {
@@ -994,6 +1255,33 @@ mod tests {
         assert_eq!((v[0].start_ms, v[0].end_ms), (0, 21_000));
         assert_eq!(v[1].key, "b");
         assert_eq!(v[2].start_ms, 60_000);
+    }
+
+    #[test]
+    fn selection_clamps_to_written_footage_and_rejects_gaps() {
+        let recording = |path: &str, start_ms: i64, duration: f64, status: &str| Recording {
+            id: 0,
+            path: path.into(),
+            start_ms,
+            duration,
+            size: 1,
+            status: status.into(),
+            audio_tracks: 1,
+            kept: false,
+            probed: true,
+        };
+        let mut view = RecordingsView {
+            recs: vec![recording("closed.mp4", 1_000, 2.0, "complete"),
+                       recording("live.mp4", 5_000, 1.0, "recording")],
+            written_live: Some(("live.mp4".into(), 7_000)),
+            in_ms: Some(10_000),
+            out_ms: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(view.selection(), Some((1_000, 7_000)));
+        view.in_ms = Some(4_000);
+        view.out_ms = Some(4_900);
+        assert_eq!(view.selection(), None);
     }
 
     #[allow(dead_code)]

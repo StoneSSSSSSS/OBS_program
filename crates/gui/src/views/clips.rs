@@ -2,16 +2,18 @@
 //! (player, trim, mixer, export, organise).
 
 use crate::app::Ctx;
-use crate::lanes::{self, LaneAction, LaneState, WaveSource, GUTTER};
+use crate::lanes::{self, LaneAction, LaneState, PreviewProgress, RangePreview, WaveSource};
 use crate::player::seek_bar;
 use crate::theme::{self, icon};
-use cv_core::ipc::Request;
+use cv_core::ipc::{ExportSource, Request};
 use cv_core::model::{apply_edit, AudioEdit, Category, Clip, ClipFilter, ClipSort, Game};
 use cv_core::util::{format_duration, format_duration_precise, human_bytes, now_ms};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Margin, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
+
+mod timeline;
 
 static OPEN_REQUEST: AtomicI64 = AtomicI64::new(0);
 
@@ -52,6 +54,11 @@ struct Detail {
     edits: Vec<AudioEdit>,
     edits_dirty: Option<Instant>,
     lanes: LaneState,
+    lane_display: lanes::LaneDisplay,
+    edit_history: lanes::EditHistory,
+    timeline: timeline::ClipTimeline,
+    preview: Option<RangePreview>,
+    game_search: String,
     /// Where this clip was when the player was last showing it.
     resume_pos: f64,
 }
@@ -122,10 +129,14 @@ impl ClipsView {
     }
 
     pub fn save_position(&mut self, c: &mut Ctx) {
-        if let Some(clip) = &self.detail.clip {
-            let pos = c.player.state().time_pos;
-            if let Some(db) = c.db() {
-                let _ = db.set_clip_position(clip.id, pos);
+        if let Some(clip) = self.detail.clip.clone() {
+            self.flush_audio(c, clip.id);
+            self.stop_preview(c);
+            if c.player.path.as_deref() == Some(clip.path.as_str()) {
+                let pos = c.player.state().time_pos;
+                if let Some(db) = c.db() {
+                    let _ = db.set_clip_position(clip.id, pos);
+                }
             }
         }
     }
@@ -158,9 +169,10 @@ impl ClipsView {
             self.detail.resume_pos = c.player.state().time_pos;
             return;
         }
-        c.player.edits = self.detail.edits.clone();
         let mix = if c.cfg.player.remember_clip_mix { clip.mixer.clone() } else { None };
-        c.player.open(&clip.path, self.detail.resume_pos, clip.audio_tracks.max(0) as usize, &clip.track_names, mix.as_deref(), false, false, &c.cfg.player);
+        c.player.open(&clip.path, self.detail.resume_pos, clip.audio_tracks.max(0) as usize, &clip.track_names, mix.as_ref(), false, false, &c.cfg.player);
+        c.player.set_edits(self.detail.edits.clone());
+        c.player.set_loop(c.cfg.player.loop_clips);
     }
 
     fn open_clip(&mut self, c: &mut Ctx, id: i64) {
@@ -171,20 +183,18 @@ impl ClipsView {
         }
         let start = if clip.last_position > 1.0 && clip.last_position < clip.duration - 2.0 { clip.last_position } else { 0.0 };
         let mix = if c.cfg.player.remember_clip_mix { clip.mixer.clone() } else { None };
-        c.player.edits = clip.audio_edits.clone();
-        c.player.open(&clip.path, start, clip.audio_tracks.max(0) as usize, &clip.track_names, mix.as_deref(), false, c.cfg.player.autoplay, &c.cfg.player);
+        c.player.open(&clip.path, start, clip.audio_tracks.max(0) as usize, &clip.track_names, mix.as_ref(), false, c.cfg.player.autoplay, &c.cfg.player);
+        c.player.set_edits(clip.audio_edits.clone());
         if c.player.track_count > 1 {
             c.player.show_mixer = true;
         }
-        let loop_v = if c.cfg.player.loop_clips { "inf" } else { "no" };
-        if let Some(m) = &c.player.mpv {
-            let _ = m.set("loop-file", loop_v);
-        }
+        c.player.set_loop(c.cfg.player.loop_clips);
         self.detail = Detail {
             title_edit: clip.title.clone(),
             notes_edit: clip.notes.clone(),
             share_mb: c.cfg.export.target_size_mb,
             edits: clip.audio_edits.clone(),
+            lane_display: lanes::LaneDisplay::load(id),
             clip: Some(clip),
             ..Default::default()
         };
@@ -194,9 +204,7 @@ impl ClipsView {
     fn close_clip(&mut self, c: &mut Ctx) {
         self.save_position(c);
         c.player.close();
-        if let Some(m) = &c.player.mpv {
-            let _ = m.set("loop-file", "no");
-        }
+        c.player.set_loop(false);
         self.open = None;
         self.detail = Detail::default();
         self.dirty = true;
@@ -232,6 +240,18 @@ impl ClipsView {
         });
         ui.add_space(8.0);
 
+        let last_saved = c.service.shared.lock().jobs.values()
+            .filter(|job| job.kind == "clip" && job.state == "done")
+            .filter_map(|job| job.clip_id.map(|id| (job.id, id)))
+            .max_by_key(|(job_id, _)| *job_id)
+            .map(|(_, clip_id)| clip_id);
+        if let Some(id) = last_saved {
+            if ui.button("Open last saved clip").clicked() {
+                self.open_clip(c, id);
+                return;
+            }
+        }
+
         if !self.selected.is_empty() {
             self.bulk_bar(ui, c);
             ui.add_space(8.0);
@@ -243,6 +263,7 @@ impl ClipsView {
                 ui.label(theme::icon_text(icon::LIBRARY, 40.0).color(theme::TEXT_FAINT));
                 ui.label(theme::title(if self.search.is_empty() { "No clips here yet" } else { "No matches" }));
                 ui.label(theme::label_dim(format!("Save a clip with {} while you play.", c.cfg.hotkeys.save_clip)));
+                if ui.button("Choose a range from recordings").clicked() { c.goto=Some(crate::app::Page::Recordings); }
             });
             return;
         }
@@ -609,11 +630,22 @@ impl ClipsView {
         };
         let hits = c.player.shortcuts(ui, &c.cfg.player);
         let st = c.player.state();
+        let duration = self.media_duration(c, &clip);
         if hits.mark_in {
-            self.detail.in_pt = Some(st.time_pos);
+            self.stop_preview(c);
+            self.mark_in(st.time_pos, duration);
         }
         if hits.mark_out {
-            self.detail.out_pt = Some(st.time_pos);
+            self.stop_preview(c);
+            self.mark_out(st.time_pos, duration);
+        }
+        if let Some(preview) = &mut self.detail.preview {
+            match preview.progress(st.loaded.then_some(st.time_pos), st.paused, st.eof) {
+                PreviewProgress::Playing => ui.ctx().request_repaint_after(Duration::from_millis(30)),
+                PreviewProgress::Finished | PreviewProgress::EndOfFile => self.stop_preview(c),
+            }
+        } else if !st.eof {
+            c.player.set_loop(c.cfg.player.loop_clips);
         }
         if hits.escape && !c.player.fullscreen {
             self.close_clip(c);
@@ -672,12 +704,7 @@ impl ClipsView {
         egui::Panel::bottom("clip_controls").resizable(false).frame(egui::Frame::NONE).show(ui, |ui| {
             ui.add_space(4.0);
             let lanes_on = c.player.show_mixer;
-            ui.horizontal(|ui| {
-                if lanes_on {
-                    ui.add_space(GUTTER);
-                }
-                seek_bar(ui, &mut c.player, &mut self.detail.in_pt, &mut self.detail.out_pt, c.accent);
-            });
+            self.timeline_controls(ui, c, duration, lanes_on);
             if lanes_on {
                 self.clip_lanes(ui, c, &clip);
             }
@@ -690,53 +717,130 @@ impl ClipsView {
         self.persist_audio(c, &clip);
     }
 
+    fn media_duration(&self, c: &Ctx, clip: &Clip) -> f64 {
+        let state = c.player.state();
+        if state.loaded && state.duration.is_finite() && state.duration > 0.0 {
+            state.duration
+        } else {
+            if clip.duration.is_finite() { clip.duration.max(0.0) } else { 0.0 }
+        }
+    }
+
+    fn stop_preview(&mut self, c: &mut Ctx) {
+        if self.detail.preview.take().is_some() {
+            c.player.set_paused(true);
+            c.player.set_loop(!c.player.state().eof && c.cfg.player.loop_clips);
+        }
+    }
+
     fn clip_lanes(&mut self, ui: &mut Ui, c: &mut Ctx, clip: &Clip) {
-        let dur = c.player.state().duration.max(clip.duration).max(0.1);
-        let wave = c.waves.get(&clip.path).cloned();
-        let sources: Vec<WaveSource> = wave.iter().map(|w| WaveSource { start: 0.0, end: dur, wave: w }).collect();
+        let dur = self.media_duration(c, clip);
+        let (t0, t1) = self.detail.timeline.range(dur);
+        let wave = c.waves.get(&clip.path);
+        let tracks = c.player.media_info()
+            .map(|info| lanes::waveform_tracks(info, dur, &c.cfg.audio.app_categories));
+        let sources: Vec<WaveSource> = wave.iter().map(|w| WaveSource {
+            start: 0.0, end: dur, wave: w, tracks: tracks.as_ref(),
+        }).collect();
         let ph = Some(c.player.state().time_pos);
-        let acts = lanes::lanes(ui, &mut c.player, 0.0, dur, false, &sources, &self.detail.edits, ph, &mut self.detail.lanes, c.accent);
-        for a in acts {
-            match a {
-                LaneAction::Seek(t) => c.player.seek(t, true),
-                LaneAction::Edit { tracks, a, b, gain } => {
-                    for tr in &tracks {
-                        apply_edit(&mut self.detail.edits, *tr, a, b, gain);
+        let default_range = self.selection(dur).unwrap_or((0.0, dur));
+        let acts = lanes::lanes(ui, &mut c.player, t0, t1, false, &sources, &self.detail.edits, ph, &mut self.detail.lanes, c.accent, self.detail.edit_history.can_undo(), Some(&mut self.detail.lane_display), (0.0, dur), default_range);
+        let mut region_saved = false;
+        for action in acts {
+            match action {
+                LaneAction::Seek(t) => {
+                    self.stop_preview(c);
+                    c.player.seek(t, true);
+                }
+                LaneAction::Edit { lanes, a, b, gain } => {
+                    if !region_saved {
+                        self.detail.edit_history.save(&self.detail.edits, c.player.mix.clone());
+                        region_saved = true;
                     }
-                    if tracks.iter().any(|t| *t > 0) && c.player.mode == crate::player::MixMode::Full && gain != 1.0 {
-                        c.player.set_mode(crate::player::MixMode::Separate);
+                    for lane in &lanes {
+                        apply_edit(&mut self.detail.edits, lane, a, b, gain);
+                    }
+                    if let Some(mode) = lanes::mode_for_edit(&lanes, gain).filter(|mode| *mode != c.player.mix.mode) {
+                        c.player.set_mode(mode);
                         self.detail.mix_dirty = Some(Instant::now());
-                        c.toast("info", "Switched to separate tracks so the edit is audible");
                     }
                     c.player.set_edits(self.detail.edits.clone());
                     self.detail.edits_dirty = Some(Instant::now());
                 }
-                LaneAction::MixChanged => self.detail.mix_dirty = Some(Instant::now()),
+                LaneAction::Undo => {
+                    if let Some(snapshot) = self.detail.edit_history.undo() {
+                        let now = Instant::now();
+                        if snapshot.mix != c.player.mix {
+                            self.detail.mix_dirty = Some(now);
+                        }
+                        if snapshot.edits != self.detail.edits {
+                            self.detail.edits_dirty = Some(now);
+                        }
+                        self.detail.edits = snapshot.edits;
+                        c.player.restore_audio(snapshot.mix, self.detail.edits.clone());
+                    }
+                }
+                LaneAction::MixChanged { previous } => {
+                    if let Some(previous) = previous {
+                        self.detail.edit_history.save(&self.detail.edits, previous);
+                    }
+                    self.detail.mix_dirty = Some(Instant::now());
+                }
+                LaneAction::DisplayChanged => {
+                    if let Err(error) = self.detail.lane_display.save(clip.id) {
+                        c.toast("error", format!("Couldn't save lane display: {error}"));
+                    }
+                }
             }
         }
     }
 
-    /// Save the clip's mix and audio edits shortly after they change.
-    fn persist_audio(&mut self, c: &mut Ctx, clip: &Clip) {
-        if let Some(t) = self.detail.mix_dirty {
-            if t.elapsed() > Duration::from_millis(800) {
-                if c.cfg.player.remember_clip_mix {
-                    let gains = c.player.effective_gains();
-                    if let Some(db) = c.db() {
-                        let _ = db.set_clip_mixer(clip.id, Some(&gains));
-                    }
-                }
-                self.detail.mix_dirty = None;
+    /// Flush audio changes before navigation and before any job reads the clip.
+    fn flush_audio(&mut self, c: &mut Ctx, clip_id: i64) -> bool {
+        let belongs = self.detail.clip.as_ref().is_some_and(|clip| c.player.path.as_deref() == Some(clip.path.as_str()));
+        let mix = (self.detail.mix_dirty.is_some() && c.cfg.player.remember_clip_mix && belongs).then(|| c.player.mix.clone());
+        let edits = self.detail.edits_dirty.is_some().then_some(self.detail.edits.as_slice());
+        if mix.is_none() && edits.is_none() {
+            self.detail.mix_dirty = None;
+            return true;
+        }
+        let Some(db) = c.db() else {
+            c.toast("error", "Could not open the library to save the audio changes");
+            return false;
+        };
+        let result = (|| -> anyhow::Result<()> {
+            if let Some(mix) = &mix {
+                db.set_clip_mixer(clip_id, Some(mix))?;
+            }
+            if let Some(edits) = edits {
+                db.set_clip_audio_edits(clip_id, edits)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            c.toast("error", format!("Could not save audio changes: {error}"));
+            return false;
+        }
+        if let Some(clip) = &mut self.detail.clip {
+            if mix.is_some() {
+                clip.mixer = mix;
+            }
+            if edits.is_some() {
+                clip.audio_edits = self.detail.edits.clone();
             }
         }
-        if let Some(t) = self.detail.edits_dirty {
-            if t.elapsed() > Duration::from_millis(500) {
-                let edits = self.detail.edits.clone();
-                if let Some(db) = c.db() {
-                    let _ = db.set_clip_audio_edits(clip.id, &edits);
-                }
-                self.detail.edits_dirty = None;
-            }
+        self.detail.mix_dirty = None;
+        self.detail.edits_dirty = None;
+        true
+    }
+
+    fn persist_audio(&mut self, c: &mut Ctx, clip: &Clip) {
+        let due = [self.detail.mix_dirty, self.detail.edits_dirty].into_iter().flatten()
+            .any(|changed| changed.elapsed() >= Duration::from_millis(700));
+        if due && !self.flush_audio(c, clip.id) {
+            let now = Instant::now();
+            self.detail.mix_dirty = self.detail.mix_dirty.map(|_| now);
+            self.detail.edits_dirty = self.detail.edits_dirty.map(|_| now);
         }
         if self.detail.mix_dirty.is_some() || self.detail.edits_dirty.is_some() {
             ui_repaint_soon();
@@ -766,6 +870,7 @@ impl ClipsView {
                     if n == 1 { "" } else { "s" }
                 )));
                 if ui.button("Remove all edits").clicked() {
+                    self.detail.edit_history.save(&self.detail.edits, c.player.mix.clone());
                     self.detail.edits.clear();
                     c.player.set_edits(Vec::new());
                     self.detail.edits_dirty = Some(Instant::now());
@@ -778,66 +883,94 @@ impl ClipsView {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(theme::title("Trim"));
-            ui.label(theme::small("Mark in/out with I and O, or the buttons."));
+            ui.label(theme::small("Move the playhead, then set each end of your selection."));
             ui.add_space(4.0);
             let pos = c.player.state().time_pos;
+            let duration = self.media_duration(c, clip);
             ui.horizontal(|ui| {
-                if ui.button(format!("In: {}", self.detail.in_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text("Set in-point at playhead (I)").clicked() {
-                    self.detail.in_pt = Some(pos);
+                if ui.button(format!("Set start  {}", self.detail.in_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text("Start here (I)").clicked() {
+                    self.stop_preview(c);
+                    self.mark_in(pos, duration);
                 }
-                if ui.button(format!("Out: {}", self.detail.out_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text("Set out-point at playhead (O)").clicked() {
-                    self.detail.out_pt = Some(pos);
+                if ui.button(format!("Set end  {}", self.detail.out_pt.map(format_duration_precise).unwrap_or("—".into()))).on_hover_text("End here (O)").clicked() {
+                    self.stop_preview(c);
+                    self.mark_out(pos, duration);
                 }
                 if theme::icon_button(ui, icon::CLOSE, 12.0, "Clear").clicked() {
+                    self.stop_preview(c);
                     self.detail.in_pt = None;
                     self.detail.out_pt = None;
                 }
             });
-            let (a, b) = (self.detail.in_pt.unwrap_or(0.0), self.detail.out_pt.unwrap_or(clip.duration));
-            let valid = b > a + 0.2 && (self.detail.in_pt.is_some() || self.detail.out_pt.is_some());
-            if valid {
+            if let Some((a, b)) = self.selection(duration) {
                 ui.label(theme::label_dim(format!("Selection {}", format_duration_precise(b - a))));
-            }
-            ui.add_enabled_ui(valid, |ui| {
-                ui.horizontal(|ui| {
-                    if theme::primary_button(ui, Some(icon::SCISSORS), "Save as new clip").clicked() {
-                        c.request(Request::TrimClip { clip_id: clip.id, start_s: a, end_s: b, replace: false, precise: None });
-                        c.toast("info", "Trimming…");
+                let previewing = self.detail.preview.is_some();
+                if ui.button(if previewing { "Stop preview" } else { "Preview selection" }).clicked() {
+                    if previewing {
+                        self.stop_preview(c);
+                    } else {
+                        c.player.set_loop(false);
+                        c.player.seek(a, true);
+                        c.player.set_paused(false);
+                        self.detail.preview = Some(RangePreview::new(a, b));
                     }
-                    if theme::ghost_button(ui, None, "Trim original").on_hover_text("Replaces this clip (the original goes to the Recycle Bin)").clicked() {
-                        c.player.close();
-                        c.request(Request::TrimClip { clip_id: clip.id, start_s: a, end_s: b, replace: true, precise: None });
-                        c.toast("info", "Trimming…");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if theme::primary_button(ui, Some(icon::SCISSORS), "Save as new clip").clicked()
+                        && self.flush_audio(c, clip.id)
+                    {
+                        if c.request(Request::TrimClip { clip_id: clip.id, start_s: a, end_s: b, replace: false }).is_some() {
+                            c.toast("info", "Trimming…");
+                        }
+                    }
+                    if theme::ghost_button(ui, None, "Trim original").on_hover_text("Replaces this clip (the original goes to the Recycle Bin)").clicked()
+                        && self.flush_audio(c, clip.id)
+                    {
                         self.close_clip(c);
+                        if c.request(Request::TrimClip { clip_id: clip.id, start_s: a, end_s: b, replace: true }).is_some() {
+                            c.toast("info", "Trimming…");
+                        }
                     }
                 });
-            });
+            } else if self.detail.in_pt.is_some() || self.detail.out_pt.is_some() {
+                ui.label(theme::small("Choose a selection longer than 0.1 seconds."));
+            }
         });
         ui.add_space(12.0);
 
         // Export / share.
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(theme::title("Share"));
+            ui.label(theme::title("Export to share"));
             ui.label(theme::small("Exports use your current audio mix and the trim selection, if any."));
             ui.add_space(4.0);
-            let gains = c.player.effective_gains();
-            let range = match (self.detail.in_pt, self.detail.out_pt) {
-                (None, None) => None,
-                (a, b) => Some((a.unwrap_or(0.0), b.unwrap_or(clip.duration))),
-            };
-            ui.horizontal(|ui| {
-                if theme::primary_button(ui, Some(icon::SHARE), &format!("Under {} MB", self.detail.share_mb)).on_hover_text("Re-encode to fit a size limit (e.g. Discord)").clicked() {
-                    c.request(Request::Export { clip_id: clip.id, range, gains: gains.clone(), target_size_mb: Some(self.detail.share_mb) });
-                    c.toast("info", "Exporting…");
+            let range = self.selection(self.media_duration(c, clip));
+            let valid = range.is_some() || (self.detail.in_pt.is_none() && self.detail.out_pt.is_none());
+            ui.add_enabled_ui(valid, |ui| {
+                let mut export = |target_size_mb| {
+                    if c.request(Request::Export {
+                        source: ExportSource::Clip { clip_id: clip.id },
+                        range,
+                        mix: c.player.mix.clone(),
+                        edits: Some(self.detail.edits.clone()),
+                        target_size_mb,
+                        title: String::new(),
+                    }).is_some() {
+                        c.toast("info", "Exporting…");
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Limit");
+                    ui.add(egui::DragValue::new(&mut self.detail.share_mb).range(1..=4000).suffix(" MB"));
+                    if theme::primary_button(ui, Some(icon::SHARE), "Export to size limit").on_hover_text("Re-encode to fit the selected file size").clicked() {
+                        export(Some(self.detail.share_mb));
+                    }
+                });
+                if theme::ghost_button(ui, Some(icon::SHARE), "Export full quality").on_hover_text("Mixes audio to one track").clicked() {
+                    export(None);
                 }
-                ui.add(egui::DragValue::new(&mut self.detail.share_mb).range(1..=4000).suffix(" MB"));
             });
-            if theme::ghost_button(ui, Some(icon::SHARE), "Export full quality").on_hover_text("Keeps the original video; mixes audio to one track").clicked() {
-                c.request(Request::Export { clip_id: clip.id, range, gains, target_size_mb: None });
-                c.toast("info", "Exporting…");
-            }
-            jobs_list(ui, c);
+            show_jobs(ui,c,true);
         });
         ui.add_space(12.0);
 
@@ -851,8 +984,10 @@ impl ClipsView {
                 ui.label(theme::label_dim("Game"));
                 let current = clip.game_name.clone().unwrap_or_else(|| "Unknown".into());
                 egui::ComboBox::from_id_salt("clip_game").selected_text(current).width(220.0).show_ui(ui, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.detail.game_search).hint_text("Search games"));
+                    let query = self.detail.game_search.trim().to_lowercase();
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                        for g in &games {
+                        for g in games.iter().filter(|g| g.name.to_lowercase().contains(&query)) {
                             if ui.selectable_label(clip.game_id == Some(g.id), &g.name).clicked() {
                                 c.request(Request::SetClipGame { clip_id: clip.id, game_id: Some(g.id) });
                                 self.dirty = true;
@@ -1002,15 +1137,20 @@ fn filter_row(ui: &mut Ui, selected: bool, glyph: &str, label: &str, count: Opti
 }
 
 pub fn jobs_list(ui: &mut Ui, c: &mut Ctx) {
+    show_jobs(ui,c,false);
+}
+
+fn show_jobs(ui:&mut Ui,c:&mut Ctx,exports_only:bool){
     let jobs: Vec<_> = {
         let s = c.service.shared.lock();
         let mut v: Vec<_> = s.jobs.values().cloned().collect();
         v.sort_by_key(|j| std::cmp::Reverse(j.id));
-        v.into_iter().take(4).collect()
+        v.into_iter().filter(|j|!exports_only || j.kind=="export").take(4).collect()
     };
     for j in jobs {
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        let active = j.state == "running" || j.state == "queued";
+        ui.horizontal_wrapped(|ui| {
             let (color, text) = match j.state.as_str() {
                 "done" => (theme::SUCCESS, "Done".to_string()),
                 "failed" => (theme::DANGER, "Failed".to_string()),
@@ -1018,24 +1158,42 @@ pub fn jobs_list(ui: &mut Ui, c: &mut Ctx) {
                 "queued" => (theme::TEXT_FAINT, "Queued".to_string()),
                 _ => (theme::TEXT_DIM, format!("{:.0}%", j.progress * 100.0)),
             };
-            ui.label(RichText::new(format!("{} {}", j.kind, j.title)).size(12.5).color(theme::TEXT_DIM));
             ui.label(RichText::new(text).size(12.5).color(color));
-            if j.state == "running" || j.state == "queued" {
+            if let Some(bytes) = j.output_bytes {
+                ui.label(theme::small(cv_core::util::human_bytes(bytes))).on_hover_text(format!("{bytes} bytes"));
+            }
+            if active {
                 if ui.small_button("Cancel").clicked() {
                     c.request(Request::CancelJob { id: j.id });
                 }
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             } else if let Some(out) = &j.output {
-                if j.kind == "export" && ui.small_button("Show").clicked() {
+                if let Some(id) = j.clip_id.filter(|_| j.kind != "export") {
+                    if ui.small_button("Open saved clip").clicked() {
+                        request_open(id);
+                        c.goto = Some(crate::app::Page::Clips);
+                    }
+                }
+                if ui.small_button("Open folder").on_hover_text("Show this file in Explorer").clicked() {
                     show_in_folder(out);
                 }
             }
         });
+        let name = j.output.as_deref().and_then(|path| std::path::Path::new(path).file_name())
+            .and_then(|name| name.to_str()).unwrap_or(&j.title);
+        let filename = ui.add(egui::Label::new(RichText::new(name).size(12.5).color(theme::TEXT_DIM))
+            .wrap().selectable(true));
+        if let Some(path) = &j.output {
+            filename.on_hover_ui(|ui| {
+                ui.set_max_width(360.0);
+                ui.add(egui::Label::new(path).wrap().selectable(true));
+            });
+        }
         if j.state == "running" {
             ui.add(egui::ProgressBar::new(j.progress).desired_height(4.0));
         }
         if j.state == "failed" && !j.message.is_empty() {
-            ui.label(RichText::new(&j.message).size(12.0).color(theme::DANGER));
+            ui.add(egui::Label::new(RichText::new(&j.message).size(12.0).color(theme::DANGER)).wrap());
         }
     }
 }
@@ -1089,4 +1247,24 @@ static REPAINT_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::ne
 
 pub fn set_repaint_ctx(ctx: &egui::Context) {
     let _ = REPAINT_CTX.set(ctx.clone());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marks_clamp_without_moving_the_opposite_boundary() {
+        let mut view = ClipsView::default();
+        assert_eq!(view.selection(10.0), None);
+        view.mark_in(-2.0, 10.0);
+        view.mark_out(20.0, 10.0);
+        assert_eq!(view.selection(10.0), Some((0.0, 10.0)));
+        view.mark_in(8.0, 10.0);
+        view.mark_out(5.0, 10.0);
+        assert_eq!(view.selection(10.0), Some((8.0, 8.101)));
+        view.mark_in(10.0,10.0);
+        assert!((view.detail.in_pt.unwrap()-8.0).abs()<1e-6);
+        assert_eq!(view.selection(0.0), None);
+    }
 }

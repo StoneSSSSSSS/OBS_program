@@ -59,8 +59,8 @@ impl Service {
         self.shared.lock().connected
     }
 
-    /// Blocking call (use for quick requests).
-    /// Send without waiting (slow operations like restarting OBS). Errors
+
+    /// Send without waiting (slow operations like restarting the recorder). Errors
     /// come back as toasts.
     pub fn fire(&self, req: Request) {
         let c = self.client.lock().clone();

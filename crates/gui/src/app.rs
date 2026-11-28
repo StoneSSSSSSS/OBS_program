@@ -1,6 +1,5 @@
 //! Top-level app: navigation, shared resources, toasts.
 
-use crate::mpv::Mpv;
 use crate::player::Player;
 use crate::service::{Service, UiEvent};
 use crate::theme::{self, icon};
@@ -38,6 +37,7 @@ pub struct Ctx {
     pub toasts: Vec<Toast>,
     /// Requested navigation (views set this).
     pub goto: Option<Page>,
+    pub open_recording_settings: bool,
 }
 
 impl Ctx {
@@ -80,7 +80,6 @@ pub struct App {
     recordings: RecordingsView,
     settings: SettingsView,
     titlebar_done: u32,
-    gl: Option<std::sync::Arc<glow::Context>>,
     selftest: Option<SelfTest>,
 }
 
@@ -102,15 +101,7 @@ impl App {
         theme::install_fonts(ctx);
         let accent = theme::accent(cfg.general.accent);
         theme::apply(ctx, accent, cfg.general.ui_scale);
-        let mpv = match (crate::mpv::find_libmpv(&cfg.advanced.mpv_dll_path), cc.get_proc_address.clone()) {
-            (Some(dll), Some(gp)) => Mpv::new(&dll, ctx, gp, &cfg.player).map_err(|e| format!("{e:#}")),
-            (None, _) => Err("libmpv-2.dll not found next to clipvault.exe".to_string()),
-            (_, None) => Err("OpenGL is unavailable".to_string()),
-        };
-        if let Err(e) = &mpv {
-            tracing::error!("player: {e}");
-        }
-        let player = Player::new(mpv, &cfg.player);
+        let player = Player::new(ctx.clone(), &cfg);
         crate::views::clips::set_repaint_ctx(ctx);
         let page = match cfg.general.start_page.as_str() {
             "recordings" => Page::Recordings,
@@ -126,6 +117,7 @@ impl App {
             accent,
             toasts: Vec::new(),
             goto: None,
+            open_recording_settings: false,
             cfg,
         };
         App {
@@ -136,16 +128,14 @@ impl App {
             recordings: RecordingsView::default(),
             settings: SettingsView::default(),
             titlebar_done: 0,
-            gl: cc.gl.clone(),
             selftest: std::env::var_os("CLIPVAULT_SELFTEST").map(|d| SelfTest { dir: d.into(), step: 0, at: Instant::now(), entered: false, shot: false }),
         }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
         self.c.thumbs.poll(ctx);
-        if let Some(m) = &self.c.player.mpv {
-            m.pump();
-        }
+        self.c.player.set_preferences(&self.c.cfg);
+
         self.c.player.after_load_check();
         while let Ok(ev) = self.c.service.events.try_recv() {
             match ev {
@@ -186,11 +176,11 @@ impl App {
         if self.page == Page::Settings {
             self.settings.leave(&mut self.c);
         }
+        if self.page == Page::Recordings { self.recordings.leave(&mut self.c); }
+        if self.page == Page::Clips { self.clips.save_position(&mut self.c); }
         // Leaving a page with a player: pause playback.
         if matches!(self.page, Page::Recordings | Page::Clips) {
-            if let Some(m) = &self.c.player.mpv {
-                m.set_pause(true);
-            }
+            self.c.player.set_paused(true);
         }
         self.page = page;
     }
@@ -253,7 +243,8 @@ impl App {
                 ui.set_width(w);
                 let enabled = connected && status.as_ref().map(|s| s.replay.active).unwrap_or(false);
                 ui.add_enabled_ui(enabled, |ui| {
-                    if theme::accent_button(ui, Some(icon::RECORD), "Save clip", self.c.accent)
+                    if theme::accent_button(ui, Some(icon::RECORD), "Save replay", self.c.accent)
+                        .on_disabled_hover_text("Available while the replay buffer is recording")
                         .on_hover_text(format!("Saves the last {} ({})", cv_core::util::format_duration(self.c.cfg.clips.clip_length_secs as f64), self.c.cfg.hotkeys.save_clip))
                         .clicked()
                     {
@@ -382,11 +373,7 @@ pub fn status_block(ui: &mut Ui, connected: bool, status: Option<&cv_core::ipc::
         row(ui, theme::WARNING, "Starting service…");
         return;
     };
-    if !s.obs.running {
-        row(ui, theme::DANGER, "OBS not running");
-    } else if !s.obs.connected {
-        row(ui, theme::WARNING, "Connecting to OBS…");
-    } else if s.recording.active {
+    if !s.engine.running { row(ui, theme::WARNING, "Recorder idle"); } else if s.recording.active {
         let secs = (cv_core::util::now_ms() - s.recording.started_ms).max(0) / 1000;
         row(ui, theme::LIVE, &format!("Recording · {}", cv_core::util::format_span_short(secs)));
     } else if s.recording.paused_by_user {
@@ -418,6 +405,10 @@ impl eframe::App for App {
         if let Some(p) = self.c.goto.take() {
             self.navigate(p);
         }
+        if std::mem::take(&mut self.c.open_recording_settings) {
+            self.settings.select_tab("recording");
+            self.navigate(Page::Settings);
+        }
 
         let fullscreen = self.c.player.fullscreen && matches!(self.page, Page::Recordings | Page::Clips);
         if !fullscreen {
@@ -439,12 +430,10 @@ impl eframe::App for App {
         self.toasts(&ctx);
     }
 
-    fn on_exit(&mut self, gl: Option<&glow::Context>) {
-        self.clips.save_position(&mut self.c);
-        if let (Some(m), Some(gl)) = (&self.c.player.mpv, gl.or(self.gl.as_deref())) {
-            m.stop();
-            m.destroy_gl(gl);
-        }
+    fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        if self.page == Page::Clips { self.clips.save_position(&mut self.c); }
+        self.recordings.flush_edits();
+        self.c.player.close();
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

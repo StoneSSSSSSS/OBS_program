@@ -4,11 +4,10 @@
 #   cargo build --release
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 #
-# OBS keeps running (and recording) while the service is swapped.
+# Updating restarts the native recorder and briefly interrupts recording.
 
 param(
     [string]$Dest = "$env:LOCALAPPDATA\Programs\ClipVault",
-    [string]$Ffmpeg = "",
     [switch]$NoStart,
     [switch]$NoDesktopShortcut
 )
@@ -19,45 +18,27 @@ $rel = Join-Path $repo 'target\release'
 foreach ($f in 'clipvault.exe', 'clipvault-service.exe') {
     if (-not (Test-Path (Join-Path $rel $f))) { throw "Build first with 'cargo build --release' ($f is missing)." }
 }
-$mpv = Join-Path $repo 'third_party\libmpv-2.dll'
-if (-not (Test-Path $mpv)) {
-    throw "third_party\libmpv-2.dll is missing. Download mpv-dev-x86_64-*.7z from https://github.com/shinchiro/mpv-winbuild-cmake/releases and extract libmpv-2.dll into third_party\."
+# Stop the installed ClipVault recorder before replacing its executable.
+$serviceExe = [IO.Path]::GetFullPath((Join-Path $Dest 'clipvault-service.exe'))
+$guiExe = [IO.Path]::GetFullPath((Join-Path $Dest 'clipvault.exe'))
+$runningService = @(Get-Process clipvault-service -ErrorAction SilentlyContinue | Where-Object Path -EQ $serviceExe)
+$runningGui = @(Get-Process clipvault -ErrorAction SilentlyContinue | Where-Object Path -EQ $guiExe)
+$guiWasOpen = $runningGui.Count -gt 0
+foreach ($process in $runningGui) {
+    [void]$process.CloseMainWindow()
+    if (-not $process.WaitForExit(10000)) { throw 'Close the ClipVault window and run the installer again.' }
 }
-
-# Stop running ClipVault processes. The service exits without touching OBS.
-$services = @(
-    (Join-Path $Dest 'clipvault-service.exe'),
-    (Join-Path $rel 'clipvault-service.exe'),
-    (Join-Path $repo 'target\debug\clipvault-service.exe')
-)
-foreach ($svc in $services) {
-    if (Test-Path $svc) { try { & $svc --stop 2>$null | Out-Null } catch {} }
+if ($runningService.Count) {
+    & $serviceExe --stop
+    foreach ($process in $runningService) {
+        if (-not $process.WaitForExit(20000)) { throw 'The recorder is still finishing. Wait for it to exit before updating.' }
+    }
 }
-Start-Sleep -Seconds 2
-$guiWasOpen = [bool](Get-Process clipvault -ErrorAction SilentlyContinue)
-Get-Process clipvault, clipvault-service -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Seconds 1
 
 New-Item -ItemType Directory -Force $Dest, (Join-Path $Dest 'assets') | Out-Null
 Copy-Item (Join-Path $rel 'clipvault.exe'), (Join-Path $rel 'clipvault-service.exe') $Dest -Force
-Copy-Item $mpv $Dest -Force
 Copy-Item (Join-Path $repo 'assets\*.png') (Join-Path $Dest 'assets') -Force
 Write-Output "Installed to $Dest"
-
-# Bundle a modern ffmpeg next to the app (PATH may have an ancient one).
-if (-not $Ffmpeg) {
-    $Ffmpeg = Get-ChildItem 'C:\Program Files' -Directory -Filter 'ffmpeg*' -ErrorAction SilentlyContinue |
-        Sort-Object Name -Descending |
-        ForEach-Object { Join-Path $_.FullName 'bin' } |
-        Where-Object { (Test-Path (Join-Path $_ 'ffmpeg.exe')) -and (Test-Path (Join-Path $_ 'ffprobe.exe')) } |
-        Select-Object -First 1
-}
-if ($Ffmpeg -and (Test-Path (Join-Path $Ffmpeg 'ffmpeg.exe'))) {
-    Copy-Item (Join-Path $Ffmpeg 'ffmpeg.exe'), (Join-Path $Ffmpeg 'ffprobe.exe') $Dest -Force
-    Write-Output "Bundled ffmpeg from $Ffmpeg"
-} else {
-    Write-Warning "No ffmpeg 5+ found; set its path in Settings > Advanced."
-}
 
 # Remove the old Python program from Startup.
 $startup = [Environment]::GetFolderPath('Startup')
@@ -77,7 +58,7 @@ if (-not $NoDesktopShortcut) { $shortcutArgs += '--desktop' }
 
 if (-not $NoStart) {
     Start-Process (Join-Path $Dest 'clipvault-service.exe') -WorkingDirectory $Dest
-    Write-Output 'ClipVault service started (it adopts the running OBS).'
+    Write-Output 'ClipVault recorder started.'
     if ($guiWasOpen) {
         Start-Sleep -Seconds 2
         Start-Process (Join-Path $Dest 'clipvault.exe') -WorkingDirectory $Dest

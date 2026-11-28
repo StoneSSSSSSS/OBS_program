@@ -1,12 +1,12 @@
 //! Settings: every option in config.toml, grouped into sections, with a
-//! save bar that warns when OBS has to restart.
+//! save bar that warns when recording needs to restart.
 
 use crate::app::Ctx;
 use crate::theme::{self, icon};
 use cv_core::audio_names::Endpoint;
-use cv_core::config::{Accent, Config, ENCODERS, RECORDING_FORMATS};
+use cv_core::config::{Accent, Config, HistoryMode, HEIGHTS, MAX_ROLLING_MINUTES, QUALITIES, ROLLING_SEGMENT_SECS};
 use cv_core::hotkey::Hotkey;
-use cv_core::ipc::{AudioDevices, Request};
+use cv_core::ipc::{AudioDevices, MonitorInfo, Request};
 use cv_core::model::Game;
 use eframe::egui::{self, Color32, Key, Margin, RichText, Ui, Vec2};
 
@@ -21,12 +21,11 @@ enum Tab {
     Games,
     Player,
     Export,
-    Obs,
     Advanced,
     About,
 }
 
-const TABS: [(Tab, &str, &str); 12] = [
+const TABS: [(Tab, &str, &str); 11] = [
     (Tab::General, icon::SETTINGS, "General"),
     (Tab::Recording, icon::HISTORY, "24/7 recording"),
     (Tab::Clips, icon::LIBRARY, "Clips & replay"),
@@ -36,7 +35,6 @@ const TABS: [(Tab, &str, &str); 12] = [
     (Tab::Games, icon::GAME, "Games"),
     (Tab::Player, icon::PLAY, "Player"),
     (Tab::Export, icon::SHARE, "Export & sharing"),
-    (Tab::Obs, icon::DEVICE, "OBS"),
     (Tab::Advanced, icon::MORE, "Advanced"),
     (Tab::About, icon::INFO, "About"),
 ];
@@ -47,11 +45,13 @@ pub struct SettingsView {
     saved: Option<Config>,
     capturing: Option<&'static str>,
     devices: Option<AudioDevices>,
+    monitors: Option<Vec<MonitorInfo>>,
     games: Vec<Game>,
     games_loaded: bool,
     new_item: [String; 6],
     confirm_restart: bool,
     merge_from: Option<i64>,
+    new_preset_mb: u32,
 }
 
 impl Default for SettingsView {
@@ -62,11 +62,13 @@ impl Default for SettingsView {
             saved: None,
             capturing: None,
             devices: None,
+            monitors: None,
             games: Vec::new(),
             games_loaded: false,
             new_item: Default::default(),
             confirm_restart: false,
             merge_from: None,
+            new_preset_mb: 25,
         }
     }
 }
@@ -123,7 +125,10 @@ impl SettingsView {
                     ui.painter().text(rect.left_center() + egui::vec2(16.0, 0.0), egui::Align2::CENTER_CENTER, glyph, egui::FontId::new(13.0, theme::icons_family()), if sel { c.accent } else { theme::TEXT_FAINT });
                     ui.painter().text(rect.left_center() + egui::vec2(34.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.5), fg);
                     if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        self.tab = tab;
+                        if self.tab != tab {
+                            self.leave(c);
+                            self.tab = tab;
+                        }
                     }
                 }
             });
@@ -133,15 +138,20 @@ impl SettingsView {
             let mut d = self.draft.take().unwrap();
             match self.tab {
                 Tab::General => self.general(ui, c, &mut d),
-                Tab::Recording => recording(ui, c, &mut d),
+                Tab::Recording => {
+                    if self.monitors.is_none() {
+                        self.monitors = Some(c.service.call(Request::Monitors).ok()
+                            .and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default());
+                    }
+                    recording(ui, c, &mut d, &mut self.monitors);
+                }
                 Tab::Clips => self.clips(ui, c, &mut d),
                 Tab::Hotkeys => self.hotkeys(ui, c, &mut d),
                 Tab::Overlay => overlay(ui, c, &mut d),
                 Tab::Audio => self.audio(ui, c, &mut d),
                 Tab::Games => self.games(ui, c, &mut d),
                 Tab::Player => player(ui, c, &mut d),
-                Tab::Export => export(ui, c, &mut d),
-                Tab::Obs => obs(ui, c, &mut d),
+                Tab::Export => export(ui, c, &mut d, &mut self.new_preset_mb),
                 Tab::Advanced => advanced(ui, c, &mut d),
                 Tab::About => about(ui, c),
             }
@@ -151,14 +161,14 @@ impl SettingsView {
     }
 
     fn save_bar(&mut self, ui: &mut Ui, c: &mut Ctx) {
-        let restart = self.saved.as_ref().zip(self.draft.as_ref()).map(|(s, d)| s.obs_restart_needed(d)).unwrap_or(false);
+        let restart = self.saved.as_ref().zip(self.draft.as_ref()).map(|(s, d)| s.recorder_restart_needed(d)).unwrap_or(false);
         theme::card().inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(theme::icon_text(icon::INFO, 14.0).color(theme::TEXT_DIM));
                 ui.label(RichText::new("You have unsaved changes").color(theme::TEXT));
                 if restart {
-                    ui.label(theme::label_dim("· some need OBS to restart"));
+                    ui.label(theme::label_dim("· recording will restart"));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::primary_button(ui, Some(icon::CHECK), "Save").clicked() {
@@ -181,17 +191,14 @@ impl SettingsView {
             return;
         }
         let mut choice = None;
-        egui::Modal::new(egui::Id::unique("restart_obs")).show(ui.ctx(), |ui| {
+        egui::Modal::new(egui::Id::unique("restart_recorder")).show(ui.ctx(), |ui| {
             ui.set_width(420.0);
-            ui.label(theme::title("Restart OBS to apply?"));
-            ui.label(theme::label_dim("Recording settings only take effect after OBS restarts. That leaves a gap of about 10 seconds in the 24/7 recording."));
+            ui.label(theme::title("Restart recording to apply?"));
+            ui.label(theme::label_dim("ClipVault closes the current file and starts a new one with your settings. The timeline may have a short gap."));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if theme::primary_button(ui, Some(icon::REFRESH), "Save & restart OBS").clicked() {
+                if theme::primary_button(ui, Some(icon::REFRESH), "Save & restart recording").clicked() {
                     choice = Some(true);
-                }
-                if theme::ghost_button(ui, None, "Save, restart later").clicked() {
-                    choice = Some(false);
                 }
                 if theme::ghost_button(ui, None, "Cancel").clicked() {
                     self.confirm_restart = false;
@@ -204,7 +211,7 @@ impl SettingsView {
         }
     }
 
-    fn save(&mut self, ctx: &egui::Context, c: &mut Ctx, restart_obs: bool) {
+    fn save(&mut self, ctx: &egui::Context, c: &mut Ctx, restart_recorder: bool) {
         let Some(mut d) = self.draft.clone() else { return };
         d.sanitize();
         if let Err(e) = d.save() {
@@ -213,9 +220,9 @@ impl SettingsView {
         }
         self.saved = Some(d.clone());
         self.draft = Some(d.clone());
-        let r = c.service.call(Request::ReloadConfig { restart_obs });
+        let r = c.service.call(Request::ReloadConfig { restart_recorder });
         match r {
-            Ok(_) => c.toast("success", if restart_obs { "Saved, restarting OBS" } else { "Settings saved" }),
+            Ok(_) => c.toast("success", if restart_recorder { "Settings saved. Restarting recording…" } else { "Settings saved" }),
             Err(e) => c.toast("warning", format!("Saved; the service will pick it up when it starts ({e})")),
         }
         c.reload_config();
@@ -226,9 +233,9 @@ impl SettingsView {
 
     fn general(&mut self, ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
         group(ui, "Startup", |ui| {
-            toggle_row(ui, c, "Start with Windows", "Runs the background service at login. It launches OBS and keeps everything recording.", &mut d.general.start_with_windows);
+            toggle_row(ui, c, "Start with Windows", "Starts the ClipVault background service when you sign in.", &mut d.general.start_with_windows);
             toggle_row(ui, c, "Show tray icon", "A small icon next to the clock: red when recording, amber when something needs attention.", &mut d.general.show_tray_icon);
-            toggle_row(ui, c, "Windows notifications", "Pop-ups when the mic disconnects, OBS crashes, or the disk is nearly full.", &mut d.general.notifications);
+            toggle_row(ui, c, "Windows notifications", "Pop-ups for microphone, recording, and storage alerts.", &mut d.general.notifications);
             row(ui, "Open on", "Which page ClipVault opens on.", |ui| {
                 egui::ComboBox::from_id_salt("start_page").selected_text(d.general.start_page.clone()).show_ui(ui, |ui| {
                     for p in ["home", "recordings", "clips"] {
@@ -261,15 +268,15 @@ impl SettingsView {
 
     fn clips(&mut self, ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
         group(ui, "Clip length", |ui| {
-            row(ui, "Default clip length", "How much the replay buffer keeps: a saved clip is the last N seconds. Requires OBS restart.", |ui| {
+            if let Some(seconds) = d.recording.rolling_seconds() {
+                ui.label(theme::small(format!("Replay only caps both clip hotkeys at {} minutes.", seconds / 60)));
+            }
+            row(ui, "Default clip length", "How far back the Save clip hotkey reaches.", |ui| {
                 ui.add(egui::DragValue::new(&mut d.clips.clip_length_secs).range(5..=3600).suffix(" s"));
                 ui.label(theme::small(cv_core::util::format_duration(d.clips.clip_length_secs as f64)));
             });
             row(ui, "Short clip length", "Length of the \"save short clip\" hotkey (trimmed from the replay).", |ui| {
                 ui.add(egui::DragValue::new(&mut d.clips.short_clip_secs).range(5..=600).suffix(" s"));
-            });
-            row(ui, "Replay buffer memory limit", "Upper bound on RAM the replay buffer may use. Requires OBS restart.", |ui| {
-                ui.add(egui::DragValue::new(&mut d.clips.replay_max_memory_mb).range(256..=65536).suffix(" MB"));
             });
         });
         group(ui, "Organising", |ui| {
@@ -280,9 +287,6 @@ impl SettingsView {
             });
             row(ui, "Name when no game is detected", "Used for clips of the desktop or unknown apps.", |ui| {
                 ui.add(egui::TextEdit::singleline(&mut d.clips.unknown_game_name).desired_width(200.0));
-            });
-            row(ui, "Game detection window", "How far back to look when deciding which game a clip is from.", |ui| {
-                ui.add(egui::DragValue::new(&mut d.clips.attribution_window_secs).range(5..=3600).suffix(" s"));
             });
             toggle_row(ui, c, "Favourite game clips automatically", "Clips saved while a game is running start as favourites.", &mut d.clips.auto_favorite);
         });
@@ -306,7 +310,7 @@ impl SettingsView {
         group(ui, "Global hotkeys", |ui| {
             ui.label(theme::small("Work everywhere, including in full-screen games. Click a box and press the keys. Mouse side buttons (Mouse4/Mouse5) work too. Esc cancels, Backspace clears."));
             ui.add_space(6.0);
-            self.hotkey_row(ui, c, "save_clip", "Save clip", "Saves the replay buffer (the last few minutes).", &mut d.hotkeys.save_clip);
+            self.hotkey_row(ui, c, "save_clip", "Save clip", "Saves the last few minutes of available footage.", &mut d.hotkeys.save_clip);
             self.hotkey_row(ui, c, "save_short", "Save short clip", "Saves only the last \"short clip length\" seconds.", &mut d.hotkeys.save_short_clip);
             self.hotkey_row(ui, c, "marker", "Add marker", "Bookmarks this moment on the 24/7 timeline.", &mut d.hotkeys.add_marker);
             self.hotkey_row(ui, c, "toggle_rec", "Pause/resume 24/7 recording", "", &mut d.hotkeys.toggle_recording);
@@ -377,10 +381,9 @@ impl SettingsView {
             }
         }
         group(ui, "Microphone guard", |ui| {
-            ui.label(theme::small("When a USB headset drops and reconnects, Windows often registers it as a new device (\"2- Headset…\") and OBS keeps recording the old, silent one. ClipVault matches mics by name and switches OBS to the connected one within a couple of seconds."));
-            ui.add_space(4.0);
-            toggle_row(ui, c, "Keep the mic connected", "Watch audio devices and re-point OBS automatically.", &mut d.audio.mic_guard);
-            row(ui, "Preferred microphones", "First connected one wins. Drag order with the arrows.", |ui| {
+            toggle_row(ui, c, "Record microphone", "Save the microphone on its own track and include it in the full mix.", &mut d.audio.record_mic);
+            toggle_row(ui, c, "Choose a preferred mic", "Match microphones by name when Windows renames a reconnected headset.", &mut d.audio.mic_guard);
+            row(ui, "Preferred microphones", "ClipVault uses the first connected mic in this list. Use the arrows to reorder it.", |ui| {
                 ui.vertical(|ui| {
                     let mut remove = None;
                     let mut swap = None;
@@ -422,48 +425,41 @@ impl SettingsView {
                     });
                 });
             });
-            row(ui, "If none are connected", "What OBS records when no preferred mic is plugged in.", |ui| {
+            row(ui, "If none are connected", "Choose a fallback when none of your preferred microphones are available.", |ui| {
                 egui::ComboBox::from_id_salt("mic_fallback")
-                    .selected_text(if d.audio.mic_fallback == "none" { "Leave OBS alone" } else { "Windows default mic" })
+                    .selected_text(if d.audio.mic_fallback == "none" { "Record without a microphone" } else { "Windows default mic" })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut d.audio.mic_fallback, "windows_default".to_string(), "Windows default mic");
-                        ui.selectable_value(&mut d.audio.mic_fallback, "none".to_string(), "Leave OBS alone");
+                        ui.selectable_value(&mut d.audio.mic_fallback, "none".to_string(), "Record without a microphone");
                     });
             });
-            row(ui, "Mic volume", "Gain applied in OBS (100% = unchanged).", |ui| {
+            row(ui, "Mic volume", "Level saved in the recording (100% = unchanged).", |ui| {
                 ui.add(egui::Slider::new(&mut d.audio.mic_gain, 0.0..=4.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
             });
-            toggle_row(ui, c, "Noise suppression", "Adds OBS's RNNoise filter to your mic (affects recordings).", &mut d.audio.mic_noise_suppression);
             row(ui, "Warn when the mic is silent", "Notify if the mic records nothing for this long while recording (0 = off).", |ui| {
                 ui.add(egui::DragValue::new(&mut d.audio.mic_silence_warning_mins).range(0..=600).suffix(" min"));
             });
         });
-        group(ui, "Separate audio tracks", |ui| {
-            toggle_row(ui, c, "Record separate tracks", "Six tracks: full mix, game, voice chat, music, mic, desktop. Lets you rebalance clips later. Requires OBS restart.", &mut d.audio.multitrack);
-            toggle_row(ui, c, "Game track follows your game", "Points the Game track at whichever game you're playing.", &mut d.audio.game_audio_capture);
-            toggle_row(ui, c, "Keep apps on other devices in the full mix", "e.g. Discord playing on a headset's \"chat\" channel instead of the default device.", &mut d.audio.auto_mix_other_devices);
-            row(ui, "Voice chat apps", "Recorded on the Voice chat track.", |ui| list_editor(ui, &mut d.audio.voice_apps, &mut self.new_item[0], "Discord.exe"));
-            row(ui, "Music apps", "Recorded on the Music track. Sound is split per program, not per browser tab.", |ui| {
+        group(ui, "App audio", |ui| {
+            toggle_row(ui, c, "Record separate app tracks", "Keep individual apps adjustable alongside the full mix.", &mut d.recording.app_tracks);
+            if d.recording.app_tracks {
+                row(ui, "App track slots", "Maximum number of apps with their own tracks at once. Other apps stay audible in the full mix.", |ui| {
+                    ui.add(egui::DragValue::new(&mut d.recording.app_track_count).range(1..=24));
+                });
+                row(ui, "App track bitrate", "Higher bitrates use more storage.", |ui| {
+                    ui.add(egui::DragValue::new(&mut d.recording.app_bitrate_kbps).range(64..=320).suffix(" kbps"));
+                });
+            }
+            row(ui, "Voice chat apps", "Group app tracks under Voice chat in the mixer.", |ui| list_editor(ui, &mut d.audio.voice_apps, &mut self.new_item[0], "Discord.exe"));
+            row(ui, "Music apps", "Group app tracks under Music in the mixer. Browser tabs share a track.", |ui| {
                 ui.vertical(|ui| {
                     list_editor(ui, &mut d.audio.music_apps, &mut self.new_item[1], "Spotify.exe");
-                    if ui.button("Add browsers & media players").on_hover_text("YouTube, Twitch and other browser audio get their own slider (all browser tabs share it)").clicked() {
+                    if ui.button("Add browsers & media players").clicked() {
                         for app in MEDIA_APPS {
                             if !d.audio.music_apps.iter().any(|x| x.eq_ignore_ascii_case(app)) {
                                 d.audio.music_apps.push(app.to_string());
                             }
                         }
-                    }
-                });
-            });
-            ui.label(theme::small("Apps that aren't on the Voice chat or Music lists (and aren't a game) are only in the Full mix and Desktop tracks."));
-            ui.add_space(8.0);
-            row(ui, "Desktop audio device", "\"default\" follows Windows. Or pin a specific output.", |ui| {
-                let outputs: Vec<Endpoint> = self.devices.as_ref().map(|x| x.outputs.clone()).unwrap_or_default();
-                egui::ComboBox::from_id_salt("desktop_dev").selected_text(d.audio.desktop_device.clone()).width(280.0).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut d.audio.desktop_device, "default".to_string(), "default (follow Windows)");
-                    for e in &outputs {
-                        let name = cv_core::audio_names::clean_display_name(&e.name);
-                        ui.selectable_value(&mut d.audio.desktop_device, name.clone(), name);
                     }
                 });
             });
@@ -473,9 +469,6 @@ impl SettingsView {
     fn games(&mut self, ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
         group(ui, "Detection", |ui| {
             toggle_row(ui, c, "Full-screen apps are games", "Anything full-screen that isn't a browser or tool counts as a game.", &mut d.games.fullscreen_is_game);
-            row(ui, "Game follow delay", "A game must be focused this long before the Game track switches to it.", |ui| {
-                ui.add(egui::DragValue::new(&mut d.games.audio_follow_delay_secs).range(0..=60).suffix(" s"));
-            });
             row(ui, "Extra game folders", "Anything run from these folders is a game.", |ui| list_editor(ui, &mut d.games.library_folders, &mut self.new_item[2], "E:\\games"));
             row(ui, "Always a game", "Executable names.", |ui| list_editor(ui, &mut d.games.always_games, &mut self.new_item[3], "javaw.exe"));
             row(ui, "Never a game", "Executable names.", |ui| list_editor(ui, &mut d.games.never_games, &mut self.new_item[4], "chrome.exe"));
@@ -568,95 +561,118 @@ impl SettingsView {
 
 // ---------------------------------------------------------- free sections
 
-fn recording(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
-    group(ui, "Continuous recording", |ui| {
-        toggle_row(ui, c, "Record 24/7", "Keep a rolling recording so you can go back and clip anything later.", &mut d.recording.enabled);
-        folder_row(ui, "Recordings folder", "Requires OBS restart.", &mut d.recording.folder);
-        row(ui, "Keep this much footage", "Oldest footage is deleted beyond this. Time the PC is off doesn't count.", |ui| {
-            ui.add(egui::DragValue::new(&mut d.recording.retention_hours).range(1..=1440).suffix(" h"));
-            ui.label(theme::small(format!("≈ {:.1} days of recording", d.recording.retention_hours as f32 / 24.0)));
+fn recording(ui: &mut Ui, c: &mut Ctx, d: &mut Config, monitors: &mut Option<Vec<MonitorInfo>>) {
+    group(ui, "Recording history", |ui| {
+        row(ui, "History mode", "Choose how ClipVault keeps new footage.", |ui| {
+            ui.selectable_value(&mut d.recording.history_mode, HistoryMode::Archive, "Full history");
+            ui.selectable_value(&mut d.recording.history_mode, HistoryMode::Rolling, "Replay only");
         });
-        row(ui, "Also delete footage older than", "0 = never delete by age.", |ui| {
-            ui.add(egui::DragValue::new(&mut d.recording.max_age_days).range(0..=3650).suffix(" days"));
-        });
-        row(ui, "Storage cap", "Max space for 24/7 recordings (0 = no cap).", |ui| {
-            ui.add(egui::DragValue::new(&mut d.recording.max_storage_gb).range(0..=100000).suffix(" GB"));
-        });
-        row(ui, "Always keep free", "Deletes old footage early if the drive gets this full.", |ui| {
-            ui.add(egui::DragValue::new(&mut d.recording.min_free_space_gb).range(1..=10000).suffix(" GB"));
-        });
-        row(ui, "File length", "The recording is split into files this long. Shorter files make cuts faster. Requires OBS restart.", |ui| {
-            ui.add(egui::DragValue::new(&mut d.recording.segment_minutes).range(1..=240).suffix(" min"));
-        });
-        row(ui, "File format", "Fragmented MP4 survives crashes and power cuts without corruption.", |ui| {
-            egui::ComboBox::from_id_salt("format").selected_text(label_for(RECORDING_FORMATS, &d.recording.format)).width(320.0).show_ui(ui, |ui| {
-                for (k, v) in RECORDING_FORMATS {
-                    ui.selectable_value(&mut d.recording.format, k.to_string(), *v);
-                }
-            });
-        });
-    });
-    group(ui, "Quality (requires OBS restart)", |ui| {
-        row(ui, "Encoder", "", |ui| {
-            egui::ComboBox::from_id_salt("encoder").selected_text(label_for(ENCODERS, &d.recording.encoder)).width(280.0).show_ui(ui, |ui| {
-                for (k, v) in ENCODERS {
-                    ui.selectable_value(&mut d.recording.encoder, k.to_string(), *v);
-                }
-            });
-        });
-        row(ui, "Rate control", "CQP = constant quality (recommended). CBR/VBR = fixed bitrate.", |ui| {
-            for rc in ["CQP", "VBR", "CBR"] {
-                ui.selectable_value(&mut d.recording.rate_control, rc.to_string(), rc);
-            }
-        });
-        if d.recording.rate_control == "CQP" {
-            row(ui, "Quality level", "Lower = better quality and bigger files. 18-28 is typical.", |ui| {
-                ui.add(egui::Slider::new(&mut d.recording.cqp, 10..=40));
-            });
-        } else {
-            row(ui, "Bitrate", "Video bitrate.", |ui| {
-                ui.add(egui::DragValue::new(&mut d.recording.bitrate_kbps).range(500..=300000).speed(100).suffix(" kbps"));
-                ui.label(theme::small(format!("≈ {:.1} GB/hour", d.recording.bitrate_kbps as f64 * 3600.0 / 8.0 / 1024.0 / 1024.0)));
-            });
-            if d.recording.rate_control == "VBR" {
-                row(ui, "Max bitrate", "", |ui| {
-                    ui.add(egui::DragValue::new(&mut d.recording.max_bitrate_kbps).range(500..=400000).speed(100).suffix(" kbps"));
+        if d.recording.history_mode == HistoryMode::Rolling {
+            row(ui, "Replay window", "Save this much recent footage at most. Unsaved footage expires automatically.", |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for minutes in [1, 2, 5, 10] {
+                            ui.selectable_value(&mut d.recording.rolling_minutes, minutes, format!("{minutes} min"));
+                        }
+                        ui.add(egui::DragValue::new(&mut d.recording.rolling_minutes)
+                            .range(1..=MAX_ROLLING_MINUTES).suffix(" min").prefix("Custom "));
+                    });
+                    ui.label(theme::small(format!(
+                        "Up to {} min can be saved. Disk cleanup works in roughly {ROLLING_SEGMENT_SECS}-second segments.",
+                        d.recording.rolling_minutes
+                    )));
                 });
-            }
+            });
+            ui.label(theme::small("Use the clip hotkeys or the Home replay action to save new footage. Replay only keeps it off the 24/7 timeline and clears unsaved footage when ClipVault stops."));
+            ui.label(theme::small("Saved clips and existing 24/7 recordings stay in the library. Archive cleanup pauses while Replay only is active."));
+        } else {
+            toggle_row(ui, c, "Record 24/7", "Keep a searchable timeline. Turning this off keeps a temporary buffer for clip hotkeys.", &mut d.recording.enabled);
+            folder_row(ui, "Recordings folder", "Where ClipVault saves continuous recordings.", &mut d.recording.folder);
+            row(ui, "Keep this much footage", "Oldest footage is deleted beyond this. Time the PC is off doesn't count.", |ui| {
+                ui.add(egui::DragValue::new(&mut d.recording.retention_hours).range(1..=1440).suffix(" h"));
+                ui.label(theme::small(format!("≈ {:.1} days of recording", d.recording.retention_hours as f32 / 24.0)));
+            });
+            row(ui, "Also delete footage older than", "0 = never delete by age.", |ui| {
+                ui.add(egui::DragValue::new(&mut d.recording.max_age_days).range(0..=3650).suffix(" days"));
+            });
+            row(ui, "Storage cap", "Max space for 24/7 recordings (0 = no cap).", |ui| {
+                ui.add(egui::DragValue::new(&mut d.recording.max_storage_gb).range(0..=100000).suffix(" GB"));
+            });
+            row(ui, "Always keep free", "Deletes older footage if free space drops below this amount.", |ui| {
+                ui.add(egui::DragValue::new(&mut d.recording.min_free_space_gb).range(1..=10000).suffix(" GB"));
+            });
+            row(ui, "File length", "Shorter segments give retention finer control.", |ui| {
+                ui.add(egui::DragValue::new(&mut d.recording.segment_minutes).range(1..=240).suffix(" min"));
+            });
         }
-        row(ui, "Preset", "NVENC: p1 fastest … p7 best quality.", |ui| {
-            egui::ComboBox::from_id_salt("preset").selected_text(d.recording.preset.clone()).show_ui(ui, |ui| {
-                let presets: &[&str] = if d.recording.encoder.contains("x264") { &["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"] } else { &["p1", "p2", "p3", "p4", "p5", "p6", "p7"] };
-                for p in presets {
-                    ui.selectable_value(&mut d.recording.preset, p.to_string(), *p);
+    });
+    group(ui, "Screen capture", |ui| {
+        row(ui, "Monitor", "Select which screen to record.", |ui| {
+            let selected = monitors.as_deref().unwrap_or_default().iter()
+                .find(|monitor| monitor.device_name.eq_ignore_ascii_case(&d.recording.monitor));
+            let label = if d.recording.monitor.eq_ignore_ascii_case("primary") {
+                "Primary monitor".to_string()
+            } else {
+                selected.map(monitor_label).unwrap_or_else(|| d.recording.monitor.clone())
+            };
+            egui::ComboBox::from_id_salt("recording_monitor").selected_text(label).show_ui(ui, |ui| {
+                ui.selectable_value(&mut d.recording.monitor, "primary".to_string(), "Primary monitor");
+                for monitor in monitors.as_deref().unwrap_or_default() {
+                    ui.selectable_value(&mut d.recording.monitor, monitor.device_name.clone(), monitor_label(monitor));
+                }
+            });
+            if theme::icon_button(ui, icon::REFRESH, 11.0, "Refresh monitors").clicked() {
+                *monitors = None;
+            }
+        });
+        row(ui, "Capture method", "Auto chooses a Windows capture method for your display.", |ui| {
+            let methods = [("auto", "Auto"), ("duplication", "Desktop Duplication"), ("graphics_capture", "Windows Graphics Capture")];
+            egui::ComboBox::from_id_salt("capture_method").selected_text(label_for(&methods, &d.recording.capture_method)).show_ui(ui, |ui| {
+                for (value, label) in methods {
+                    ui.selectable_value(&mut d.recording.capture_method, value.to_string(), label);
                 }
             });
         });
-        row(ui, "Frame rate", "", |ui| {
-            for f in [30, 60, 120, 144] {
-                ui.selectable_value(&mut d.recording.fps, f, format!("{f} fps"));
+        toggle_row(ui, c, "Show mouse cursor", "Include the pointer in the video.", &mut d.recording.show_cursor);
+    });
+    group(ui, "Video and sound quality", |ui| {
+        row(ui, "Encoder", "Auto uses a hardware encoder when available.", |ui| {
+            ui.selectable_value(&mut d.recording.encoder, "auto".to_string(), "Auto");
+            ui.selectable_value(&mut d.recording.encoder, "software".to_string(), "Software");
+        });
+        row(ui, "Video quality", "Higher quality uses more storage.", |ui| {
+            egui::ComboBox::from_id_salt("video_quality").selected_text(label_for(QUALITIES, &d.recording.quality)).show_ui(ui, |ui| {
+                for (value, label) in QUALITIES {
+                    ui.selectable_value(&mut d.recording.quality, value.to_string(), *label);
+                }
+            });
+        });
+        if d.recording.quality == "custom" {
+            row(ui, "Video bitrate", "Average bitrate target.", |ui| {
+                ui.add(egui::DragValue::new(&mut d.recording.bitrate_kbps).range(500..=300000).speed(100).suffix(" kbps"));
+            });
+        }
+        row(ui, "Frame rate", "Maximum frames per second.", |ui| {
+            ui.add(egui::DragValue::new(&mut d.recording.fps).range(10..=240).suffix(" fps"));
+        });
+        row(ui, "Resolution limit", "Preserves the screen's aspect ratio.", |ui| {
+            for (height, label) in HEIGHTS {
+                ui.selectable_value(&mut d.recording.max_height, *height, *label);
             }
         });
-        row(ui, "Output resolution", "Downscale the recording (empty = same as your screen), e.g. 1920x1080.", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut d.recording.output_resolution).hint_text("native").desired_width(140.0));
-        });
-        row(ui, "Keyframe interval", "Smaller = more precise instant cuts, slightly bigger files.", |ui| {
+        row(ui, "Keyframe interval", "Shorter intervals improve seek responsiveness and use slightly more storage.", |ui| {
             ui.add(egui::DragValue::new(&mut d.recording.keyframe_interval_secs).range(1..=10).suffix(" s"));
         });
-        row(ui, "Audio bitrate", "Per track.", |ui| {
-            egui::ComboBox::from_id_salt("abr").selected_text(format!("{} kbps", d.recording.audio_bitrate_kbps)).show_ui(ui, |ui| {
-                for b in [96, 128, 160, 192, 256, 320] {
-                    ui.selectable_value(&mut d.recording.audio_bitrate_kbps, b, format!("{b} kbps"));
-                }
-            });
+        row(ui, "Full mix and mic bitrate", "Per track.", |ui| {
+            ui.add(egui::DragValue::new(&mut d.recording.audio_bitrate_kbps).range(64..=320).suffix(" kbps"));
         });
     });
-    group(ui, "Reliability", |ui| {
-        toggle_row(ui, c, "Restart recording if it stops", "If OBS stops recording on its own, start it again.", &mut d.recording.auto_restart);
-        row(ui, "Stall detection", "Restart the recording if the file stops growing for this long.", |ui| {
-            ui.add(egui::DragValue::new(&mut d.recording.stall_timeout_secs).range(20..=600).suffix(" s"));
-        });
-    });
+}
+
+fn monitor_label(monitor: &MonitorInfo) -> String {
+    let display = monitor.device_name.rsplit('\\').next().unwrap_or(&monitor.device_name);
+    let primary = if monitor.primary { " · primary" } else { "" };
+    format!("{display} · {} × {}{primary}", monitor.width, monitor.height)
 }
 
 fn overlay(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
@@ -711,17 +727,18 @@ fn player(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
         row(ui, "Big skip", "Shift + ← / →", |ui| {
             ui.add(egui::DragValue::new(&mut d.player.seek_large_secs).range(5..=600).suffix(" s"));
         });
-        row(ui, "Hardware decoding", "Use the GPU to decode video. Try \"auto-copy-safe\" if playback looks wrong.", |ui| {
-            for h in ["auto-safe", "auto-copy-safe", "no"] {
-                ui.selectable_value(&mut d.player.hwdec, h.to_string(), h);
-            }
-        });
     });
     group(ui, "Audio tracks", |ui| {
         row(ui, "Default mix", "How multi-track files start playing.", |ui| {
             ui.selectable_value(&mut d.player.default_mix_mode, "full".to_string(), "Full mix");
             ui.selectable_value(&mut d.player.default_mix_mode, "separate".to_string(), "Separate tracks");
         });
+        toggle_row(ui, c, "Smooth audio edits", "Fade into and out of edited regions to reduce clicks.", &mut d.player.smooth_edits);
+        if d.player.smooth_edits {
+            row(ui, "Edit fade length", "Length of the fade at each edit boundary.", |ui| {
+                ui.add(egui::DragValue::new(&mut d.player.edit_fade_ms).range(1..=1000).suffix(" ms"));
+            });
+        }
         toggle_row(ui, c, "Remember each clip's mix", "Reopen clips with the volumes you last used.", &mut d.player.remember_clip_mix);
     });
     group(ui, "24/7 timeline", |ui| {
@@ -735,11 +752,33 @@ fn player(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
     });
 }
 
-fn export(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
+fn export(ui: &mut Ui, c: &mut Ctx, d: &mut Config, new_preset_mb: &mut u32) {
     group(ui, "Exports", |ui| {
         folder_row(ui, "Export folder", "Empty = <clips folder>\\_Exports.", &mut d.export.folder);
-        row(ui, "Share size target", "Default size for \"Share\" exports (Discord's free limit is 10 MB).", |ui| {
+        row(ui, "Default share limit", "Maximum file size for a Share export.", |ui| {
             ui.add(egui::DragValue::new(&mut d.export.target_size_mb).range(1..=4096).suffix(" MB"));
+        });
+        row(ui, "Share size presets", "Quick size choices in the export dialog.", |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let mut remove = None;
+                    for &size in &d.export.size_presets_mb {
+                        if ui.small_button(format!("{size} MB ×")).on_hover_text("Remove preset").clicked() {
+                            remove = Some(size);
+                        }
+                    }
+                    if let Some(size) = remove {
+                        d.export.size_presets_mb.retain(|&preset| preset != size);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(new_preset_mb).range(1..=4096).suffix(" MB"));
+                    if ui.button("Add preset").clicked() && !d.export.size_presets_mb.contains(new_preset_mb) {
+                        d.export.size_presets_mb.push(*new_preset_mb);
+                        d.export.size_presets_mb.sort_unstable();
+                    }
+                });
+            });
         });
         row(ui, "Max height for shares", "Downscale big recordings when targeting a size (0 = keep).", |ui| {
             for h in [0u32, 720, 1080, 1440] {
@@ -749,76 +788,17 @@ fn export(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
         toggle_row(ui, c, "Copy to clipboard after export", "Paste the finished file straight into Discord.", &mut d.export.copy_to_clipboard);
         toggle_row(ui, c, "Open the folder after export", "", &mut d.export.open_folder_after);
     });
-    group(ui, "Cutting & encoding", |ui| {
-        toggle_row(ui, c, "Frame-exact cuts by default", "Re-encodes when clipping/trimming (slower). Off = instant lossless cuts.", &mut d.export.precise_cuts);
-        row(ui, "Encoder for re-encodes", "", |ui| {
-            for e in ["h264_nvenc", "hevc_nvenc", "libx264"] {
-                ui.selectable_value(&mut d.export.video_encoder, e.to_string(), e);
-            }
+    group(ui, "Encoding", |ui| {
+        row(ui, "Export audio bitrate", "Applied to the mixed audio track.", |ui| {
+            ui.add(egui::DragValue::new(&mut d.export.audio_bitrate_kbps).range(64..=192).suffix(" kbps"));
         });
-        row(ui, "Re-encode quality", "Lower = better (CQ/CRF).", |ui| {
-            ui.add(egui::Slider::new(&mut d.export.quality, 15..=35));
-        });
-        row(ui, "Export audio bitrate", "", |ui| {
-            for b in [128u32, 160, 192, 256, 320] {
-                ui.selectable_value(&mut d.export.audio_bitrate_kbps, b, format!("{b}k"));
-            }
-        });
-    });
-}
-
-fn obs(ui: &mut Ui, c: &mut Ctx, d: &mut Config) {
-    group(ui, "OBS Studio", |ui| {
-        file_row(ui, "OBS executable", "", &mut d.obs.exe_path, &["exe"]);
-        toggle_row(ui, c, "Launch OBS automatically", "Start OBS when the service starts.", &mut d.obs.launch_on_start);
-        row(ui, "Launch delay", "Wait after login before starting OBS.", |ui| {
-            ui.add(egui::DragValue::new(&mut d.obs.launch_delay_secs).range(0..=600).suffix(" s"));
-        });
-        toggle_row(ui, c, "Start minimised to tray", "", &mut d.obs.minimize_to_tray);
-        toggle_row(ui, c, "Restart OBS if it crashes", "", &mut d.obs.restart_on_crash);
-        toggle_row(ui, c, "Restart OBS even if I close it", "Off: closing OBS yourself pauses recording until you start it again.", &mut d.obs.restart_if_closed);
-        row(ui, "Crash restart limit", "Stop auto-restarting after this many restarts in an hour.", |ui| {
-            ui.add(egui::DragValue::new(&mut d.obs.max_restarts_per_hour).range(1..=100).suffix(" / hour"));
-        });
-        row(ui, "Process priority", "Higher priority helps avoid dropped frames while gaming. Requires OBS restart.", |ui| {
-            for (k, v) in [("normal", "Normal"), ("above_normal", "Above normal"), ("high", "High")] {
-                ui.selectable_value(&mut d.obs.process_priority, k.to_string(), v);
-            }
-        });
-        toggle_row(ui, c, "Let ClipVault manage OBS output settings", "Writes the recording/replay/track settings into OBS. Turn off to configure OBS by hand.", &mut d.obs.manage_settings);
-        row(ui, "Shutdown timeout", "How long to wait for OBS to close before ending it.", |ui| {
-            ui.add(egui::DragValue::new(&mut d.obs.shutdown_timeout_secs).range(3..=120).suffix(" s"));
-        });
-        row(ui, "", "", |ui| {
-            if theme::ghost_button(ui, Some(icon::REFRESH), "Restart OBS now").clicked() {
-                c.service.fire(Request::RestartObs);
-                c.toast("info", "Restarting OBS…");
-            }
-        });
-    });
-    group(ui, "Connection", |ui| {
-        row(ui, "Websocket port", "", |ui| {
-            ui.add(egui::DragValue::new(&mut d.obs.websocket_port).range(1024..=65535));
-        });
-        row(ui, "Websocket password", "Empty = use OBS's own (recommended).", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut d.obs.websocket_password).password(true).desired_width(200.0));
-        });
-        folder_row(ui, "OBS settings folder", "Empty = %APPDATA%\\obs-studio.", &mut d.obs.config_dir);
     });
 }
 
 fn advanced(ui: &mut Ui, _c: &mut Ctx, d: &mut Config) {
-    group(ui, "Tools", |ui| {
-        file_row(ui, "ffmpeg.exe", "Empty = auto-detect.", &mut d.advanced.ffmpeg_path, &["exe"]);
-        file_row(ui, "ffprobe.exe", "Empty = next to ffmpeg.", &mut d.advanced.ffprobe_path, &["exe"]);
-        file_row(ui, "libmpv-2.dll", "Empty = next to ClipVault. Takes effect on restart of the app.", &mut d.advanced.mpv_dll_path, &["dll"]);
-    });
     group(ui, "Service", |ui| {
-        row(ui, "Local port", "Port the app uses to talk to the background service.", |ui| {
+        row(ui, "Local port", "Starting port for the local connection. Takes effect when the background service restarts.", |ui| {
             ui.add(egui::DragValue::new(&mut d.advanced.ipc_port).range(1024..=65000));
-        });
-        row(ui, "Health check interval", "", |ui| {
-            ui.add(egui::DragValue::new(&mut d.advanced.health_check_secs).range(1..=60).suffix(" s"));
         });
         row(ui, "Activity sampling", "How often the focused window is checked.", |ui| {
             ui.add(egui::DragValue::new(&mut d.advanced.activity_sample_ms).range(250..=10000).suffix(" ms"));
@@ -847,8 +827,11 @@ fn about(ui: &mut Ui, c: &mut Ctx) {
         let s = c.service.status();
         let rows = [
             ("Service", if c.service.connected() { format!("running (v{})", s.as_ref().map(|s| s.version.clone()).unwrap_or_default()) } else { "not running".into() }),
-            ("OBS", s.as_ref().map(|s| if s.obs.connected { format!("connected (OBS {})", s.obs.version) } else if s.obs.running { "running, connecting".into() } else { "not running".into() }).unwrap_or_default()),
-            ("Video engine", if c.player.mpv.is_some() { "libmpv loaded".into() } else { c.player.init_error.clone().unwrap_or_default() }),
+            ("Recorder", s.as_ref().map(|s| if s.engine.running {
+                format!("{} · {}", s.engine.capture, s.engine.encoder)
+            } else {
+                s.engine.last_error.clone()
+            }).unwrap_or_default()),
             ("Settings", cv_core::paths::config_path().display().to_string()),
             ("Data", cv_core::paths::data_dir().display().to_string()),
         ];
@@ -867,9 +850,9 @@ fn about(ui: &mut Ui, c: &mut Ctx) {
             if theme::ghost_button(ui, Some(icon::FOLDER), "Open data folder").clicked() {
                 let _ = std::process::Command::new("explorer.exe").arg(cv_core::paths::data_dir()).spawn();
             }
-            if theme::ghost_button(ui, Some(icon::REFRESH), "Restart service").on_hover_text("OBS keeps recording while the service restarts").clicked() {
-                c.service.fire(Request::Shutdown);
-                c.toast("info", "Restarting the service…");
+            if theme::ghost_button(ui, Some(icon::REFRESH), "Restart recorder").on_hover_text("Closes the current file and starts a new recording").clicked() {
+                c.service.fire(Request::RestartRecorder);
+                c.toast("info", "Restarting recording…");
             }
         });
     });

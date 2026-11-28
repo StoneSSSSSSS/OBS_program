@@ -3,7 +3,7 @@
 use crate::app::{Ctx, Page};
 use crate::theme::{self, icon};
 use cv_core::ipc::{Request, Status};
-use cv_core::model::{Clip, ClipFilter, EventEntry};
+use cv_core::model::{Clip, ClipFilter, EventEntry, Recording};
 use cv_core::util::{format_duration, format_span_short, human_bytes, now_ms};
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Stroke, Ui, Vec2};
 use std::time::{Duration, Instant};
@@ -13,6 +13,7 @@ pub struct HomeView {
     recent: Vec<Clip>,
     events: Vec<EventEntry>,
     footage_s: f64,
+    recordings: Vec<Recording>,
     loaded: Option<Instant>,
     dirty: bool,
 }
@@ -30,7 +31,8 @@ impl HomeView {
         if let Some(db) = c.db() {
             self.recent = db.list_clips(&ClipFilter::default()).unwrap_or_default().into_iter().take(8).collect();
             self.events = db.recent_events(30).unwrap_or_default();
-            self.footage_s = db.list_recordings().unwrap_or_default().iter().filter(|r| !r.kept).map(|r| r.duration).sum();
+            self.recordings = db.list_recordings().unwrap_or_default();
+            self.footage_s = self.recordings.iter().map(|r| r.duration).sum();
         }
         self.loaded = Some(Instant::now());
         self.dirty = false;
@@ -43,14 +45,21 @@ impl HomeView {
             ui.horizontal(|ui| {
                 ui.label(theme::heading("Overview"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::ghost_button(ui, Some(icon::FLAG), "Add marker").on_hover_text("Bookmark this moment on the 24/7 timeline").clicked() {
-                        c.request(Request::AddMarker { label: String::new() });
-                        c.toast("info", "Marker added");
-                    }
-                    if theme::primary_button(ui, Some(icon::LIVE), "Watch live").clicked() {
-                        c.goto = Some(Page::Recordings);
-                        crate::views::recordings::request_go_live();
-                    }
+                    let live = status.as_ref().is_some_and(|s| {
+                        s.recording.active && s.recording.written_until_ms > s.recording.started_ms
+                    });
+                    ui.add_enabled_ui(live, |ui| {
+                        if theme::ghost_button(ui, Some(icon::FLAG), "Add marker")
+                            .on_hover_text("Bookmark this moment on the 24/7 timeline")
+                            .clicked() && c.request(Request::AddMarker { label: String::new() }).is_some()
+                        {
+                            c.toast("info", "Marker added");
+                        }
+                        if theme::primary_button(ui, Some(icon::LIVE), "Watch live").clicked() {
+                            c.goto = Some(Page::Recordings);
+                            crate::views::recordings::request_go_live();
+                        }
+                    }).response.on_disabled_hover_text("Available while recording full history.");
                 });
             });
             ui.add_space(14.0);
@@ -59,11 +68,10 @@ impl HomeView {
                 for w in &s.warnings {
                     warning_banner(ui, w);
                 }
-                if s.obs.closed_by_user || (!s.obs.running && !s.warnings.is_empty()) {
+                if !s.engine.running && !s.engine.last_error.is_empty() {
                     ui.horizontal(|ui| {
-                        if theme::primary_button(ui, Some(icon::REFRESH), "Start OBS").clicked() {
-                            c.service.fire(Request::RestartObs);
-                c.toast("info", "Restarting OBS…");
+                        if theme::primary_button(ui, Some(icon::REFRESH), "Restart recorder").clicked() {
+                            c.service.fire(Request::RestartRecorder);
                         }
                     });
                     ui.add_space(8.0);
@@ -92,6 +100,8 @@ impl HomeView {
                 ui.add_space(gap);
             }
 
+            self.recent_footage(ui, c, status.as_ref());
+            ui.add_space(gap);
             // Live audio + recent clips side by side.
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
@@ -100,7 +110,7 @@ impl HomeView {
                     theme::card().show(ui, |ui| {
                         ui.set_width(left_w - 34.0);
                         ui.label(theme::title("Live audio"));
-                        ui.label(theme::small("What OBS is recording right now"));
+                        ui.label(theme::small("Sound reaching the recorder"));
                         ui.add_space(8.0);
                         let meters = c.service.shared.lock().meters.clone();
                         if meters.is_empty() {
@@ -131,7 +141,10 @@ impl HomeView {
                         });
                         ui.add_space(6.0);
                         if self.recent.is_empty() {
-                            ui.label(theme::label_dim(format!("No clips yet. Press {} in game to save one.", c.cfg.hotkeys.save_clip)));
+                            ui.label(theme::label_dim(format!(
+                                "No clips yet. Press {} in game to save one.",
+                                c.cfg.hotkeys.save_clip
+                            )));
                         }
                         let tw = 200.0;
                         egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
@@ -165,12 +178,118 @@ impl HomeView {
                         };
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
                         ui.painter().circle_filled(r.center(), 3.5, color);
-                        let t = chrono::DateTime::from_timestamp_millis(e.at_ms).unwrap_or_default().with_timezone(&chrono::Local);
-                        ui.label(RichText::new(t.format("%b %d  %H:%M:%S").to_string()).monospace().size(12.0).color(theme::TEXT_FAINT));
+                        let t = chrono::DateTime::from_timestamp_millis(e.at_ms)
+                            .unwrap_or_default()
+                            .with_timezone(&chrono::Local);
+                        ui.label(
+                            RichText::new(t.format("%b %d  %H:%M:%S").to_string())
+                                .monospace()
+                                .size(12.0)
+                                .color(theme::TEXT_FAINT),
+                        );
                         ui.label(RichText::new(&e.message).color(theme::TEXT_DIM));
                     });
                 }
             });
+        });
+    }
+}
+
+impl HomeView {
+    fn recent_footage(&self, ui: &mut Ui, c: &mut Ctx, status: Option<&Status>) {
+        let mut spans: Vec<_> = self.recordings.iter().filter(|r| !r.is_live()).map(|r| (r.start_ms, r.end_ms())).collect();
+        if let Some(s) = status.filter(|s| s.recording.active) {
+            spans.push((s.recording.started_ms, s.recording.written_until_ms));
+        }
+        spans.retain(|(a, b)| b > a);
+        spans.sort_unstable();
+        let latest_recording = spans.last().copied();
+        let mut joined: Vec<(i64, i64)> = Vec::new();
+        for (start, end) in spans {
+            if let Some(last) = joined.last_mut().filter(|s| start <= s.1 + 100) {
+                last.1 = last.1.max(end);
+            } else {
+                joined.push((start, end));
+            }
+        }
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(theme::title("Recent footage"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let rolling = status.filter(|s| s.replay.rolling_minutes.is_some());
+                    let available = rolling.map_or_else(
+                        || joined.last().is_some_and(|(a, b)| b - a >= 30_000),
+                        |s| s.replay.active && s.replay.available_seconds >= 30,
+                    );
+                    let save = ui.add_enabled(available && c.service.connected(), egui::Button::new("Clip last 30 seconds"));
+                    if save
+                        .on_disabled_hover_text("Requires 30 seconds of continuous footage and the recorder service.")
+                        .clicked()
+                    {
+                        if rolling.is_some() {
+                            c.service.fire(Request::SaveRecentRolling { seconds: 30 });
+                        } else if let Some(&(_, end)) = joined.last() {
+                            c.service.fire(Request::CutRange {
+                                from_ms: end - 30_000,
+                                to_ms: end,
+                                title: String::new(),
+                                game_id: None,
+                                category_ids: vec![],
+                                mix: None,
+                                audio_edits: vec![],
+                            });
+                        }
+                    }
+                    if let Some((start, end)) = latest_recording {
+                        let duration = format_duration((end - start) as f64 / 1000.0);
+                        if ui.button(format!("Open latest recording · {duration}")).clicked() {
+                            crate::views::recordings::request_play_at(start);
+                            c.goto = Some(Page::Recordings);
+                        }
+                    }
+                });
+            });
+            if let Some(minutes) = status.and_then(|s| s.replay.rolling_minutes) {
+                ui.label(theme::label_dim(format!("Replay only keeps the last {minutes} min temporarily. Open Clips to edit a saved replay.")));
+            }
+            let Some(&(_, end)) = joined.last() else {
+                if status.is_none_or(|s| s.replay.rolling_minutes.is_none()) {
+                    ui.label(theme::label_dim("Recorded footage will appear here."));
+                }
+                return;
+            };
+            let begin = end - 3_600_000;
+            let label = |ms| {
+                chrono::DateTime::from_timestamp_millis(ms)
+                    .unwrap_or_default()
+                    .with_timezone(&chrono::Local)
+                    .format("%b %d  %H:%M")
+                    .to_string()
+            };
+            ui.label(theme::small(format!(
+                "{}  –  {}    ·    Select a recorded section to play",
+                label(begin),
+                label(end)
+            )));
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
+            ui.painter().rect_filled(rect, 4.0, theme::SURFACE3);
+            let x = |t: i64| rect.left() + ((t - begin) as f32 / 3_600_000.0).clamp(0.0, 1.0) * rect.width();
+            for &(a, b) in joined.iter().filter(|(_, b)| *b > begin) {
+                ui.painter()
+                    .rect_filled(egui::Rect::from_x_y_ranges(x(a)..=x(b), rect.y_range()), 3.0, c.accent);
+            }
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let t = begin + ((pos.x - rect.left()) / rect.width() * 3_600_000.0) as i64;
+                    if joined.iter().any(|&(a, b)| a <= t && t <= b) {
+                        crate::views::recordings::request_play_at(t);
+                        c.goto = Some(Page::Recordings);
+                    } else {
+                        c.toast("info", "There is no recording at that time.");
+                    }
+                }
+            }
         });
     }
 }
@@ -227,6 +346,12 @@ fn recording_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, footage_s: f64) 
         big(ui, "—", theme::TEXT_FAINT);
         return;
     };
+    if let Some(minutes)=s.replay.rolling_minutes {
+        big(ui,"Replay only",theme::TEXT);
+        ui.label(theme::label_dim(format!("Keep the last {minutes} min. Saved clips stay in your library.")));
+        if ui.button("Change recording mode").clicked() { c.open_recording_settings=true; }
+        return;
+    }
     if s.recording.active {
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
@@ -237,7 +362,12 @@ fn recording_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, footage_s: f64) 
         });
         ui.ctx().request_repaint_after(Duration::from_millis(80));
         let secs = (now_ms() - s.recording.started_ms).max(0) / 1000;
-        ui.label(theme::label_dim(format!("Current file {} · {} audio track{}", format_span_short(secs), s.recording.tracks, if s.recording.tracks == 1 { "" } else { "s" })));
+        ui.label(theme::label_dim(format!(
+            "Current file {} · {} audio track{}",
+            format_span_short(secs),
+            s.recording.tracks,
+            if s.recording.tracks == 1 { "" } else { "s" }
+        )));
     } else if s.recording.paused_by_user {
         big(ui, "Paused", theme::TEXT_DIM);
         ui.label(theme::label_dim("Clips still work (replay buffer)."));
@@ -245,7 +375,11 @@ fn recording_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, footage_s: f64) 
         big(ui, "Stopped", theme::WARNING);
         ui.label(theme::label_dim("ClipVault will restart it automatically."));
     }
-    ui.label(theme::small(format!("{:.1} h stored · keeps {} h", footage_s / 3600.0, c.cfg.recording.retention_hours)));
+    ui.label(theme::small(format!(
+        "{:.1} h stored · keeps {} h",
+        footage_s / 3600.0,
+        c.cfg.recording.retention_hours
+    )));
     ui.add_space(6.0);
     let paused = s.recording.paused_by_user;
     if theme::ghost_button(ui, Some(if paused { icon::PLAY } else { icon::PAUSE }), if paused { "Resume" } else { "Pause" }).clicked() {
@@ -296,7 +430,15 @@ fn mic_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, _: f64) {
     if s.mic.state == "fallback" && !s.mic.preferred.is_empty() {
         ui.label(theme::small(format!("Waiting for {}", s.mic.preferred)));
     }
-    let peak = c.service.shared.lock().meters.iter().find(|(k, _)| k.to_lowercase().contains("mic")).map(|(_, v)| *v).unwrap_or(0.0);
+    let peak = c
+        .service
+        .shared
+        .lock()
+        .meters
+        .iter()
+        .find(|(k, _)| k.to_lowercase().contains("mic"))
+        .map(|(_, v)| *v)
+        .unwrap_or(0.0);
     ui.add_space(6.0);
     theme::meter(ui, peak, ui.available_width().min(220.0));
 }
@@ -309,15 +451,24 @@ fn storage_card(ui: &mut Ui, c: &mut Ctx, s: Option<&Status>, _: f64) {
     };
     let d = &s.disk;
     big(ui, &format!("{} free", human_bytes(d.free_bytes)), theme::TEXT);
-    let frac = if d.total_bytes > 0 { 1.0 - d.free_bytes as f32 / d.total_bytes as f32 } else { 0.0 };
+    let frac = if d.total_bytes > 0 {
+        1.0 - d.free_bytes as f32 / d.total_bytes as f32
+    } else {
+        0.0
+    };
     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(240.0), 6.0), Sense::hover());
     ui.painter().rect_filled(r, CornerRadius::same(3), theme::SURFACE3);
     let mut used = r;
     used.set_width(r.width() * frac);
     let low = d.free_bytes < c.cfg.recording.min_free_space_gb as u64 * 1024 * 1024 * 1024;
-    ui.painter().rect_filled(used, CornerRadius::same(3), if low { theme::WARNING } else { theme::TEXT_DIM });
+    ui.painter()
+        .rect_filled(used, CornerRadius::same(3), if low { theme::WARNING } else { theme::TEXT_DIM });
     ui.add_space(4.0);
-    ui.label(theme::label_dim(format!("Recordings {} ({} files)", human_bytes(d.recordings_bytes), d.recordings_count)));
+    ui.label(theme::label_dim(format!(
+        "Recordings {} ({} files)",
+        human_bytes(d.recordings_bytes),
+        d.recordings_count
+    )));
     ui.label(theme::label_dim(format!("Clips {} ({})", human_bytes(d.clips_bytes), d.clips_count)));
 }
 
@@ -331,7 +482,8 @@ fn recent_tile(ui: &mut Ui, c: &mut Ctx, clip: &Clip, w: f32) -> egui::Response 
         egui::Image::new(&tex).corner_radius(CornerRadius::same(10)).paint_at(ui, img);
     }
     if resp.hovered() {
-        ui.painter().rect_stroke(img, CornerRadius::same(10), Stroke::new(1.5, theme::TEXT_DIM), egui::StrokeKind::Inside);
+        ui.painter()
+            .rect_stroke(img, CornerRadius::same(10), Stroke::new(1.5, theme::TEXT_DIM), egui::StrokeKind::Inside);
     }
     crate::views::clips::duration_badge(ui, img, clip.duration);
     ui.painter().text(
